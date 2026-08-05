@@ -14,9 +14,9 @@ from scipy.spatial.transform import Rotation as R
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformBroadcaster, TransformListener
 
 
-class FinalRobotController(Node):
+class ArucoCalibNode(Node):
     def __init__(self):
-        super().__init__('final_robot_controller')
+        super().__init__('aruco_calib')
 
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
@@ -370,7 +370,7 @@ class FinalRobotController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = FinalRobotController()
+    node = ArucoCalibNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

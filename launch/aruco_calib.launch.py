@@ -13,7 +13,7 @@ def generate_launch_description():
         Node(
             package='cap_robot',
             executable='aruco_calib',
-            name='final_robot_controller',
+            name='aruco_calib',
             output='screen',
             parameters=[str(config_file)],
         )

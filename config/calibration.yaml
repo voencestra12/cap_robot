@@ -1,8 +1,8 @@
-final_robot_controller:
+/aruco_calib:
   ros__parameters:
-    image_topic: /camera/camera/color/image_raw
-    camera_info_topic: /camera/camera/color/camera_info
-    camera_frame: camera_color_optical_frame
+    image_topic: /fixed_camera/camera/color/image_raw
+    camera_info_topic: /fixed_camera/camera/color/camera_info
+    camera_frame: fixed_camera/camera_color_optical_frame
     marker_size_m: 0.05
     target_debug_log_period_sec: 2.0
 

@@ -1,4 +1,4 @@
-robot_agent_node:
+/agent2/robot_agent_node:
   ros__parameters:
     agent_id: agent2
     robot_ip: 192.168.1.198
@@ -30,9 +30,9 @@ robot_agent_node:
     sdk_z_min: 20.0
     sdk_z_max: 700.0
 
-    color_topic: /camera/camera/color/image_raw
-    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
-    camera_info_topic: /camera/camera/color/camera_info
+    color_topic: /agent2/camera/color/image_raw
+    depth_topic: /agent2/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /agent2/camera/color/camera_info
     yolo_model_path: yolo11m-seg.pt
 
     llm_model: gemma4:e4b
