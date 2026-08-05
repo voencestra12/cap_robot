@@ -1,0 +1,24 @@
+final_robot_controller:
+  ros__parameters:
+    image_topic: /camera/camera/color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    camera_frame: camera_color_optical_frame
+    marker_size_m: 0.05
+    target_debug_log_period_sec: 2.0
+
+    # [x, y, z, qx, qy, qz, qw]
+    # offset_1: [-0.195949, 0.004359, 0.026819, 0.020803, 0.005481, 0.696245, 0.717482]
+    # offset_1: [-0.185429, 0.003176, 0.018006, -0.011176, 0.002573, 0.698863, 0.715164]
+    offset_1: [-0.199929, 0.023176, 0.020006, -0.011176, 0.002573, 0.698863, 0.715164]
+    offset_2: [-0.198899, -0.001916, 0.024214, 0.014971, 0.013757, 0.706619, 0.707302]
+
+    workspace_marker_ids: [0, 2, 4, 11, 13, 15]
+    # marker ID 순서대로 [x, y, z]를 이어 붙인 값, 단위 mm
+    workspace_marker_offsets_mm: [
+      0.0, 0.0, 0.0,
+      300.0, 0.0, 0.0,
+      600.0, 0.0, 0.0,
+      600.0, 350.0, 0.0,
+      300.0, 350.0, 0.0,
+      0.0, 350.0, 0.0
+    ]

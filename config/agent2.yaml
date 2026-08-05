@@ -1,0 +1,40 @@
+robot_agent_node:
+  ros__parameters:
+    agent_id: agent2
+    robot_ip: 192.168.1.198
+    enable_perception: true
+    enable_command_input: false
+
+    # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
+    agent_specs: ["agent1:A", "agent2:B"]
+    agent_base_frames: ["agent1:robot_1_base", "agent2:robot_2_base"]
+
+    use_tf_workspace: true
+    robot_base_frame: robot_2_base
+    workspace_frame: workspace_0
+    xarm_command_frame_mode: identity
+
+    tf_lookup_timeout_sec: 1.0
+    tf_cache_period_sec: 0.2
+    tf_cache_max_age_sec: 60.0
+    tf_buffer_cache_sec: 60.0
+    tf_lookup_delay_sec: 0.5
+    tf_debug_log_period_sec: 2.0
+
+    dry_run: true
+    enable_sdk_safety_box: true
+    sdk_x_min: 50.0
+    sdk_x_max: 750.0
+    sdk_y_min: -600.0
+    sdk_y_max: 600.0
+    sdk_z_min: 20.0
+    sdk_z_max: 700.0
+
+    color_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/color/camera_info
+    yolo_model_path: yolo11m-seg.pt
+
+    llm_model: gemma4:e4b
+    ollama_url: http://localhost:11434/api/generate
+    prompt_file: agent_policy.txt

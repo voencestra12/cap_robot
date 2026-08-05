@@ -1,0 +1,6 @@
+numpy
+scipy
+requests
+opencv-python
+ultralytics
+xarm-python-sdk
