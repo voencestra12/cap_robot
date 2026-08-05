@@ -22,7 +22,7 @@ robot_agent_node:
     tf_debug_log_period_sec: 2.0
 
     # 안전을 위해 기본값은 dry_run입니다. 실제 구동 확인 후 false로 바꾸세요.
-    dry_run: true
+    dry_run: false
     enable_sdk_safety_box: true
     sdk_x_min: 50.0
     sdk_x_max: 750.0
