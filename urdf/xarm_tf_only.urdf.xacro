@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="cap_robot_xarm_tf_only">
+  <!--
+    TF-only xArm model wrapper.
+
+    The external ArUco calibration node owns the parent transform of agent_base
+    (e.g. workspace_0 -> robot_1_base). This URDF only publishes the xArm
+    kinematic chain below that already-existing base frame.
+  -->
+  <xacro:arg name="agent_base" default="robot_1_base"/>
+  <xacro:arg name="prefix" default="agent1_"/>
+  <xacro:arg name="hw_ns" default="xarm"/>
+  <xacro:arg name="dof" default="6"/>
+  <xacro:arg name="robot_type" default="xarm"/>
+  <xacro:arg name="add_gripper" default="false"/>
+
+  <!-- xarm_device_macro requires attach_to to be a link in this URDF. -->
+  <link name="$(arg agent_base)"/>
+
+  <xacro:include filename="$(find xarm_description)/urdf/xarm_device_macro.xacro"/>
+
+  <xacro:xarm_device
+      prefix="$(arg prefix)"
+      hw_ns="$(arg hw_ns)"
+      dof="$(arg dof)"
+      robot_type="$(arg robot_type)"
+      add_gripper="$(arg add_gripper)"
+      attach_to="$(arg agent_base)"
+      attach_xyz="0 0 0"
+      attach_rpy="0 0 0"
+      create_attach_link="false"
+      load_gazebo_plugin="false"/>
+</robot>

@@ -1,0 +1,10 @@
+description: "Agent 1 idealized hand-eye TF: agent1_link6 -> agent1/camera_link"
+parent_frame: agent1_link6
+child_frame: agent1/camera_link
+T_parent_child:
+  matrix:
+    - [0.0, 0.0, -1.0, 0.105]
+    - [0.0, 1.0,  0.0, 0.020]
+    - [1.0, 0.0,  0.0, 0.085]
+    - [0.0, 0.0,  0.0, 1.000]
+note: "Uses the user-selected idealized camera_link-basis transform. RealSense owns camera_link -> camera_color_optical_frame."

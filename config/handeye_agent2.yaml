@@ -1,0 +1,10 @@
+description: "Agent 2 idealized hand-eye TF: agent2_link6 -> agent2/camera_link"
+parent_frame: agent2_link6
+child_frame: agent2/camera_link
+T_parent_child:
+  matrix:
+    - [0.0, 0.0, -1.0, 0.105]
+    - [0.0, 1.0,  0.0, 0.020]
+    - [1.0, 0.0,  0.0, 0.025]
+    - [0.0, 0.0,  0.0, 1.000]
+note: "Converted from the Agent 2 link6 -> camera_color_optical_frame result using the selected idealized RealSense camera_link -> color_optical offset of 0.015 m. RealSense owns camera_link -> camera_color_optical_frame."

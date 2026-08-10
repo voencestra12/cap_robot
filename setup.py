@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/prompts', glob('prompts/*.txt')),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/urdf', glob('urdf/*.xacro')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,6 +26,7 @@ setup(
             'aruco_calib = cap_robot.aruco_calib:main',
             'robot_agent = cap_robot.robot_agent:main',
             'workstation_llm = cap_robot.workstation_llm:main',
+            'mount_tf = cap_robot.mount_tf:main',
         ],
     },
 )
