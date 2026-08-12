@@ -58,7 +58,6 @@ class RobotAgentNode(Node):
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
         self.declare_parameter('enable_perception', True)
-        self.declare_parameter('enable_command_input', True)
         # 예: ['agent1:A|B'] 또는 ['agent1:A', 'agent2:B']
         # 이번 TF 테스트는 robot_1_base 하나로 A/B구역을 모두 검증할 수 있게 기본값을 agent1:A|B로 둡니다.
         self.declare_parameter('agent_specs', ['agent1:A|B'])
@@ -95,11 +94,11 @@ class RobotAgentNode(Node):
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
         self.declare_parameter('prompt_file', 'agent_policy.txt')
         self.declare_parameter('yolo_model_path', 'yolo11m-seg.pt')
+        self.declare_parameter('guidebook_topic', '/mission/guidebook')
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
-        self.enable_command_input = bool(self.get_parameter('enable_command_input').value)
         self.agent_specs = self.parse_agent_specs(self.get_parameter('agent_specs').value)
         self.use_tf_workspace = bool(self.get_parameter('use_tf_workspace').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value).strip()
@@ -129,14 +128,13 @@ class RobotAgentNode(Node):
         self.ollama_url = str(self.get_parameter('ollama_url').value).strip()
         self.prompt_file = str(self.get_parameter('prompt_file').value).strip()
         self.yolo_model_path = str(self.get_parameter('yolo_model_path').value).strip()
+        self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
         self.prompt_path = self.resolve_prompt_path(self.prompt_file)
 
         if not self.agent_id or not self.robot_ip:
             raise ValueError('agent_id와 robot_ip는 비어 있을 수 없습니다.')
         if self.agent_id not in self.agent_specs:
             raise ValueError(f'{self.agent_id}가 agent_specs에 없습니다: {self.agent_specs}')
-        if self.enable_command_input and not self.enable_perception:
-            raise ValueError('현재 단계에서는 명령 입력 Agent에 perception이 필요합니다.')
         if self.use_tf_workspace and not self.workspace_frame:
             raise ValueError('TF workspace 사용 시 workspace_frame은 비어 있을 수 없습니다.')
         if self.use_tf_workspace and not self.agent_base_frames:
@@ -172,15 +170,32 @@ class RobotAgentNode(Node):
         self.arm = XArmAPI(self.robot_ip, is_radian=False)
         self.get_logger().info(f'✅ [{self.agent_id}] 로봇 연결 완료!')
 
+        # Workstation이 발행한 동일한 가이드북을 모든 Agent가 받습니다.
+        # 현재 단계에서는 가이드북을 저장하고 depends_on에 따라 READY/BLOCKED만 계산하며,
+        # 실제 LLM 호출이나 로봇 실행에는 아직 연결하지 않습니다.
+        self.current_mission_id = None
+        self.guidebook_tasks = {}
+        self.guidebook_task_status = {}
+        self.guidebook_lock = threading.Lock()
+
+        guidebook_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.guidebook_sub = self.create_subscription(
+            String,
+            self.guidebook_topic,
+            self.guidebook_callback,
+            guidebook_qos,
+        )
+
+        # 기존 /agent_task 기반 실행 경로는 회귀 방지를 위해 그대로 유지합니다.
         # 모든 Agent가 같은 토픽을 구독하고 assignee_id가 자신인 작업만 실행합니다.
         self.task_pub = self.create_publisher(String, '/agent_task', 10)
         self.task_sub = self.create_subscription(String, '/agent_task', self.task_callback, 10)
         self.pose_publisher = self.create_publisher(Float32MultiArray, '/mouse_target_pose', 10)
-        self.prompt_sub = None
-        if self.enable_command_input:
-            self.prompt_sub = self.create_subscription(
-                String, '/human_command', self.command_callback, 10
-            )
 
         self.latest_poses = {}
         self.current_detected_items = []
@@ -244,10 +259,96 @@ class RobotAgentNode(Node):
         )
         self.get_logger().info(
             f'✅ [{self.agent_id}] 준비 완료 '
-            f'(perception={self.enable_perception}, command={self.enable_command_input}, '
+            f'(perception={self.enable_perception}, '
             f'zones={self.agent_specs[self.agent_id]}, '
-            f'use_tf_workspace={self.use_tf_workspace})'
+            f'use_tf_workspace={self.use_tf_workspace}, '
+            f'guidebook_topic={self.guidebook_topic})'
         )
+
+    def guidebook_callback(self, msg):
+        """Workstation guidebook을 저장하고 각 Task의 초기 READY/BLOCKED 상태를 계산합니다.
+
+        이 단계에서는 가이드북을 실제 정책 생성이나 로봇 실행에 연결하지 않습니다.
+        """
+        try:
+            guidebook = json.loads(msg.data)
+            if not isinstance(guidebook, dict):
+                raise ValueError('guidebook은 JSON 객체여야 합니다.')
+
+            mission_id = str(guidebook.get('mission_id', '')).strip()
+            tasks = guidebook.get('tasks')
+            if not mission_id:
+                raise ValueError('mission_id가 비어 있습니다.')
+            if not isinstance(tasks, list) or not tasks:
+                raise ValueError('tasks는 비어 있지 않은 배열이어야 합니다.')
+
+            task_map = {}
+            for index, task in enumerate(tasks):
+                if not isinstance(task, dict):
+                    raise ValueError(f'tasks[{index}]는 JSON 객체여야 합니다.')
+
+                task_id = str(task.get('task_id', '')).strip()
+                depends_on = task.get('depends_on')
+                if not task_id:
+                    raise ValueError(f'tasks[{index}].task_id가 비어 있습니다.')
+                if task_id in task_map:
+                    raise ValueError(f'중복 task_id입니다: {task_id}')
+                if not isinstance(depends_on, list):
+                    raise ValueError(f'{task_id}.depends_on은 배열이어야 합니다.')
+
+                normalized_task = dict(task)
+                normalized_task['task_id'] = task_id
+                normalized_task['depends_on'] = [str(dep).strip() for dep in depends_on]
+                task_map[task_id] = normalized_task
+
+            known_task_ids = set(task_map)
+            for task_id, task in task_map.items():
+                unknown_dependencies = [
+                    dep for dep in task['depends_on']
+                    if dep not in known_task_ids
+                ]
+                if unknown_dependencies:
+                    raise ValueError(
+                        f'{task_id}가 존재하지 않는 선행 Task를 참조합니다: '
+                        f'{unknown_dependencies}'
+                    )
+
+            with self.guidebook_lock:
+                self.current_mission_id = mission_id
+                self.guidebook_tasks = task_map
+                self.guidebook_task_status = {
+                    task_id: 'BLOCKED' for task_id in task_map
+                }
+                self.refresh_guidebook_task_states_locked()
+                status_snapshot = dict(self.guidebook_task_status)
+
+            self.get_logger().info(
+                f'📘 [{self.agent_id}] Guidebook 수신: '
+                f'mission_id={mission_id}, tasks={len(task_map)}'
+            )
+            for task_id, task in task_map.items():
+                self.get_logger().info(
+                    f'  - {task_id}: {status_snapshot[task_id]} | '
+                    f'depends_on={task["depends_on"]} | '
+                    f'{task.get("description", "")}'
+                )
+
+        except Exception as error:
+            self.get_logger().error(f'❌ Guidebook 수신/해석 실패: {error}')
+
+    def refresh_guidebook_task_states_locked(self):
+        """guidebook_lock을 잡은 상태에서 depends_on만으로 READY/BLOCKED를 계산합니다."""
+        for task_id, task in self.guidebook_tasks.items():
+            current = self.guidebook_task_status.get(task_id)
+            if current in ('CLAIMED', 'EXECUTING', 'SUCCEEDED', 'FAILED'):
+                continue
+
+            dependencies = task.get('depends_on', [])
+            ready = all(
+                self.guidebook_task_status.get(dep) == 'SUCCEEDED'
+                for dep in dependencies
+            )
+            self.guidebook_task_status[task_id] = 'READY' if ready else 'BLOCKED'
 
     @staticmethod
     def parse_agent_specs(raw_specs):
@@ -1280,7 +1381,7 @@ class RobotAgentNode(Node):
             daemon=True,
         )
         self._ros_spin_thread.start()
-        self.get_logger().info('🧵 ROS callback spin thread 시작: /tf, camera, command, timer 처리 분리')
+        self.get_logger().info('🧵 ROS callback spin thread 시작: /tf, camera, guidebook, task, timer 처리 분리')
 
     def run(self):
         if self.enable_perception:
