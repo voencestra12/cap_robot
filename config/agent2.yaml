@@ -38,4 +38,8 @@
     llm_model: gemma4:e4b
     ollama_url: http://localhost:11434/api/generate
     prompt_file: agent_policy.txt
+    guidebook_prompt_file: agent_guidebook_policy.txt
+    guidebook_policy_enabled: true
+    guidebook_policy_poll_sec: 1.0
+    guidebook_policy_retry_sec: 5.0
     guidebook_topic: /mission/guidebook

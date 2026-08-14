@@ -93,6 +93,12 @@ class RobotAgentNode(Node):
         self.declare_parameter('llm_model', 'gemma4:e4b')
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
         self.declare_parameter('prompt_file', 'agent_policy.txt')
+        # Guidebook 기반 정책 생성은 기존 사용자 명령용 prompt와 분리합니다.
+        # 기존 실행 경로를 보존하면서 새 경로를 단계적으로 검증하기 위한 설정입니다.
+        self.declare_parameter('guidebook_prompt_file', 'agent_guidebook_policy.txt')
+        self.declare_parameter('guidebook_policy_enabled', True)
+        self.declare_parameter('guidebook_policy_poll_sec', 1.0)
+        self.declare_parameter('guidebook_policy_retry_sec', 5.0)
         self.declare_parameter('yolo_model_path', 'yolo11m-seg.pt')
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
 
@@ -127,9 +133,24 @@ class RobotAgentNode(Node):
         self.llm_model = str(self.get_parameter('llm_model').value).strip()
         self.ollama_url = str(self.get_parameter('ollama_url').value).strip()
         self.prompt_file = str(self.get_parameter('prompt_file').value).strip()
+        self.guidebook_prompt_file = str(
+            self.get_parameter('guidebook_prompt_file').value
+        ).strip()
+        self.guidebook_policy_enabled = bool(
+            self.get_parameter('guidebook_policy_enabled').value
+        )
+        self.guidebook_policy_poll_sec = float(
+            self.get_parameter('guidebook_policy_poll_sec').value
+        )
+        self.guidebook_policy_retry_sec = float(
+            self.get_parameter('guidebook_policy_retry_sec').value
+        )
         self.yolo_model_path = str(self.get_parameter('yolo_model_path').value).strip()
         self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
         self.prompt_path = self.resolve_prompt_path(self.prompt_file)
+        self.guidebook_prompt_path = self.resolve_prompt_path(
+            self.guidebook_prompt_file
+        )
 
         if not self.agent_id or not self.robot_ip:
             raise ValueError('agent_id와 robot_ip는 비어 있을 수 없습니다.')
@@ -174,9 +195,17 @@ class RobotAgentNode(Node):
         # 현재 단계에서는 가이드북을 저장하고 depends_on에 따라 READY/BLOCKED만 계산하며,
         # 실제 LLM 호출이나 로봇 실행에는 아직 연결하지 않습니다.
         self.current_mission_id = None
+        self.current_guidebook = {}
         self.guidebook_tasks = {}
         self.guidebook_task_status = {}
         self.guidebook_lock = threading.Lock()
+
+        # Step 1: READY Guidebook Task를 Agent LLM 정책 후보로 변환하는 경로만 추가합니다.
+        # 아직 claim/status 또는 실제 /agent_task 발행에는 연결하지 않습니다.
+        self.guidebook_policy_candidates = {}
+        self.guidebook_policy_inflight = set()
+        self.guidebook_policy_last_attempt = {}
+        self.guidebook_policy_lock = threading.Lock()
 
         guidebook_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -189,6 +218,10 @@ class RobotAgentNode(Node):
             self.guidebook_topic,
             self.guidebook_callback,
             guidebook_qos,
+        )
+        self.guidebook_policy_timer = self.create_timer(
+            max(0.2, self.guidebook_policy_poll_sec),
+            self.poll_ready_guidebook_tasks,
         )
 
         # 기존 /agent_task 기반 실행 경로는 회귀 방지를 위해 그대로 유지합니다.
@@ -249,6 +282,12 @@ class RobotAgentNode(Node):
         self.get_logger().info(
             f'🧠 LLM 설정: model={self.llm_model}, url={self.ollama_url}, '
             f'prompt={self.prompt_path}'
+        )
+        self.get_logger().info(
+            f'📘 Guidebook policy: enabled={self.guidebook_policy_enabled}, '
+            f'prompt={self.guidebook_prompt_path}, '
+            f'poll={self.guidebook_policy_poll_sec:.1f}s, '
+            f'retry={self.guidebook_policy_retry_sec:.1f}s'
         )
         self.get_logger().info(
             f'🧭 xArm command frame mode={self.xarm_command_frame_mode}, '
@@ -315,12 +354,18 @@ class RobotAgentNode(Node):
 
             with self.guidebook_lock:
                 self.current_mission_id = mission_id
+                self.current_guidebook = dict(guidebook)
                 self.guidebook_tasks = task_map
                 self.guidebook_task_status = {
                     task_id: 'BLOCKED' for task_id in task_map
                 }
                 self.refresh_guidebook_task_states_locked()
                 status_snapshot = dict(self.guidebook_task_status)
+
+            with self.guidebook_policy_lock:
+                self.guidebook_policy_candidates.clear()
+                self.guidebook_policy_inflight.clear()
+                self.guidebook_policy_last_attempt.clear()
 
             self.get_logger().info(
                 f'📘 [{self.agent_id}] Guidebook 수신: '
@@ -863,6 +908,259 @@ class RobotAgentNode(Node):
             return source_path
 
         raise FileNotFoundError(f'프롬프트 파일을 찾을 수 없습니다: {prompt_file}')
+
+
+    @staticmethod
+    def poses_for_prompt(poses_dict):
+        """workspace_0 기준 perception pose를 LLM 입력용 JSON 객체로 바꿉니다."""
+        result = {}
+        for name, pose in poses_dict.items():
+            if not isinstance(pose, (list, tuple)) or len(pose) < 4:
+                continue
+            result[str(name)] = {
+                'x_mm': round(float(pose[0]), 1),
+                'y_mm': round(float(pose[1]), 1),
+                'z_mm': round(float(pose[2]), 1),
+                'yaw_deg': round(float(np.degrees(float(pose[3]))), 1),
+            }
+        return result
+
+    def load_guidebook_policy_prompt(self, guidebook, task, detected_items, poses_dict):
+        """Guidebook READY Task 하나를 위한 Agent LLM prompt를 생성합니다."""
+        template_text = self.guidebook_prompt_path.read_text(encoding='utf-8')
+        template = Template(template_text)
+        zone_frame_text = (
+            f'{self.workspace_frame} 기준' if self.use_tf_workspace else f'{self.agent_id} 기준'
+        )
+        return template.substitute(
+            local_agent_id=self.agent_id,
+            mission_id=str(guidebook.get('mission_id', '')),
+            mission_goal=str(guidebook.get('goal', '')),
+            guidebook_json=json.dumps(guidebook, ensure_ascii=False),
+            task_json=json.dumps(task, ensure_ascii=False),
+            detected_items=json.dumps(detected_items, ensure_ascii=False),
+            detected_poses=json.dumps(
+                self.poses_for_prompt(poses_dict),
+                ensure_ascii=False,
+            ),
+            agents=json.dumps(self.agent_specs, ensure_ascii=False),
+            zone_frame=zone_frame_text,
+            zones=json.dumps(self.ZONES, ensure_ascii=False),
+            pick_place_z_offset_mm=f'{self.PICK_PLACE_Z_OFFSET_MM:.1f}',
+            default_pnp_actions=json.dumps(
+                self.DEFAULT_PNP_ACTIONS,
+                ensure_ascii=False,
+            ),
+        )
+
+    def ask_llm_for_guidebook_policy(self, guidebook, task, detected_items, poses_dict):
+        """READY Guidebook Task에 대한 이 Agent의 PnP 정책 후보를 생성합니다."""
+        prompt = self.load_guidebook_policy_prompt(
+            guidebook,
+            task,
+            detected_items,
+            poses_dict,
+        )
+        payload = {
+            'model': self.llm_model,
+            'prompt': prompt,
+            'format': 'json',
+            'stream': False,
+            'options': {'temperature': 0.0, 'num_predict': 2048},
+        }
+        task_id = str(task.get('task_id', ''))
+        self.get_logger().info(
+            f'🧠 [{self.agent_id}] Guidebook {task_id} 정책 후보 생성 중...'
+        )
+        try:
+            response = requests.post(self.ollama_url, json=payload, timeout=60.0)
+            response.raise_for_status()
+            result = json.loads(response.json()['response'].strip())
+            if not isinstance(result, dict):
+                raise ValueError('Agent LLM 응답은 JSON 객체여야 합니다.')
+            self.get_logger().info(
+                f'🤖 [{self.agent_id}] Guidebook {task_id} Policy 후보: {result}'
+            )
+            return result
+        except Exception as error:
+            self.get_logger().error(
+                f'🚨 [{self.agent_id}] Guidebook {task_id} Policy 생성 실패: {error}'
+            )
+            return {}
+
+    def validate_guidebook_policy_candidate(self, result, task, poses_dict):
+        """Step 1 정책 후보를 기존 build_tasks()가 이해할 수 있는 형태로 검증합니다.
+
+        현재 단계에서는 기존 executor를 그대로 재사용하기 위해 destination을
+        A/B zone + u/v 형식으로 제한합니다. 이 제한은 임시 호환 계층이며,
+        향후 zone 하드코딩 제거 시 Target Resolver로 대체할 예정입니다.
+        """
+        if not isinstance(result, dict):
+            raise ValueError('Guidebook 정책 후보는 JSON 객체여야 합니다.')
+
+        can_execute = result.get('can_execute')
+        if not isinstance(can_execute, bool):
+            raise ValueError('can_execute는 true 또는 false여야 합니다.')
+
+        if not can_execute:
+            reason = str(result.get('reason', '')).strip() or '실행 불가'
+            return None, reason
+
+        target = self.find_detected_target(result.get('target', ''), poses_dict)
+        if target is None:
+            raise ValueError(
+                f"정책의 target을 현재 perception에서 찾을 수 없습니다: {result.get('target')}"
+            )
+
+        destination = result.get('destination')
+        if not isinstance(destination, dict):
+            raise ValueError('destination은 JSON 객체여야 합니다.')
+
+        destination_type = str(destination.get('type', '')).strip().lower()
+        if destination_type != 'zone':
+            raise ValueError(
+                "Step 1에서는 destination.type='zone'만 지원합니다. "
+                '향후 Target Resolver 단계에서 relative/workspace 표현을 추가합니다.'
+            )
+
+        zone = self.normalize_zone(destination.get('zone', ''))
+        if zone is None:
+            raise ValueError('destination.zone은 A 또는 B여야 합니다.')
+        if zone not in self.agent_specs[self.agent_id]:
+            return None, f'{self.agent_id}가 {zone}구역에 도달할 수 없습니다.'
+
+        try:
+            u = float(destination.get('u'))
+            v = float(destination.get('v'))
+        except (TypeError, ValueError) as error:
+            raise ValueError('destination.u/v에는 숫자가 필요합니다.') from error
+
+        actions = self.validate_actions(result.get('actions'))
+
+        legacy_policy = {
+            'generated_policy': [
+                {
+                    'agent_id': self.agent_id,
+                    'target': target,
+                    'destination': f'{zone}구역',
+                    'place_u': u,
+                    'place_v': v,
+                    'actions': actions,
+                }
+            ]
+        }
+        return legacy_policy, ''
+
+    def poll_ready_guidebook_tasks(self):
+        """READY Task 중 아직 후보를 만들지 않은 하나를 비동기로 계획합니다."""
+        if not self.guidebook_policy_enabled:
+            return
+        if not self.latest_poses:
+            return
+
+        with self.guidebook_lock:
+            mission_id = self.current_mission_id
+            if not mission_id:
+                return
+            ready_ids = [
+                task_id
+                for task_id, status in self.guidebook_task_status.items()
+                if status == 'READY'
+            ]
+
+        if not ready_ids:
+            return
+
+        now = time.time()
+        selected = None
+        with self.guidebook_policy_lock:
+            for task_id in ready_ids:
+                if task_id in self.guidebook_policy_candidates:
+                    continue
+                if task_id in self.guidebook_policy_inflight:
+                    continue
+                last = self.guidebook_policy_last_attempt.get(task_id, 0.0)
+                if now - last < self.guidebook_policy_retry_sec:
+                    continue
+                self.guidebook_policy_last_attempt[task_id] = now
+                self.guidebook_policy_inflight.add(task_id)
+                selected = task_id
+                break
+
+        if selected is not None:
+            threading.Thread(
+                target=self.plan_one_guidebook_task,
+                args=(selected,),
+                daemon=True,
+            ).start()
+
+    def plan_one_guidebook_task(self, task_id):
+        """READY Guidebook Task 하나를 기존 task 형식의 실행 후보까지 변환합니다."""
+        try:
+            with self.guidebook_lock:
+                if self.guidebook_task_status.get(task_id) != 'READY':
+                    return
+                guidebook = dict(self.current_guidebook)
+                task = dict(self.guidebook_tasks[task_id])
+                mission_id = self.current_mission_id
+
+            with self.perception_lock:
+                poses_dict = dict(self.latest_poses)
+                detected_items = list(self.current_detected_items)
+
+            if not poses_dict:
+                return
+
+            result = self.ask_llm_for_guidebook_policy(
+                guidebook,
+                task,
+                detected_items,
+                poses_dict,
+            )
+            if not result:
+                return
+
+            legacy_policy, reason = self.validate_guidebook_policy_candidate(
+                result,
+                task,
+                poses_dict,
+            )
+            if legacy_policy is None:
+                self.get_logger().info(
+                    f'ℹ️ [{self.agent_id}] {task_id} 후보 제외: {reason}'
+                )
+                return
+
+            # 핵심: 새 Guidebook 정책을 기존 build_tasks()에 맞춰 변환합니다.
+            # TF / zone 계산 / actions 검증 / 기존 task 구조를 그대로 재사용합니다.
+            built = self.build_tasks(legacy_policy, poses_dict)
+            if len(built) != 1:
+                raise ValueError(
+                    f'Guidebook Task 하나에서 실행 후보 {len(built)}개가 생성되었습니다.'
+                )
+
+            execution_task = built[0]
+            execution_task['mission_id'] = mission_id
+            execution_task['guidebook_task_id'] = task_id
+            execution_task['guidebook_description'] = str(task.get('description', ''))
+
+            with self.guidebook_policy_lock:
+                self.guidebook_policy_candidates[task_id] = execution_task
+
+            self.get_logger().info(
+                f'✅ [{self.agent_id}] {task_id} Guidebook→기존 Task 변환 완료 '
+                f'(아직 실행/claim하지 않음): target={execution_task["target"]}, '
+                f'destination={execution_task["destination"]}, '
+                f'actions={len(execution_task["actions"])}'
+            )
+
+        except Exception as error:
+            self.get_logger().error(
+                f'❌ [{self.agent_id}] {task_id} Guidebook 정책 후보 처리 실패: {error}'
+            )
+        finally:
+            with self.guidebook_policy_lock:
+                self.guidebook_policy_inflight.discard(task_id)
 
     def load_policy_prompt(self, user_cmd, detected_items):
         """robot_agent.py에서 .txt 프롬프트를 직접 로드하고 값을 채웁니다."""
