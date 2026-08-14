@@ -43,3 +43,12 @@
     guidebook_policy_poll_sec: 1.0
     guidebook_policy_retry_sec: 5.0
     guidebook_topic: /mission/guidebook
+
+    # Guidebook 기반 Agent 간 ROS coordination
+    coordination_enabled: true
+    task_claim_topic: /mission/task_claim
+    task_status_topic: /mission/task_status
+    claim_window_sec: 2.0
+    status_sync_grace_sec: 2.0
+    ignore_startup_retained_guidebook: true
+    startup_retained_guard_sec: 5.0

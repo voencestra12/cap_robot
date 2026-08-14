@@ -51,9 +51,12 @@ class RobotAgentNode(Node):
     DEFAULT_PNP_ACTIONS = LLM_DEFAULT_PNP_ACTIONS
     HOME_POSE = (200.0, 0.0, 300.0, 0.0)
     SAFE_RETREAT_POSE = (100.0, 350.0, 400.0, 0.0)
+    CLAIM_WAIT_SEC = 2.0
+    STARTUP_GUIDEBOOK_IGNORE_SEC = 5.0
 
     def __init__(self):
         super().__init__('robot_agent_node')
+        self.node_started_wall_time = time.time()
 
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
@@ -101,6 +104,8 @@ class RobotAgentNode(Node):
         self.declare_parameter('guidebook_policy_retry_sec', 5.0)
         self.declare_parameter('yolo_model_path', 'yolo11m-seg.pt')
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
+        self.declare_parameter('task_claim_topic', '/mission/task_claim')
+        self.declare_parameter('task_status_topic', '/mission/task_status')
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
@@ -147,6 +152,8 @@ class RobotAgentNode(Node):
         )
         self.yolo_model_path = str(self.get_parameter('yolo_model_path').value).strip()
         self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
+        self.task_claim_topic = str(self.get_parameter('task_claim_topic').value).strip()
+        self.task_status_topic = str(self.get_parameter('task_status_topic').value).strip()
         self.prompt_path = self.resolve_prompt_path(self.prompt_file)
         self.guidebook_prompt_path = self.resolve_prompt_path(
             self.guidebook_prompt_file
@@ -207,6 +214,11 @@ class RobotAgentNode(Node):
         self.guidebook_policy_last_attempt = {}
         self.guidebook_policy_lock = threading.Lock()
 
+        # Step 2 최소 coordination 상태: Task별 claim 후보와 이미 결정된 winner만 저장합니다.
+        self.guidebook_claims = {}
+        self.guidebook_claim_started = set()
+        self.guidebook_claim_lock = threading.Lock()
+
         guidebook_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -222,6 +234,17 @@ class RobotAgentNode(Node):
         self.guidebook_policy_timer = self.create_timer(
             max(0.2, self.guidebook_policy_poll_sec),
             self.poll_ready_guidebook_tasks,
+        )
+
+        # 두 Agent가 모두 실행 중인 상태에서 쓰는 최소 claim/status 채널입니다.
+        # 이번 단계는 별도 custom msg 없이 std_msgs/String JSON을 사용합니다.
+        self.task_claim_pub = self.create_publisher(String, self.task_claim_topic, 10)
+        self.task_claim_sub = self.create_subscription(
+            String, self.task_claim_topic, self.task_claim_callback, 10
+        )
+        self.task_status_pub = self.create_publisher(String, self.task_status_topic, 10)
+        self.task_status_sub = self.create_subscription(
+            String, self.task_status_topic, self.task_status_callback, 10
         )
 
         # 기존 /agent_task 기반 실행 경로는 회귀 방지를 위해 그대로 유지합니다.
@@ -318,6 +341,15 @@ class RobotAgentNode(Node):
             tasks = guidebook.get('tasks')
             if not mission_id:
                 raise ValueError('mission_id가 비어 있습니다.')
+
+            # /mission/guidebook이 TRANSIENT_LOCAL이라 launch 직후 이전 mission이 다시 올 수 있습니다.
+            # 이번 최소 Step 2에서는 두 Agent를 먼저 띄운 뒤 새 mission을 보내는 방식으로 안전하게 테스트합니다.
+            if time.time() - self.node_started_wall_time < self.STARTUP_GUIDEBOOK_IGNORE_SEC:
+                self.get_logger().warn(
+                    f'🛑 [{self.agent_id}] startup 직후 Guidebook 무시: mission_id={mission_id}. '
+                    '두 Agent 준비 후 새 mission을 발행하세요.'
+                )
+                return
             if not isinstance(tasks, list) or not tasks:
                 raise ValueError('tasks는 비어 있지 않은 배열이어야 합니다.')
 
@@ -353,6 +385,11 @@ class RobotAgentNode(Node):
                     )
 
             with self.guidebook_lock:
+                if self.current_mission_id == mission_id:
+                    self.get_logger().info(
+                        f'📘 [{self.agent_id}] 동일 mission 재수신 무시: {mission_id}'
+                    )
+                    return
                 self.current_mission_id = mission_id
                 self.current_guidebook = dict(guidebook)
                 self.guidebook_tasks = task_map
@@ -366,6 +403,10 @@ class RobotAgentNode(Node):
                 self.guidebook_policy_candidates.clear()
                 self.guidebook_policy_inflight.clear()
                 self.guidebook_policy_last_attempt.clear()
+
+            with self.guidebook_claim_lock:
+                self.guidebook_claims.clear()
+                self.guidebook_claim_started.clear()
 
             self.get_logger().info(
                 f'📘 [{self.agent_id}] Guidebook 수신: '
@@ -394,6 +435,173 @@ class RobotAgentNode(Node):
                 for dep in dependencies
             )
             self.guidebook_task_status[task_id] = 'READY' if ready else 'BLOCKED'
+
+
+    def task_claim_callback(self, msg):
+        """READY Task에 대해 실행 가능한 Agent가 보낸 claim을 모읍니다."""
+        try:
+            claim = json.loads(msg.data)
+            mission_id = str(claim.get('mission_id', '')).strip()
+            task_id = str(claim.get('task_id', '')).strip()
+            agent_id = str(claim.get('agent_id', '')).strip()
+            if not mission_id or not task_id or not agent_id:
+                raise ValueError('task_claim 필수 필드가 없습니다.')
+
+            with self.guidebook_lock:
+                if mission_id != self.current_mission_id:
+                    return
+                if self.guidebook_task_status.get(task_id) != 'READY':
+                    return
+
+            with self.guidebook_claim_lock:
+                self.guidebook_claims.setdefault(task_id, set()).add(agent_id)
+
+            self.get_logger().info(
+                f'📨 [{self.agent_id}] CLAIM 수신: {task_id} <- {agent_id}'
+            )
+        except Exception as error:
+            self.get_logger().error(f'❌ task_claim 해석 실패: {error}')
+
+    def publish_task_claim(self, task_id):
+        """자기 Policy 후보가 유효할 때 claim을 1회 발행하고 winner 결정을 예약합니다."""
+        with self.guidebook_lock:
+            mission_id = self.current_mission_id
+            if not mission_id or self.guidebook_task_status.get(task_id) != 'READY':
+                return
+
+        claim = {
+            'mission_id': mission_id,
+            'task_id': task_id,
+            'agent_id': self.agent_id,
+        }
+
+        with self.guidebook_claim_lock:
+            self.guidebook_claims.setdefault(task_id, set()).add(self.agent_id)
+            if task_id in self.guidebook_claim_started:
+                return
+            self.guidebook_claim_started.add(task_id)
+
+        msg = String()
+        msg.data = json.dumps(claim, ensure_ascii=False)
+        self.task_claim_pub.publish(msg)
+        self.get_logger().info(f'📣 [{self.agent_id}] CLAIM 발행: {task_id}')
+
+        threading.Thread(
+            target=self.finalize_task_claim,
+            args=(mission_id, task_id),
+            daemon=True,
+        ).start()
+
+    def finalize_task_claim(self, mission_id, task_id):
+        """짧은 claim window 뒤 claimant의 agent_id 사전순으로 winner를 정합니다.
+
+        현재 Step 2의 목적은 중복 실행 방지와 status 흐름 검증입니다.
+        더 복잡한 협상/우선순위 정책은 이 경로가 안정된 뒤 확장합니다.
+        """
+        time.sleep(self.CLAIM_WAIT_SEC)
+
+        with self.guidebook_lock:
+            if mission_id != self.current_mission_id:
+                return
+            if self.guidebook_task_status.get(task_id) != 'READY':
+                return
+
+        with self.guidebook_claim_lock:
+            claimants = sorted(self.guidebook_claims.get(task_id, set()))
+
+        if not claimants:
+            return
+
+        winner = claimants[0]
+        self.get_logger().info(
+            f'🏁 [{self.agent_id}] CLAIM WINNER: {task_id} -> {winner} '
+            f'(claimants={claimants})'
+        )
+        if winner != self.agent_id:
+            return
+
+        with self.guidebook_policy_lock:
+            task = self.guidebook_policy_candidates.get(task_id)
+        if not isinstance(task, dict):
+            self.get_logger().error(
+                f'❌ [{self.agent_id}] {task_id} winner이지만 실행 후보가 없습니다.'
+            )
+            return
+
+        self.publish_task_status(task_id, 'CLAIMED')
+
+        dispatch = dict(task)
+        dispatch['assignee_id'] = self.agent_id
+        msg = String()
+        msg.data = json.dumps(dispatch, ensure_ascii=False)
+        self.task_pub.publish(msg)
+        self.get_logger().info(
+            f'➡️ [{self.agent_id}] /agent_task 발행: {task_id} / target={dispatch["target"]}'
+        )
+
+    def publish_task_status(self, task_id, status):
+        """Guidebook Task 상태를 로컬에 먼저 반영하고 다른 Agent에도 공유합니다."""
+        with self.guidebook_lock:
+            mission_id = self.current_mission_id
+        if not mission_id:
+            return
+
+        payload = {
+            'mission_id': mission_id,
+            'task_id': task_id,
+            'agent_id': self.agent_id,
+            'status': status,
+        }
+        self.apply_task_status(payload)
+
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.task_status_pub.publish(msg)
+
+    def task_status_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            self.apply_task_status(payload)
+        except Exception as error:
+            self.get_logger().error(f'❌ task_status 해석 실패: {error}')
+
+    def apply_task_status(self, payload):
+        """CLAIMED/EXECUTING/SUCCEEDED/FAILED를 로컬 Guidebook 상태에 반영합니다."""
+        mission_id = str(payload.get('mission_id', '')).strip()
+        task_id = str(payload.get('task_id', '')).strip()
+        agent_id = str(payload.get('agent_id', '')).strip()
+        status = str(payload.get('status', '')).strip().upper()
+        if status not in ('CLAIMED', 'EXECUTING', 'SUCCEEDED', 'FAILED'):
+            raise ValueError(f'지원하지 않는 task status: {status}')
+
+        with self.guidebook_lock:
+            if mission_id != self.current_mission_id:
+                return
+            if task_id not in self.guidebook_tasks:
+                return
+
+            current = self.guidebook_task_status.get(task_id)
+            if current in ('SUCCEEDED', 'FAILED') or current == status:
+                return
+            status_rank = {'BLOCKED': 0, 'READY': 0, 'CLAIMED': 1, 'EXECUTING': 2,
+                           'SUCCEEDED': 3, 'FAILED': 3}
+            if status_rank.get(status, 0) < status_rank.get(current, 0):
+                return
+
+            self.guidebook_task_status[task_id] = status
+            before = dict(self.guidebook_task_status)
+            self.refresh_guidebook_task_states_locked()
+            after = dict(self.guidebook_task_status)
+
+        self.get_logger().info(
+            f'📡 [{self.agent_id}] {task_id} status={status} by {agent_id}'
+        )
+        for changed_id in after:
+            if before.get(changed_id) != after.get(changed_id):
+                self.get_logger().info(
+                    f'🔄 [{self.agent_id}] {changed_id}: '
+                    f'{before.get(changed_id)} -> {after.get(changed_id)}'
+                )
 
     @staticmethod
     def parse_agent_specs(raw_specs):
@@ -973,7 +1181,7 @@ class RobotAgentNode(Node):
             f'🧠 [{self.agent_id}] Guidebook {task_id} 정책 후보 생성 중...'
         )
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=60.0)
+            response = requests.post(self.ollama_url, json=payload, timeout=300.0)
             response.raise_for_status()
             result = json.loads(response.json()['response'].strip())
             if not isinstance(result, dict):
@@ -1126,6 +1334,9 @@ class RobotAgentNode(Node):
                 poses_dict,
             )
             if legacy_policy is None:
+                # 동일 mission/task에서 실행 불가 판정을 매 poll마다 다시 LLM에 묻지 않습니다.
+                with self.guidebook_policy_lock:
+                    self.guidebook_policy_candidates[task_id] = None
                 self.get_logger().info(
                     f'ℹ️ [{self.agent_id}] {task_id} 후보 제외: {reason}'
                 )
@@ -1144,15 +1355,26 @@ class RobotAgentNode(Node):
             execution_task['guidebook_task_id'] = task_id
             execution_task['guidebook_description'] = str(task.get('description', ''))
 
+            # LLM 응답을 기다리는 동안 다른 Agent가 먼저 Task를 가져갔을 수 있습니다.
+            with self.guidebook_lock:
+                if mission_id != self.current_mission_id:
+                    return
+                if self.guidebook_task_status.get(task_id) != 'READY':
+                    self.get_logger().info(
+                        f'ℹ️ [{self.agent_id}] {task_id}는 Policy 생성 중 이미 처리되어 후보를 폐기합니다.'
+                    )
+                    return
+
             with self.guidebook_policy_lock:
                 self.guidebook_policy_candidates[task_id] = execution_task
 
             self.get_logger().info(
-                f'✅ [{self.agent_id}] {task_id} Guidebook→기존 Task 변환 완료 '
-                f'(아직 실행/claim하지 않음): target={execution_task["target"]}, '
+                f'✅ [{self.agent_id}] {task_id} Guidebook→기존 Task 변환 완료: '
+                f'target={execution_task["target"]}, '
                 f'destination={execution_task["destination"]}, '
                 f'actions={len(execution_task["actions"])}'
             )
+            self.publish_task_claim(task_id)
 
         except Exception as error:
             self.get_logger().error(
@@ -1161,6 +1383,8 @@ class RobotAgentNode(Node):
         finally:
             with self.guidebook_policy_lock:
                 self.guidebook_policy_inflight.discard(task_id)
+                # 긴 timeout 뒤 즉시 재호출되지 않도록 종료 시각을 기준으로 retry합니다.
+                self.guidebook_policy_last_attempt[task_id] = time.time()
 
     def load_policy_prompt(self, user_cmd, detected_items):
         """robot_agent.py에서 .txt 프롬프트를 직접 로드하고 값을 채웁니다."""
@@ -1375,7 +1599,20 @@ class RobotAgentNode(Node):
                     self.is_moving = False
                     return
                 task = self.task_queue.pop(0)
-            if not self.execute_task(task):
+
+            guidebook_task_id = str(task.get('guidebook_task_id', '')).strip()
+            if guidebook_task_id:
+                self.publish_task_status(guidebook_task_id, 'EXECUTING')
+
+            success = self.execute_task(task)
+
+            if guidebook_task_id:
+                self.publish_task_status(
+                    guidebook_task_id,
+                    'SUCCEEDED' if success else 'FAILED'
+                )
+
+            if not success:
                 self.handle_task_failure(task)
                 return
 
