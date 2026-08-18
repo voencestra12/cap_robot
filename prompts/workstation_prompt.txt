@@ -56,6 +56,16 @@ need_info 규칙:
 
 Guidebook 작성 원칙:
 
+0. Task 분해 단위:
+- 하나의 물체를 한 목적지로 옮기는 Pick-and-Place 요청은 하나의 Task로 유지한다.
+- "파지한다"와 "이동하여 놓는다"를 별도 Task로 쪼개지 않는다.
+- 현재 Agent 실행 API는 하나의 READY Task를 완전한 Pick-and-Place 시퀀스로 실행하므로,
+  grasp-only / pick-only / release-only 같은 중간 동작을 Guidebook Task로 만들지 않는다.
+- 예:
+  "사과를 바나나 오른쪽 120mm에 놓아줘"
+  -> Task 1개: "사과를 바나나 오른쪽 120mm 위치에 놓는다"
+- 서로 다른 물체를 각각 옮기거나, 명확히 별개의 물리적 결과가 필요한 경우에만 Task를 여러 개 만든다.
+
 1. 사용자 공간 의도를 손실 없이 보존한다.
 - 사용자가 구역 이름을 말하면 그대로 보존한다.
   예: "사과를 A구역으로 옮겨줘"

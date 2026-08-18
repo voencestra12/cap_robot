@@ -1184,25 +1184,32 @@ class RobotAgentNode(Node):
         try:
             x_mm = float(destination_spec.get('x_mm'))
             y_mm = float(destination_spec.get('y_mm'))
-            z_mm = float(destination_spec.get('z_mm'))
+            z_raw = destination_spec.get('z_mm')
+            z_mm = None if z_raw is None else float(z_raw)
             yaw_deg = float(destination_spec.get('yaw_deg', 0.0))
         except (TypeError, ValueError) as error:
             raise ValueError(
-                'workspace target의 x_mm/y_mm/z_mm/yaw_deg에는 숫자가 필요합니다.'
+                'workspace target의 x_mm/y_mm 및 선택적 z_mm/yaw_deg에는 숫자가 필요합니다.'
             ) from error
 
-        if not all(math.isfinite(value) for value in (x_mm, y_mm, z_mm, yaw_deg)):
+        values = [x_mm, y_mm, yaw_deg] + ([] if z_mm is None else [z_mm])
+        if not all(math.isfinite(value) for value in values):
             raise ValueError('workspace target에 유한한 숫자만 사용할 수 있습니다.')
+
+        reference_place_pose = {
+            'x': x_mm,
+            'y': y_mm,
+            'yaw': float(np.radians(yaw_deg)),
+        }
+        # z를 사용자가 주지 않았으면 억지로 생성하지 않습니다.
+        # executor의 기존 fallback(place.z가 없으면 object.z)을 그대로 사용합니다.
+        if z_mm is not None:
+            reference_place_pose['z'] = z_mm
 
         return {
             'type': 'workspace',
             'label': 'workspace 절대 위치',
-            'reference_place_pose': {
-                'x': x_mm,
-                'y': y_mm,
-                'z': z_mm,
-                'yaw': float(np.radians(yaw_deg)),
-            },
+            'reference_place_pose': reference_place_pose,
             'reservation_zone': None,
         }
 
@@ -1407,13 +1414,14 @@ class RobotAgentNode(Node):
             try:
                 normalized_destination['x_mm'] = float(destination.get('x_mm'))
                 normalized_destination['y_mm'] = float(destination.get('y_mm'))
-                normalized_destination['z_mm'] = float(destination.get('z_mm'))
+                if destination.get('z_mm') is not None:
+                    normalized_destination['z_mm'] = float(destination.get('z_mm'))
                 normalized_destination['yaw_deg'] = float(
                     destination.get('yaw_deg', 0.0)
                 )
             except (TypeError, ValueError) as error:
                 raise ValueError(
-                    'workspace x_mm/y_mm/z_mm/yaw_deg에는 숫자가 필요합니다.'
+                    'workspace x_mm/y_mm 및 선택적 z_mm/yaw_deg에는 숫자가 필요합니다.'
                 ) from error
 
         actions = self.validate_actions(result.get('actions'))
