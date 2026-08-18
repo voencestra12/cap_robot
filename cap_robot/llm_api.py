@@ -28,7 +28,6 @@ DEFAULT_PNP_ACTIONS = [
     {"api": API_MOVE_TO_PLACE, "z_offset": 40, "speed": 90},
     {"api": API_CONTROL_GRIPPER, "position": 850},
     {"api": API_MOVE_TO_PLACE, "z_offset": 200, "speed": 100},
-    {"api": API_RETURN_HOME},
 ]
 
 

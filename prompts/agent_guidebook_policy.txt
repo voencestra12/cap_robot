@@ -58,7 +58,10 @@
 7. move_to_place: 실제 place 위치(z_offset 정확히 $pick_place_z_offset_mm)
 8. gripper open
 9. move_to_place: retreat(z_offset 150 이상)
-10. 필요하면 return_home
+
+여기까지가 표준 Pick-and-Place의 완료이다.
+return_home은 Task가 명시적으로 home 복귀를 요구하거나 별도의 안전/협업 이유가 있을 때만 추가한다.
+일반 Pick-and-Place에는 return_home을 기본으로 추가하지 않는다.
 
 wait는 필요한 위치에 0~2초 범위에서 추가할 수 있다.
 API 순서와 speed/높이 값은 Task에 맞게 결정하되 위 validator 규칙을 반드시 만족해야 한다.
@@ -124,8 +127,7 @@ destination 선택 예:
     {"api":"move_to_place","z_offset":200,"speed":100},
     {"api":"move_to_place","z_offset":40,"speed":90},
     {"api":"control_gripper","position":850},
-    {"api":"move_to_place","z_offset":200,"speed":100},
-    {"api":"return_home"}
+    {"api":"move_to_place","z_offset":200,"speed":100}
   ]
 }
 

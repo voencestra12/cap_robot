@@ -21,7 +21,7 @@
     tf_lookup_delay_sec: 0.5
     tf_debug_log_period_sec: 2.0
 
-    dry_run: true
+    dry_run: false
     enable_sdk_safety_box: true
     sdk_x_min: 50.0
     sdk_x_max: 750.0

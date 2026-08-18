@@ -1018,7 +1018,25 @@ class RobotAgentNode(Node):
         if ret == 0:
             time.sleep(0.5)
             return True
-        self.get_logger().error(f'🚨 로봇 이동 거절됨! 에러 코드: {ret}')
+
+        # 실패 원인을 다음 테스트에서 바로 확인할 수 있도록 controller 상태를 함께 남긴다.
+        try:
+            state = self.arm.state
+        except Exception:
+            state = 'unknown'
+        try:
+            error_code = self.arm.error_code
+        except Exception:
+            error_code = 'unknown'
+        try:
+            warn_code = self.arm.warn_code
+        except Exception:
+            warn_code = 'unknown'
+
+        self.get_logger().error(
+            f'🚨 로봇 이동 거절됨! ret={ret}, state={state}, '
+            f'error_code={error_code}, warn_code={warn_code}, label={label}'
+        )
         return False
 
     def move_to_robot_tf(self, x, y, z, yaw=0.0, speed=100.0, label=''):
@@ -1920,7 +1938,33 @@ class RobotAgentNode(Node):
         )
 
     def handle_task_failure(self, failed_task):
-        self.get_logger().error(f"🚨 [{failed_task['task_id']}] 실패. 즉시 복구·대피합니다.")
+        """실패 처리.
+
+        새 Guidebook 경로에서는 실패 원인이 확인되지 않은 상태에서 로봇을 자동으로
+        다시 enable한 뒤 SAFE_RETREAT로 움직이지 않는다. FAILED status가 이미 공유되므로
+        후속 depends_on Task는 BLOCKED 상태를 유지한다.
+
+        legacy /agent_task 경로만 기존 자동 복구/대체 Agent 로직을 유지한다.
+        """
+        self.get_logger().error(f"🚨 [{failed_task['task_id']}] 작업 실패")
+
+        guidebook_task_id = str(failed_task.get('guidebook_task_id', '')).strip()
+        if guidebook_task_id:
+            with self.task_queue_lock:
+                self.task_queue.clear()
+                self.task_worker_running = False
+            self.is_moving = False
+            self.get_logger().warn(
+                f"🛑 [{failed_task['task_id']}] Guidebook Task 실패: "
+                "자동 복구 이동/자동 재할당을 수행하지 않습니다. "
+                "로봇 상태와 실패 원인을 확인한 뒤 다음 mission을 실행하세요."
+            )
+            return
+
+        # 아래는 기존 legacy 경로 호환 동작.
+        self.get_logger().error(
+            f"🚨 [{failed_task['task_id']}] legacy Task 실패. 복구·대피를 시도합니다."
+        )
         self.recover_to_safe_pose()
 
         with self.task_queue_lock:
