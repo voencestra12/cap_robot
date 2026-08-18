@@ -859,14 +859,28 @@ class RobotAgentNode(Node):
         return float(math.atan2(direction_robot[1], direction_robot[0]))
 
     def workspace_place_to_robot_place(self, place_pose, agent_id=None):
-        """배치 좌표를 workspace 기준에서 agent별 xArm base 기준으로 변환합니다."""
-        x_robot, y_robot, _ = self.workspace_point_to_robot(
-            place_pose['x'], place_pose['y'], 0.0, agent_id=agent_id
+        """배치 좌표를 workspace 기준에서 agent별 xArm base 기준으로 변환합니다.
+
+        기존 zone PnP는 place_pose에 z가 없으므로 예전처럼 workspace z=0으로 x/y만
+        변환합니다. relative_object/workspace target처럼 z가 명시된 경우에만 z까지
+        보존하여 새 Target Resolver 경로에서 사용합니다.
+        """
+        has_z = 'z' in place_pose
+        workspace_z = float(place_pose.get('z', 0.0))
+        x_robot, y_robot, z_robot = self.workspace_point_to_robot(
+            place_pose['x'], place_pose['y'], workspace_z, agent_id=agent_id
         )
         yaw_robot = self.workspace_yaw_to_robot(
             place_pose.get('yaw', 0.0), agent_id=agent_id
         )
-        return {'x': float(x_robot), 'y': float(y_robot), 'yaw': float(yaw_robot)}
+        result = {
+            'x': float(x_robot),
+            'y': float(y_robot),
+            'yaw': float(yaw_robot),
+        }
+        if has_z:
+            result['z'] = float(z_robot)
+        return result
 
     def workspace_object_to_robot_object(self, object_pose, agent_id=None):
         """workspace 기준 object pose를 agent별 xArm base 기준으로 변환합니다."""
@@ -1075,6 +1089,123 @@ class RobotAgentNode(Node):
         y_max = bounds['y_max'] - self.ZONE_MARGIN_MM
         return x_min + u * (x_max - x_min), y_min + v * (y_max - y_min)
 
+    def resolve_target_destination(self, destination_spec, poses_dict, assignee_id, reserved_points):
+        """Agent LLM의 destination을 기존 reference_place_pose 형식으로 변환합니다.
+
+        지원 형식:
+        - zone: 기존 A/B + u/v 호환 경로
+        - relative_object: workspace_0 기준 reference object pose + offset_mm
+        - workspace: workspace_0 절대 x/y/z/yaw
+
+        반환값의 reference_place_pose는 항상 workspace_0 기준입니다.
+        실제 robot base 변환은 기존 convert_place_pose()가 담당합니다.
+        """
+        if not isinstance(destination_spec, dict):
+            raise ValueError('destination_spec은 JSON 객체여야 합니다.')
+
+        destination_type = str(destination_spec.get('type', '')).strip().lower()
+        if destination_type not in ('zone', 'relative_object', 'workspace'):
+            raise ValueError(
+                f'지원하지 않는 destination.type={destination_type!r}. '
+                '사용 가능: zone, relative_object, workspace'
+            )
+
+        if destination_type == 'zone':
+            zone = self.normalize_zone(destination_spec.get('zone', ''))
+            if zone is None:
+                raise ValueError('zone target의 zone은 A 또는 B여야 합니다.')
+            if zone not in self.agent_specs[assignee_id]:
+                raise ValueError(f'{assignee_id}가 {zone}구역에 도달할 수 없습니다.')
+
+            try:
+                u = float(destination_spec.get('u'))
+                v = float(destination_spec.get('v'))
+            except (TypeError, ValueError) as error:
+                raise ValueError('zone target의 u/v에는 숫자가 필요합니다.') from error
+
+            place_x, place_y = self.select_place_point(
+                zone, u, v, reserved_points.get(zone, [])
+            )
+            return {
+                'type': 'zone',
+                'label': f'{zone}구역',
+                'reference_place_pose': {
+                    'x': float(place_x),
+                    'y': float(place_y),
+                    'yaw': 0.0,
+                },
+                'reservation_zone': zone,
+                'place_u': u,
+                'place_v': v,
+            }
+
+        if destination_type == 'relative_object':
+            reference = self.find_detected_target(
+                destination_spec.get('reference', ''), poses_dict
+            )
+            if reference is None:
+                raise ValueError(
+                    'relative_object의 reference를 현재 perception에서 찾을 수 없습니다: '
+                    f'{destination_spec.get("reference")}'
+                )
+
+            offset = destination_spec.get('offset_mm')
+            if not isinstance(offset, (list, tuple)) or len(offset) != 3:
+                raise ValueError(
+                    'relative_object.offset_mm은 [dx, dy, dz] 3개 숫자 배열이어야 합니다.'
+                )
+            try:
+                dx, dy, dz = (float(value) for value in offset)
+                yaw_deg = float(destination_spec.get('yaw_deg', 0.0))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    'relative_object offset_mm/yaw_deg에는 숫자가 필요합니다.'
+                ) from error
+
+            if not all(math.isfinite(value) for value in (dx, dy, dz, yaw_deg)):
+                raise ValueError('relative_object에 유한한 숫자만 사용할 수 있습니다.')
+
+            ref_x, ref_y, ref_z, _ = poses_dict[reference]
+            return {
+                'type': 'relative_object',
+                'label': f'{reference} 기준 상대 위치',
+                'reference_place_pose': {
+                    'x': float(ref_x) + dx,
+                    'y': float(ref_y) + dy,
+                    'z': float(ref_z) + dz,
+                    'yaw': float(np.radians(yaw_deg)),
+                },
+                'reference_object': reference,
+                'offset_mm': [dx, dy, dz],
+                'reservation_zone': None,
+            }
+
+        # destination_type == 'workspace'
+        try:
+            x_mm = float(destination_spec.get('x_mm'))
+            y_mm = float(destination_spec.get('y_mm'))
+            z_mm = float(destination_spec.get('z_mm'))
+            yaw_deg = float(destination_spec.get('yaw_deg', 0.0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                'workspace target의 x_mm/y_mm/z_mm/yaw_deg에는 숫자가 필요합니다.'
+            ) from error
+
+        if not all(math.isfinite(value) for value in (x_mm, y_mm, z_mm, yaw_deg)):
+            raise ValueError('workspace target에 유한한 숫자만 사용할 수 있습니다.')
+
+        return {
+            'type': 'workspace',
+            'label': 'workspace 절대 위치',
+            'reference_place_pose': {
+                'x': x_mm,
+                'y': y_mm,
+                'z': z_mm,
+                'yaw': float(np.radians(yaw_deg)),
+            },
+            'reservation_zone': None,
+        }
+
     def point_is_free(self, x, y, reserved_points):
         return all(
             math.hypot(x - px, y - py) >= self.MIN_OBJECT_SPACING_MM
@@ -1197,11 +1328,10 @@ class RobotAgentNode(Node):
             return {}
 
     def validate_guidebook_policy_candidate(self, result, task, poses_dict):
-        """Step 1 정책 후보를 기존 build_tasks()가 이해할 수 있는 형태로 검증합니다.
+        """Guidebook 정책 후보를 검증하고 기존 build_tasks() 입력 형태로 감쌉니다.
 
-        현재 단계에서는 기존 executor를 그대로 재사용하기 위해 destination을
-        A/B zone + u/v 형식으로 제한합니다. 이 제한은 임시 호환 계층이며,
-        향후 zone 하드코딩 제거 시 Target Resolver로 대체할 예정입니다.
+        Target Resolver가 zone / relative_object / workspace를 공통
+        reference_place_pose로 변환하므로, executor와 TF 코드는 그대로 재사용합니다.
         """
         if not isinstance(result, dict):
             raise ValueError('Guidebook 정책 후보는 JSON 객체여야 합니다.')
@@ -1225,39 +1355,80 @@ class RobotAgentNode(Node):
             raise ValueError('destination은 JSON 객체여야 합니다.')
 
         destination_type = str(destination.get('type', '')).strip().lower()
-        if destination_type != 'zone':
+        if destination_type not in ('zone', 'relative_object', 'workspace'):
             raise ValueError(
-                "Step 1에서는 destination.type='zone'만 지원합니다. "
-                '향후 Target Resolver 단계에서 relative/workspace 표현을 추가합니다.'
+                "destination.type은 'zone', 'relative_object', 'workspace' 중 하나여야 합니다."
             )
 
-        zone = self.normalize_zone(destination.get('zone', ''))
-        if zone is None:
-            raise ValueError('destination.zone은 A 또는 B여야 합니다.')
-        if zone not in self.agent_specs[self.agent_id]:
-            return None, f'{self.agent_id}가 {zone}구역에 도달할 수 없습니다.'
+        normalized_destination = dict(destination)
+        normalized_destination['type'] = destination_type
 
-        try:
-            u = float(destination.get('u'))
-            v = float(destination.get('v'))
-        except (TypeError, ValueError) as error:
-            raise ValueError('destination.u/v에는 숫자가 필요합니다.') from error
+        # Agent가 claim하기 전에 명백한 입력 오류/인지 부족은 여기서 먼저 차단합니다.
+        if destination_type == 'zone':
+            zone = self.normalize_zone(destination.get('zone', ''))
+            if zone is None:
+                raise ValueError('destination.zone은 A 또는 B여야 합니다.')
+            if zone not in self.agent_specs[self.agent_id]:
+                return None, f'{self.agent_id}가 {zone}구역에 도달할 수 없습니다.'
+            try:
+                normalized_destination['u'] = float(destination.get('u'))
+                normalized_destination['v'] = float(destination.get('v'))
+            except (TypeError, ValueError) as error:
+                raise ValueError('destination.u/v에는 숫자가 필요합니다.') from error
+
+        elif destination_type == 'relative_object':
+            reference = self.find_detected_target(
+                destination.get('reference', ''), poses_dict
+            )
+            if reference is None:
+                return None, (
+                    'relative_object 기준 물체를 현재 perception에서 찾을 수 없습니다: '
+                    f'{destination.get("reference")}'
+                )
+            offset = destination.get('offset_mm')
+            if not isinstance(offset, (list, tuple)) or len(offset) != 3:
+                raise ValueError(
+                    'relative_object.offset_mm은 [dx, dy, dz] 3개 숫자 배열이어야 합니다.'
+                )
+            try:
+                normalized_destination['reference'] = reference
+                normalized_destination['offset_mm'] = [
+                    float(value) for value in offset
+                ]
+                normalized_destination['yaw_deg'] = float(
+                    destination.get('yaw_deg', 0.0)
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    'relative_object offset_mm/yaw_deg에는 숫자가 필요합니다.'
+                ) from error
+
+        else:  # workspace
+            try:
+                normalized_destination['x_mm'] = float(destination.get('x_mm'))
+                normalized_destination['y_mm'] = float(destination.get('y_mm'))
+                normalized_destination['z_mm'] = float(destination.get('z_mm'))
+                normalized_destination['yaw_deg'] = float(
+                    destination.get('yaw_deg', 0.0)
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    'workspace x_mm/y_mm/z_mm/yaw_deg에는 숫자가 필요합니다.'
+                ) from error
 
         actions = self.validate_actions(result.get('actions'))
 
-        legacy_policy = {
+        policy = {
             'generated_policy': [
                 {
                     'agent_id': self.agent_id,
                     'target': target,
-                    'destination': f'{zone}구역',
-                    'place_u': u,
-                    'place_v': v,
+                    'destination_spec': normalized_destination,
                     'actions': actions,
                 }
             ]
         }
-        return legacy_policy, ''
+        return policy, ''
 
     def poll_ready_guidebook_tasks(self):
         """READY Task 중 아직 후보를 만들지 않은 하나를 비동기로 계획합니다."""
@@ -1438,13 +1609,8 @@ class RobotAgentNode(Node):
                 raise ValueError(f'정책 작업 #{order}는 JSON 객체여야 합니다.')
 
             assignee = str(raw.get('agent_id', '')).strip()
-            zone = self.normalize_zone(raw.get('destination', ''))
             if assignee not in self.agent_specs:
                 raise ValueError(f'정책 작업 #{order}: 사용할 수 없는 Agent {assignee}')
-            if zone is None or zone not in self.agent_specs[assignee]:
-                raise ValueError(
-                    f'정책 작업 #{order}: {assignee}가 도달할 수 없는 목적지입니다.'
-                )
 
             target = self.find_detected_target(raw.get('target', ''), poses_dict)
             if target is None or target in used_targets:
@@ -1453,15 +1619,30 @@ class RobotAgentNode(Node):
                     f'{raw.get("target")}'
                 )
 
-            try:
-                u = float(raw.get('place_u'))
-                v = float(raw.get('place_v'))
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f'정책 작업 #{order}: place_u/place_v에는 숫자가 필요합니다.'
-                ) from error
+            # 새 Guidebook 경로는 destination_spec을 사용합니다.
+            # 기존 user-command 경로는 destination/place_u/place_v를 그대로 받아
+            # 여기서 zone spec으로 감싸므로 회귀 없이 같은 resolver를 공유합니다.
+            destination_spec = raw.get('destination_spec')
+            if not isinstance(destination_spec, dict):
+                zone = self.normalize_zone(raw.get('destination', ''))
+                if zone is None:
+                    raise ValueError(
+                        f'정책 작업 #{order}: 기존 경로 destination은 A/B구역이어야 합니다.'
+                    )
+                destination_spec = {
+                    'type': 'zone',
+                    'zone': zone,
+                    'u': raw.get('place_u'),
+                    'v': raw.get('place_v'),
+                }
 
-            place_x, place_y = self.select_place_point(zone, u, v, reserved[zone])
+            resolved = self.resolve_target_destination(
+                destination_spec,
+                poses_dict,
+                assignee,
+                reserved,
+            )
+
             raw_actions = raw.get('actions', self.DEFAULT_PNP_ACTIONS)
             actions = self.validate_actions(raw_actions)
             rx, ry, rz, yaw = poses_dict[target]
@@ -1470,34 +1651,55 @@ class RobotAgentNode(Node):
                 'x': float(rx), 'y': float(ry),
                 'z': float(rz), 'yaw': float(yaw),
             }
-            ref_place = {'x': float(place_x), 'y': float(place_y), 'yaw': 0.0}
+            ref_place = dict(resolved['reference_place_pose'])
             robot_place = self.convert_place_pose(ref_place, assignee)
+
             if self.use_tf_workspace:
                 base_frame = self.get_agent_base_frame(assignee)
-                self.get_logger().info(
-                    f"🧭 TF place 변환: {assignee}/{zone}구역 workspace="
-                    f"({ref_place['x']:.1f}, {ref_place['y']:.1f}, yaw={np.degrees(ref_place['yaw']):.1f}deg) -> "
-                    f"{base_frame}=({robot_place['x']:.1f}, {robot_place['y']:.1f}, "
-                    f"yaw={np.degrees(robot_place['yaw']):.1f}deg)"
+                z_text = (
+                    f", z={ref_place['z']:.1f}"
+                    if 'z' in ref_place else ''
                 )
-            tasks.append({
+                robot_z_text = (
+                    f", z={robot_place['z']:.1f}"
+                    if 'z' in robot_place else ''
+                )
+                self.get_logger().info(
+                    f"🎯 Target Resolver: {assignee}/{resolved['type']} "
+                    f"workspace=({ref_place['x']:.1f}, {ref_place['y']:.1f}{z_text}, "
+                    f"yaw={np.degrees(ref_place['yaw']):.1f}deg) -> "
+                    f"{base_frame}=({robot_place['x']:.1f}, {robot_place['y']:.1f}"
+                    f"{robot_z_text}, yaw={np.degrees(robot_place['yaw']):.1f}deg)"
+                )
+
+            task_data = {
                 'task_id': f'{plan_stamp}_{order:02d}',
                 'order': order,
                 'coordinator_id': self.agent_id,
                 'assignee_id': assignee,
                 'target': target,
-                'destination': f'{zone}구역',
-                'place_u': u,
-                'place_v': v,
+                'destination': resolved['label'],
+                'destination_type': resolved['type'],
+                'destination_spec': dict(destination_spec),
                 'reference_object_pose': ref_object,
                 'reference_place_pose': ref_place,
                 'object_pose': self.convert_object_pose(ref_object, assignee),
                 'place_pose': robot_place,
                 'actions': actions,
                 'retry_count': 0,
-            })
+            }
+            if resolved['type'] == 'zone':
+                task_data['place_u'] = float(resolved['place_u'])
+                task_data['place_v'] = float(resolved['place_v'])
+
+            tasks.append(task_data)
             used_targets.add(target)
-            reserved[zone].append((place_x, place_y))
+
+            reservation_zone = resolved.get('reservation_zone')
+            if reservation_zone is not None:
+                reserved[reservation_zone].append(
+                    (float(ref_place['x']), float(ref_place['y']))
+                )
 
         return tasks
 
@@ -1564,13 +1766,20 @@ class RobotAgentNode(Node):
         if str(task['assignee_id']) != self.agent_id:
             return False
 
-        zone = self.normalize_zone(task['destination'])
-        if zone not in self.agent_specs[self.agent_id]:
-            raise ValueError(f'{self.agent_id}가 도달할 수 없는 목적지입니다.')
+        destination_type = str(task.get('destination_type', 'zone')).strip().lower()
+        if destination_type == 'zone':
+            zone = self.normalize_zone(task['destination'])
+            if zone not in self.agent_specs[self.agent_id]:
+                raise ValueError(f'{self.agent_id}가 도달할 수 없는 목적지입니다.')
+        elif destination_type not in ('relative_object', 'workspace'):
+            raise ValueError(f'지원하지 않는 destination_type={destination_type!r}')
+
         for key in ('x', 'y', 'z', 'yaw'):
             float(task['object_pose'][key])
         for key in ('x', 'y', 'yaw'):
             float(task['place_pose'][key])
+        if 'z' in task['place_pose']:
+            float(task['place_pose']['z'])
         task['actions'] = self.validate_actions(task['actions'])
         return True
 
@@ -1619,11 +1828,14 @@ class RobotAgentNode(Node):
     def execute_task(self, task):
         obj = task['object_pose']
         place = task['place_pose']
+        # 기존 zone Task에는 place.z가 없으므로 obj.z를 그대로 사용합니다.
+        # relative_object/workspace Target Resolver Task에만 place.z가 들어옵니다.
+        place_base_z = float(place.get('z', obj['z']))
         self.get_logger().info(
             f"🦾 [{task['task_id']}] [{task['target']}] -> {task['destination']} 시작 | "
             f"obj=({float(obj['x']):.1f}, {float(obj['y']):.1f}, {float(obj['z']):.1f}) | "
             f"place=({float(place['x']):.1f}, {float(place['y']):.1f}, "
-            f"yaw={np.degrees(float(place['yaw'])):.1f}deg)"
+            f"{place_base_z:.1f}, yaw={np.degrees(float(place['yaw'])):.1f}deg)"
         )
         try:
             self.arm.clean_error()
@@ -1641,7 +1853,7 @@ class RobotAgentNode(Node):
                     )
                 elif api == 'move_to_place':
                     success = self.move_to_robot_tf(
-                        place['x'], place['y'], obj['z'] + action['z_offset'],
+                        place['x'], place['y'], place_base_z + action['z_offset'],
                         yaw=place['yaw'], speed=action['speed'],
                         label=f"{task['task_id']} place"
                     )
@@ -1658,15 +1870,16 @@ class RobotAgentNode(Node):
             msg = Float32MultiArray()
             msg.data = [
                 float(place['x']), float(place['y']),
-                float(obj['z'] + self.PICK_PLACE_Z_OFFSET_MM), float(place['yaw'])
+                float(place_base_z + self.PICK_PLACE_Z_OFFSET_MM), float(place['yaw'])
             ]
             self.pose_publisher.publish(msg)
             zone = self.normalize_zone(task['destination'])
             reference_place = task['reference_place_pose']
-            with self.placed_points_lock:
-                self.placed_points[zone].append((
-                    float(reference_place['x']), float(reference_place['y'])
-                ))
+            if zone in self.placed_points:
+                with self.placed_points_lock:
+                    self.placed_points[zone].append((
+                        float(reference_place['x']), float(reference_place['y'])
+                    ))
             self.get_logger().info(f"✅ [{task['task_id']}] 작업 완료")
             return True
         except Exception as error:

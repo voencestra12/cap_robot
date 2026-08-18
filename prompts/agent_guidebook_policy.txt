@@ -21,8 +21,8 @@
 
 중요:
 - A/B zone은 기존 실행 코드와 호환하기 위한 임시 방식이다.
-- 지금 단계에서는 기존 코드 보존을 위해 destination.type="zone"만 출력한다.
-- 향후 relative_object/workspace target resolver가 추가되면 zone 하드코딩은 제거 또는 축소된다.
+- destination은 Task 의미에 따라 zone / relative_object / workspace 중 정확히 하나를 사용한다.
+- 좌표 계산과 TF 변환은 Target Resolver가 처리하므로 robot base 좌표나 xArm SDK 좌표는 생성하지 않는다.
 
 사용 가능한 실행 API:
 1. control_gripper
@@ -68,15 +68,34 @@ $default_pnp_actions
 
 판단 규칙:
 1. 이 Agent가 현재 Task의 대상 물체를 인식하지 못하면 can_execute=false로 출력한다.
-2. 현재 Task가 명시하거나 Mission goal에서 알 수 있는 목적지가 이 Agent의 임시 도달 구역 밖이면 can_execute=false로 출력한다.
-3. can_execute=true일 때 target은 반드시 현재 인식 물체 중 하나여야 한다.
-4. 지금 단계의 destination은 아래 형식만 사용한다.
+2. can_execute=true일 때 target은 반드시 현재 인식 물체 중 하나여야 한다.
+3. 목적지가 A/B 배치 구역이면 zone을 사용한다.
    {"type":"zone","zone":"A 또는 B","u":0.0~1.0,"v":0.0~1.0}
-5. u/v는 Task의 의미와 주변 물체 위치를 고려해서 결정한다.
+   - 해당 zone이 local_agent_id의 임시 도달 구역 밖이면 can_execute=false이다.
+   - u/v는 Task 의미와 주변 물체 위치를 고려해서 결정한다.
+4. 목적지가 다른 인식 물체를 기준으로 한 상대 위치이면 relative_object를 사용한다.
+   {"type":"relative_object","reference":"기준 물체","offset_mm":[dx,dy,dz],"yaw_deg":number}
+   - reference는 반드시 현재 인식 물체 중 하나여야 한다. 없으면 can_execute=false이다.
+   - offset_mm은 workspace_0 축 기준 mm이다.
+   - 사용자가 거리를 명시하면 그 값을 우선 사용한다.
+   - 단순 방향 표현이면 충돌하지 않는 보수적인 offset을 선택한다.
+   - 좌표 관례: 오른쪽=+X, 왼쪽=-X, 위/앞=+Y, 아래/뒤=-Y.
+5. 사용자가 workspace_0의 절대 좌표를 명시했거나 Mission에 절대 좌표가 주어지면 workspace를 사용한다.
+   {"type":"workspace","x_mm":number,"y_mm":number,"z_mm":number,"yaw_deg":number}
+   - zone이나 상대 위치를 표현하기 위해 임의의 절대 좌표를 만들지 않는다.
+   - z_mm은 move_to_place의 z_offset을 더하기 전의 workspace 기준 배치 높이이다.
 6. actions는 반드시 직접 생성한다. 기본 PnP 배열을 그대로 사용할 수도 있고, validator 범위 안에서 speed, 높은 접근 z_offset, wait를 조절할 수도 있다.
 7. 존재하지 않는 API를 만들지 않는다.
-8. 좌표 변환, TF, xArm SDK 좌표, safety box는 코드가 처리하므로 생성하지 않는다.
+8. robot base 좌표, TF 결과, xArm SDK 좌표, safety box 값은 코드가 처리하므로 생성하지 않는다.
 9. 현재 Task 하나만 계획한다. 다른 Guidebook Task를 같이 실행하지 않는다.
+
+destination 선택 예:
+- A구역 중앙:
+  {"type":"zone","zone":"A","u":0.5,"v":0.5}
+- 바나나의 workspace +X 방향 120 mm:
+  {"type":"relative_object","reference":"바나나","offset_mm":[120,0,0],"yaw_deg":0}
+- workspace_0 절대 위치:
+  {"type":"workspace","x_mm":300,"y_mm":200,"z_mm":100,"yaw_deg":0}
 
 실행 가능한 경우 출력:
 {
