@@ -42,14 +42,21 @@ class RobotAgentNode(Node):
     # workspace_0 기준 작업 구역(mm).
     # 실제 xArm 이동 좌표는 TF(robot_1_base <- workspace_0)로 변환해서 생성합니다.
     ZONES = {
-        'A': {'x_min': 0.0, 'x_max': 300.0, 'y_min': 0.0, 'y_max': 400.0},
-        'B': {'x_min': 400.0, 'x_max': 700.0, 'y_min': 0.0, 'y_max': 400.0},
+        # 순차 협업 실험에서 두 로봇의 배치 위치가 충분히 떨어지도록
+        # 기존 구역을 조금 더 분리합니다.
+        'A': {'x_min': 0.0, 'x_max': 250.0, 'y_min': 0.0, 'y_max': 400.0},
+        'B': {'x_min': 450.0, 'x_max': 700.0, 'y_min': 0.0, 'y_max': 400.0},
     }
     ZONE_MARGIN_MM = 50.0
     MIN_OBJECT_SPACING_MM = 120.0
     PICK_PLACE_Z_OFFSET_MM = 40.0
     DEFAULT_PNP_ACTIONS = LLM_DEFAULT_PNP_ACTIONS
-    HOME_POSE = (200.0, 0.0, 300.0, 0.0)
+    # 첨부된 xArm 기본 자세:
+    # TCP ≈ (198.0, -2.2, 264.1) mm, RPY ≈ (178.4, 0.0, 0.2) deg
+    # Joint = [0, -60, -30, 0, 90, 0] deg
+    # Cartesian 좌표보다 joint 자세가 재현성이 높아 기본 자세 복귀는 joint 명령을 사용합니다.
+    HOME_JOINT_ANGLES_DEG = [0.0, -60.0, -30.0, 0.0, 90.0, 0.0]
+    HOME_JOINT_SPEED_DEG_S = 20.0
     SAFE_RETREAT_POSE = (100.0, 350.0, 400.0, 0.0)
     CLAIM_WAIT_SEC = 2.0
     STARTUP_GUIDEBOOK_IGNORE_SEC = 5.0
@@ -407,6 +414,11 @@ class RobotAgentNode(Node):
             with self.guidebook_claim_lock:
                 self.guidebook_claims.clear()
                 self.guidebook_claim_started.clear()
+
+            # 이전 mission의 배치 기록이 다음 mission의 120 mm 간격 검사에
+            # 영향을 주지 않도록 새 mission마다 초기화합니다.
+            with self.placed_points_lock:
+                self.placed_points = {'A': [], 'B': []}
 
             self.get_logger().info(
                 f'📘 [{self.agent_id}] Guidebook 수신: '
@@ -1053,6 +1065,48 @@ class RobotAgentNode(Node):
     def move_to(self, x, y, z, yaw=0.0, speed=100.0):
         # 기존 HOME_POSE / SAFE_RETREAT_POSE는 xArm SDK command 좌표로 간주한다.
         return self.move_to_sdk(x, y, z, yaw=yaw, speed=speed, label='sdk_direct')
+
+    def return_to_home_joint_pose(self):
+        """첨부 이미지의 기본 joint 자세로 복귀합니다."""
+        target = list(self.HOME_JOINT_ANGLES_DEG)
+
+        if self.dry_run:
+            self.get_logger().warn(
+                f'🧪 DRY_RUN return_home_joint: angles={target}, '
+                f'speed={self.HOME_JOINT_SPEED_DEG_S:.1f} deg/s'
+            )
+            return True
+
+        ret = self.arm.set_servo_angle(
+            angle=target,
+            speed=float(self.HOME_JOINT_SPEED_DEG_S),
+            wait=True,
+        )
+        if ret in (0, None):
+            time.sleep(0.5)
+            self.get_logger().info(
+                f'🏠 [{self.agent_id}] 기본 자세 복귀 완료: {target}'
+            )
+            return True
+
+        try:
+            state = self.arm.state
+        except Exception:
+            state = 'unknown'
+        try:
+            error_code = self.arm.error_code
+        except Exception:
+            error_code = 'unknown'
+        try:
+            warn_code = self.arm.warn_code
+        except Exception:
+            warn_code = 'unknown'
+
+        self.get_logger().error(
+            f'🚨 기본 자세 복귀 실패! ret={ret}, state={state}, '
+            f'error_code={error_code}, warn_code={warn_code}'
+        )
+        return False
 
     def control_gripper(self, position):
         if self.dry_run:
@@ -1887,11 +1941,19 @@ class RobotAgentNode(Node):
                     time.sleep(action['seconds'])
                     success = True
                 elif api == 'return_home':
-                    success = self.move_to(*self.HOME_POSE[:3], yaw=self.HOME_POSE[3])
+                    success = self.return_to_home_joint_pose()
                 else:
                     success = False
                 if not success:
                     return False
+
+            # 일반 PnP가 끝나면 두 Agent 모두 같은 기본 자세로 복귀합니다.
+            # 복귀가 성공해야 Guidebook Task를 SUCCEEDED로 처리합니다.
+            self.get_logger().info(
+                f"🏠 [{task['task_id']}] 작업 완료 후 기본 자세로 복귀"
+            )
+            if not self.return_to_home_joint_pose():
+                return False
 
             msg = Float32MultiArray()
             msg.data = [
