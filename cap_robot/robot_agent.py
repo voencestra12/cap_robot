@@ -15,16 +15,18 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from xarm.wrapper import XArmAPI
 
 try:
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
+    from .llm_api import validate_cooperative_actions
     from .llm_api import validate_actions as validate_llm_actions
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
+    from llm_api import validate_cooperative_actions
     from llm_api import validate_actions as validate_llm_actions
 
 try:
@@ -57,13 +59,10 @@ class RobotAgentNode(Node):
     # Cartesian 좌표보다 joint 자세가 재현성이 높아 기본 자세 복귀는 joint 명령을 사용합니다.
     HOME_JOINT_ANGLES_DEG = [0.0, -60.0, -30.0, 0.0, 90.0, 0.0]
     HOME_JOINT_SPEED_DEG_S = 20.0
-    SAFE_RETREAT_POSE = (100.0, 350.0, 400.0, 0.0)
     CLAIM_WAIT_SEC = 2.0
-    STARTUP_GUIDEBOOK_IGNORE_SEC = 5.0
 
     def __init__(self):
         super().__init__('robot_agent_node')
-        self.node_started_wall_time = time.time()
 
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
@@ -73,7 +72,6 @@ class RobotAgentNode(Node):
         self.declare_parameter('agent_specs', ['agent1:A|B'])
         # ArUco 노드가 broadcast하는 TF 이름을 그대로 사용합니다.
         # target_frame <- source_frame = robot_1_base <- workspace_0
-        self.declare_parameter('use_tf_workspace', True)
         self.declare_parameter('robot_base_frame', 'robot_1_base')
         self.declare_parameter('workspace_frame', 'workspace_0')
         self.declare_parameter('tf_lookup_timeout_sec', 1.0)
@@ -85,10 +83,6 @@ class RobotAgentNode(Node):
         # 최신 시각보다 약간 과거의 명시적 시각으로 조회한다.
         self.declare_parameter('tf_lookup_delay_sec', 0.5)
         self.declare_parameter('tf_debug_log_period_sec', 2.0)
-        # TF의 robot_1_base 좌표계와 xArm SDK set_position 좌표계가 다를 수 있으므로
-        # 실제 이동 직전에 command frame 변환을 한 번 더 적용한다.
-        # agent_legacy: agent1=neg_xy_z, agent2=identity
-        self.declare_parameter('xarm_command_frame_mode', 'identity')
         self.declare_parameter('dry_run', True)
         self.declare_parameter('enable_sdk_safety_box', True)
         self.declare_parameter('sdk_x_min', 50.0)
@@ -102,10 +96,12 @@ class RobotAgentNode(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('llm_model', 'gemma4:e4b')
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
-        self.declare_parameter('prompt_file', 'agent_policy.txt')
-        # Guidebook 기반 정책 생성은 기존 사용자 명령용 prompt와 분리합니다.
-        # 기존 실행 경로를 보존하면서 새 경로를 단계적으로 검증하기 위한 설정입니다.
         self.declare_parameter('guidebook_prompt_file', 'agent_guidebook_policy.txt')
+        # [MERGED] Workstation이 완성한 협동 계획은 별도 Agent LLM 프롬프트로 검토합니다.
+        self.declare_parameter(
+            'cooperative_review_prompt_file',
+            'agent_cooperative_review.txt',
+        )
         self.declare_parameter('guidebook_policy_enabled', True)
         self.declare_parameter('guidebook_policy_poll_sec', 1.0)
         self.declare_parameter('guidebook_policy_retry_sec', 5.0)
@@ -113,12 +109,16 @@ class RobotAgentNode(Node):
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_claim_topic', '/mission/task_claim')
         self.declare_parameter('task_status_topic', '/mission/task_status')
+        self.declare_parameter('extra_perception_topic', '/perception/yolo_extra')
+        self.declare_parameter('extra_perception_max_age_sec', 2.0)
+        self.declare_parameter('cooperative_review_timeout_sec', 60.0)
+        self.declare_parameter('step_sync_timeout_sec', 30.0)
+        self.declare_parameter('step_start_delay_sec', 0.25)
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
         self.agent_specs = self.parse_agent_specs(self.get_parameter('agent_specs').value)
-        self.use_tf_workspace = bool(self.get_parameter('use_tf_workspace').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value).strip()
         self.workspace_frame = str(self.get_parameter('workspace_frame').value).strip()
         self.tf_lookup_timeout_sec = float(self.get_parameter('tf_lookup_timeout_sec').value)
@@ -130,7 +130,6 @@ class RobotAgentNode(Node):
         self.tf_buffer_cache_sec = float(self.get_parameter('tf_buffer_cache_sec').value)
         self.tf_lookup_delay_sec = float(self.get_parameter('tf_lookup_delay_sec').value)
         self.tf_debug_log_period_sec = float(self.get_parameter('tf_debug_log_period_sec').value)
-        self.xarm_command_frame_mode = str(self.get_parameter('xarm_command_frame_mode').value).strip().lower()
         self.dry_run = bool(self.get_parameter('dry_run').value)
         self.enable_sdk_safety_box = bool(self.get_parameter('enable_sdk_safety_box').value)
         self.sdk_x_min = float(self.get_parameter('sdk_x_min').value)
@@ -144,9 +143,11 @@ class RobotAgentNode(Node):
         self.camera_info_topic = str(self.get_parameter('camera_info_topic').value).strip()
         self.llm_model = str(self.get_parameter('llm_model').value).strip()
         self.ollama_url = str(self.get_parameter('ollama_url').value).strip()
-        self.prompt_file = str(self.get_parameter('prompt_file').value).strip()
         self.guidebook_prompt_file = str(
             self.get_parameter('guidebook_prompt_file').value
+        ).strip()
+        self.cooperative_review_prompt_file = str(
+            self.get_parameter('cooperative_review_prompt_file').value
         ).strip()
         self.guidebook_policy_enabled = bool(
             self.get_parameter('guidebook_policy_enabled').value
@@ -161,67 +162,89 @@ class RobotAgentNode(Node):
         self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
         self.task_claim_topic = str(self.get_parameter('task_claim_topic').value).strip()
         self.task_status_topic = str(self.get_parameter('task_status_topic').value).strip()
-        self.prompt_path = self.resolve_prompt_path(self.prompt_file)
+        self.extra_perception_topic = str(
+            self.get_parameter('extra_perception_topic').value
+        ).strip()
+        self.extra_perception_max_age_sec = float(
+            self.get_parameter('extra_perception_max_age_sec').value
+        )
+        self.cooperative_review_timeout_sec = float(
+            self.get_parameter('cooperative_review_timeout_sec').value
+        )
+        self.step_sync_timeout_sec = float(
+            self.get_parameter('step_sync_timeout_sec').value
+        )
+        self.step_start_delay_sec = float(
+            self.get_parameter('step_start_delay_sec').value
+        )
         self.guidebook_prompt_path = self.resolve_prompt_path(
             self.guidebook_prompt_file
+        )
+        self.cooperative_review_prompt_path = self.resolve_prompt_path(
+            self.cooperative_review_prompt_file
         )
 
         if not self.agent_id or not self.robot_ip:
             raise ValueError('agent_id와 robot_ip는 비어 있을 수 없습니다.')
         if self.agent_id not in self.agent_specs:
             raise ValueError(f'{self.agent_id}가 agent_specs에 없습니다: {self.agent_specs}')
-        if self.use_tf_workspace and not self.workspace_frame:
-            raise ValueError('TF workspace 사용 시 workspace_frame은 비어 있을 수 없습니다.')
-        if self.use_tf_workspace and not self.agent_base_frames:
-            raise ValueError('TF workspace 사용 시 agent_base_frames는 비어 있을 수 없습니다.')
+        if not self.workspace_frame:
+            raise ValueError('workspace_frame은 비어 있을 수 없습니다.')
+        if not self.agent_base_frames:
+            raise ValueError('agent_base_frames는 비어 있을 수 없습니다.')
         if self.enable_perception and (not self.color_topic or not self.depth_topic or not self.camera_info_topic):
             raise ValueError('perception 사용 시 color/depth/camera_info topic은 비어 있을 수 없습니다.')
-        if self.enable_perception and not self.use_tf_workspace:
-            raise ValueError('기존 T_OBJ 보정을 제거했으므로 perception 좌표 변환에는 TF workspace가 필요합니다.')
-
-
-        self.tf_buffer = None
-        self.tf_listener = None
+        # [MERGED] R8/R9 제거: workspace TF와 identity SDK frame만 지원합니다.
         # workspace_tf_cache[agent_id] = (TransformStamped, cache_update_wall_time_sec)
         self.workspace_tf_cache = {}
         self.tf_cache_lock = threading.Lock()
         self.tf_ready_agents = set()
-        self.tf_cache_timer = None
-        if self.use_tf_workspace:
-            self.tf_buffer = Buffer(cache_time=Duration(seconds=self.tf_buffer_cache_sec))
-            self.tf_listener = TransformListener(self.tf_buffer, self)
-            self.tf_cache_timer = self.create_timer(
-                self.tf_cache_period_sec, self.update_workspace_tf_cache
-            )
-            frame_text = ', '.join(
-                f'{agent}:{base} <- {self.workspace_frame}'
-                for agent, base in self.agent_base_frames.items()
-            )
-            self.get_logger().info(
-                f'🧭 [{self.agent_id}] TF workspace 활성화: {frame_text}'
-            )
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=self.tf_buffer_cache_sec))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_cache_timer = self.create_timer(
+            self.tf_cache_period_sec, self.update_workspace_tf_cache
+        )
+        frame_text = ', '.join(
+            f'{agent}:{base} <- {self.workspace_frame}'
+            for agent, base in self.agent_base_frames.items()
+        )
+        self.get_logger().info(
+            f'🧭 [{self.agent_id}] TF workspace 필수: {frame_text}'
+        )
 
         self.get_logger().info(f'🔌 [{self.agent_id}] 로봇 연결 중... IP={self.robot_ip}')
         self.arm = XArmAPI(self.robot_ip, is_radian=False)
         self.get_logger().info(f'✅ [{self.agent_id}] 로봇 연결 완료!')
 
-        # Workstation이 발행한 동일한 가이드북을 모든 Agent가 받습니다.
-        # 현재 단계에서는 가이드북을 저장하고 depends_on에 따라 READY/BLOCKED만 계산하며,
-        # 실제 LLM 호출이나 로봇 실행에는 아직 연결하지 않습니다.
+        # Workstation이 발행한 동일한 가이드북을 모든 Agent가 받아 상태를 공유합니다.
         self.current_mission_id = None
+        self.current_plan_revision = -1
         self.current_guidebook = {}
         self.guidebook_tasks = {}
         self.guidebook_task_status = {}
         self.guidebook_lock = threading.Lock()
 
-        # Step 1: READY Guidebook Task를 Agent LLM 정책 후보로 변환하는 경로만 추가합니다.
-        # 아직 claim/status 또는 실제 /agent_task 발행에는 연결하지 않습니다.
+        # [MERGED] 협동 계획 검토와 action 단위 barrier 상태입니다.
+        self.plan_approved_revision = -1
+        self.cooperative_review_inflight = set()
+        self.cooperative_reviewed = set()
+        self.cooperative_dispatched = set()
+        self.extra_perception_state = None
+        self.extra_perception_received_monotonic = 0.0
+        self.extra_perception_lock = threading.Lock()
+        self.step_sync_condition = threading.Condition()
+        self.step_sync_state = {}
+        self.step_go_sent = set()
+        self.cooperative_aborted = set()
+        self.llm_request_lock = threading.Lock()
+
+        # 일반 READY Task를 Agent LLM 실행 후보로 변환합니다.
         self.guidebook_policy_candidates = {}
         self.guidebook_policy_inflight = set()
         self.guidebook_policy_last_attempt = {}
         self.guidebook_policy_lock = threading.Lock()
 
-        # Step 2 최소 coordination 상태: Task별 claim 후보와 이미 결정된 winner만 저장합니다.
+        # 일반 Task의 claim 후보와 결정된 winner를 저장합니다.
         self.guidebook_claims = {}
         self.guidebook_claim_started = set()
         self.guidebook_claim_lock = threading.Lock()
@@ -243,8 +266,7 @@ class RobotAgentNode(Node):
             self.poll_ready_guidebook_tasks,
         )
 
-        # 두 Agent가 모두 실행 중인 상태에서 쓰는 최소 claim/status 채널입니다.
-        # 이번 단계는 별도 custom msg 없이 std_msgs/String JSON을 사용합니다.
+        # 별도 custom msg 없이 std_msgs/String JSON으로 claim/plan/task/step을 공유합니다.
         self.task_claim_pub = self.create_publisher(String, self.task_claim_topic, 10)
         self.task_claim_sub = self.create_subscription(
             String, self.task_claim_topic, self.task_claim_callback, 10
@@ -253,12 +275,17 @@ class RobotAgentNode(Node):
         self.task_status_sub = self.create_subscription(
             String, self.task_status_topic, self.task_status_callback, 10
         )
+        self.extra_perception_sub = self.create_subscription(
+            String,
+            self.extra_perception_topic,
+            self.extra_perception_callback,
+            10,
+        )
 
         # 기존 /agent_task 기반 실행 경로는 회귀 방지를 위해 그대로 유지합니다.
         # 모든 Agent가 같은 토픽을 구독하고 assignee_id가 자신인 작업만 실행합니다.
         self.task_pub = self.create_publisher(String, '/agent_task', 10)
         self.task_sub = self.create_subscription(String, '/agent_task', self.task_callback, 10)
-        self.pose_publisher = self.create_publisher(Float32MultiArray, '/mouse_target_pose', 10)
 
         self.latest_poses = {}
         self.current_detected_items = []
@@ -291,7 +318,7 @@ class RobotAgentNode(Node):
             image_qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
                 depth=10,
-                reliability=ReliabilityPolicy.RELIABLE,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
             )
             self.color_sub = self.create_subscription(
@@ -311,7 +338,8 @@ class RobotAgentNode(Node):
         self.init_robot()
         self.get_logger().info(
             f'🧠 LLM 설정: model={self.llm_model}, url={self.ollama_url}, '
-            f'prompt={self.prompt_path}'
+            f'normal_prompt={self.guidebook_prompt_path}, '
+            f'cooperative_review_prompt={self.cooperative_review_prompt_path}'
         )
         self.get_logger().info(
             f'📘 Guidebook policy: enabled={self.guidebook_policy_enabled}, '
@@ -320,7 +348,7 @@ class RobotAgentNode(Node):
             f'retry={self.guidebook_policy_retry_sec:.1f}s'
         )
         self.get_logger().info(
-            f'🧭 xArm command frame mode={self.xarm_command_frame_mode}, '
+            '🧭 xArm command frame mode=identity, '
             f'dry_run={self.dry_run}, sdk_safety_box={self.enable_sdk_safety_box}, '
             f'x=[{self.sdk_x_min:.0f},{self.sdk_x_max:.0f}], '
             f'y=[{self.sdk_y_min:.0f},{self.sdk_y_max:.0f}], '
@@ -330,33 +358,23 @@ class RobotAgentNode(Node):
             f'✅ [{self.agent_id}] 준비 완료 '
             f'(perception={self.enable_perception}, '
             f'zones={self.agent_specs[self.agent_id]}, '
-            f'use_tf_workspace={self.use_tf_workspace}, '
+            'workspace_tf=required, '
             f'guidebook_topic={self.guidebook_topic})'
         )
 
     def guidebook_callback(self, msg):
-        """Workstation guidebook을 저장하고 각 Task의 초기 READY/BLOCKED 상태를 계산합니다.
-
-        이 단계에서는 가이드북을 실제 정책 생성이나 로봇 실행에 연결하지 않습니다.
-        """
+        """Workstation guidebook을 저장하고 일반/협동 Task 경로를 준비합니다."""
         try:
             guidebook = json.loads(msg.data)
             if not isinstance(guidebook, dict):
                 raise ValueError('guidebook은 JSON 객체여야 합니다.')
 
             mission_id = str(guidebook.get('mission_id', '')).strip()
+            plan_revision = int(guidebook.get('plan_revision', 0))
             tasks = guidebook.get('tasks')
             if not mission_id:
                 raise ValueError('mission_id가 비어 있습니다.')
 
-            # /mission/guidebook이 TRANSIENT_LOCAL이라 launch 직후 이전 mission이 다시 올 수 있습니다.
-            # 이번 최소 Step 2에서는 두 Agent를 먼저 띄운 뒤 새 mission을 보내는 방식으로 안전하게 테스트합니다.
-            if time.time() - self.node_started_wall_time < self.STARTUP_GUIDEBOOK_IGNORE_SEC:
-                self.get_logger().warn(
-                    f'🛑 [{self.agent_id}] startup 직후 Guidebook 무시: mission_id={mission_id}. '
-                    '두 Agent 준비 후 새 mission을 발행하세요.'
-                )
-                return
             if not isinstance(tasks, list) or not tasks:
                 raise ValueError('tasks는 비어 있지 않은 배열이어야 합니다.')
 
@@ -377,6 +395,9 @@ class RobotAgentNode(Node):
                 normalized_task = dict(task)
                 normalized_task['task_id'] = task_id
                 normalized_task['depends_on'] = [str(dep).strip() for dep in depends_on]
+                normalized_task['execution_mode'] = str(
+                    task.get('execution_mode', 'single_agent')
+                ).strip()
                 task_map[task_id] = normalized_task
 
             known_task_ids = set(task_map)
@@ -392,12 +413,17 @@ class RobotAgentNode(Node):
                     )
 
             with self.guidebook_lock:
-                if self.current_mission_id == mission_id:
+                if (
+                    self.current_mission_id == mission_id
+                    and plan_revision <= self.current_plan_revision
+                ):
                     self.get_logger().info(
-                        f'📘 [{self.agent_id}] 동일 mission 재수신 무시: {mission_id}'
+                        f'📘 [{self.agent_id}] 이미 처리한 계획 무시: '
+                        f'{mission_id}/r{plan_revision}'
                     )
                     return
                 self.current_mission_id = mission_id
+                self.current_plan_revision = plan_revision
                 self.current_guidebook = dict(guidebook)
                 self.guidebook_tasks = task_map
                 self.guidebook_task_status = {
@@ -415,6 +441,16 @@ class RobotAgentNode(Node):
                 self.guidebook_claims.clear()
                 self.guidebook_claim_started.clear()
 
+            with self.step_sync_condition:
+                self.plan_approved_revision = -1
+                self.cooperative_review_inflight.clear()
+                self.cooperative_reviewed.clear()
+                self.cooperative_dispatched.clear()
+                self.step_sync_state.clear()
+                self.step_go_sent.clear()
+                self.cooperative_aborted.clear()
+                self.step_sync_condition.notify_all()
+
             # 이전 mission의 배치 기록이 다음 mission의 120 mm 간격 검사에
             # 영향을 주지 않도록 새 mission마다 초기화합니다.
             with self.placed_points_lock:
@@ -422,7 +458,8 @@ class RobotAgentNode(Node):
 
             self.get_logger().info(
                 f'📘 [{self.agent_id}] Guidebook 수신: '
-                f'mission_id={mission_id}, tasks={len(task_map)}'
+                f'mission_id={mission_id}, revision={plan_revision}, '
+                f'tasks={len(task_map)}'
             )
             for task_id, task in task_map.items():
                 self.get_logger().info(
@@ -430,6 +467,21 @@ class RobotAgentNode(Node):
                     f'depends_on={task["depends_on"]} | '
                     f'{task.get("description", "")}'
                 )
+
+            # [MERGED] 협동 Task는 READY 여부와 무관하게 이동 전에 전체 계획을 검토합니다.
+            for task_id, task in task_map.items():
+                if (
+                    self.is_cooperative_task(task)
+                    and self.agent_id in task.get('participants', [])
+                ):
+                    key = (mission_id, plan_revision, task_id)
+                    with self.step_sync_condition:
+                        self.cooperative_review_inflight.add(key)
+                    threading.Thread(
+                        target=self.review_cooperative_task,
+                        args=(mission_id, plan_revision, task_id),
+                        daemon=True,
+                    ).start()
 
         except Exception as error:
             self.get_logger().error(f'❌ Guidebook 수신/해석 실패: {error}')
@@ -447,6 +499,10 @@ class RobotAgentNode(Node):
                 for dep in dependencies
             )
             self.guidebook_task_status[task_id] = 'READY' if ready else 'BLOCKED'
+
+    @staticmethod
+    def is_cooperative_task(task):
+        return str(task.get('execution_mode', 'single_agent')).strip() == 'cooperative'
 
 
     def task_claim_callback(self, msg):
@@ -507,8 +563,7 @@ class RobotAgentNode(Node):
     def finalize_task_claim(self, mission_id, task_id):
         """짧은 claim window 뒤 claimant의 agent_id 사전순으로 winner를 정합니다.
 
-        현재 Step 2의 목적은 중복 실행 방지와 status 흐름 검증입니다.
-        더 복잡한 협상/우선순위 정책은 이 경로가 안정된 뒤 확장합니다.
+        일반 Task의 기존 중복 실행 방지를 위해 고정된 사전순 winner 규칙을 사용합니다.
         """
         time.sleep(self.CLAIM_WAIT_SEC)
 
@@ -559,7 +614,9 @@ class RobotAgentNode(Node):
             return
 
         payload = {
+            'scope': 'task',
             'mission_id': mission_id,
+            'plan_revision': self.current_plan_revision,
             'task_id': task_id,
             'agent_id': self.agent_id,
             'status': status,
@@ -573,9 +630,204 @@ class RobotAgentNode(Node):
     def task_status_callback(self, msg):
         try:
             payload = json.loads(msg.data)
-            self.apply_task_status(payload)
+            scope = str(payload.get('scope', 'task')).strip().lower()
+            if scope == 'plan':
+                self.apply_plan_status(payload)
+            elif scope == 'step':
+                self.apply_step_status(payload)
+            elif scope == 'task':
+                self.apply_task_status(payload)
+            else:
+                raise ValueError(f'지원하지 않는 status scope: {scope}')
         except Exception as error:
             self.get_logger().error(f'❌ task_status 해석 실패: {error}')
+
+    def extra_perception_callback(self, msg):
+        """[MERGED] Workstation과 동일한 손잡이 인식 스냅샷을 보관합니다."""
+        try:
+            state = json.loads(msg.data)
+            if not isinstance(state, dict):
+                raise ValueError('extra perception은 JSON 객체여야 합니다.')
+            with self.extra_perception_lock:
+                self.extra_perception_state = state
+                self.extra_perception_received_monotonic = time.monotonic()
+        except Exception as error:
+            self.get_logger().warn(f'⚠️ 추가 인식 상태 해석 실패: {error}')
+
+    def get_extra_perception_snapshot(self):
+        with self.extra_perception_lock:
+            state = (
+                None
+                if self.extra_perception_state is None
+                else json.loads(json.dumps(self.extra_perception_state))
+            )
+            age = time.monotonic() - self.extra_perception_received_monotonic
+        if state is None:
+            return {'valid': False, 'reason': '추가 인식 데이터를 받지 못함'}
+        state['received_age_sec'] = round(age, 3)
+        if age > self.extra_perception_max_age_sec:
+            state['valid'] = False
+            state['reason'] = f'추가 인식 데이터가 오래됨: {age:.2f}s'
+        return state
+
+    def publish_plan_feedback(self, mission_id, revision, task_id, accepted, reason):
+        payload = {
+            'scope': 'plan',
+            'mission_id': mission_id,
+            'plan_revision': int(revision),
+            'task_id': task_id,
+            'agent_id': self.agent_id,
+            'status': 'ACCEPTED' if accepted else 'REJECTED',
+            'reason': str(reason),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.task_status_pub.publish(msg)
+        self.get_logger().info(
+            f'🧠 [{self.agent_id}] 협동 계획 '
+            f'{payload["status"]}: {task_id} / {reason}'
+        )
+
+    def apply_plan_status(self, payload):
+        """Workstation의 승인/폐기/실패 결정을 반영합니다."""
+        mission_id = str(payload.get('mission_id', '')).strip()
+        revision = int(payload.get('plan_revision', -1))
+        status = str(payload.get('status', '')).strip().upper()
+        if status in ('ACCEPTED', 'REJECTED'):
+            return
+        with self.guidebook_lock:
+            if (
+                mission_id != self.current_mission_id
+                or revision != self.current_plan_revision
+            ):
+                return
+        with self.step_sync_condition:
+            if status == 'APPROVED':
+                self.plan_approved_revision = revision
+            elif status in ('SUPERSEDED', 'FAILED'):
+                self.cooperative_aborted.add((mission_id, revision))
+                with self.task_queue_lock:
+                    self.task_queue = [
+                        task for task in self.task_queue
+                        if not (
+                            task.get('execution_mode') == 'cooperative'
+                            and task.get('mission_id') == mission_id
+                            and int(task.get('plan_revision', -1)) == revision
+                        )
+                    ]
+            else:
+                return
+            self.step_sync_condition.notify_all()
+        self.get_logger().info(
+            f'📡 [{self.agent_id}] 계획 status={status}: {mission_id}/r{revision}'
+        )
+
+    def publish_step_status(self, task, step_index, status, reason=''):
+        payload = {
+            'scope': 'step',
+            'mission_id': str(task['mission_id']),
+            'plan_revision': int(task['plan_revision']),
+            'task_id': str(task['guidebook_task_id']),
+            'attempt': int(task.get('attempt', 0)),
+            'step_index': int(step_index),
+            'agent_id': self.agent_id,
+            'status': str(status).upper(),
+            'reason': str(reason),
+        }
+        # DDS loopback 전달을 기다리지 않아도 로컬 상태가 즉시 보이게 합니다.
+        self.apply_step_status(payload)
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.task_status_pub.publish(msg)
+
+    @staticmethod
+    def _step_key(payload):
+        return (
+            str(payload.get('mission_id', '')),
+            int(payload.get('plan_revision', -1)),
+            str(payload.get('task_id', '')),
+            int(payload.get('attempt', 0)),
+            int(payload.get('step_index', -1)),
+        )
+
+    def apply_step_status(self, payload):
+        status = str(payload.get('status', '')).strip().upper()
+        if status not in ('READY', 'GO', 'DONE', 'FAILED'):
+            raise ValueError(f'지원하지 않는 step status: {status}')
+        key = self._step_key(payload)
+        agent_id = str(payload.get('agent_id', '')).strip()
+        with self.guidebook_lock:
+            task = self.guidebook_tasks.get(key[2])
+            current_match = (
+                key[0] == self.current_mission_id
+                and key[1] == self.current_plan_revision
+            )
+        if not current_match or not task or not self.is_cooperative_task(task):
+            return
+        participants = set(map(str, task.get('participants', [])))
+        if status != 'GO' and agent_id not in participants:
+            return
+
+        send_go = False
+        with self.step_sync_condition:
+            state = self.step_sync_state.setdefault(
+                key,
+                {'READY': set(), 'GO': set(), 'DONE': set(), 'FAILED': set()},
+            )
+            state[status].add(agent_id)
+            if status == 'FAILED':
+                self.cooperative_aborted.add((key[0], key[1]))
+            if (
+                status == 'READY'
+                and self.agent_id == str(task.get('coordinator_id', min(participants)))
+                and state['READY'] >= participants
+                and key not in self.step_go_sent
+            ):
+                self.step_go_sent.add(key)
+                send_go = True
+            self.step_sync_condition.notify_all()
+
+        if send_go:
+            go_payload = {
+                **payload,
+                'agent_id': self.agent_id,
+                'status': 'GO',
+                'start_after_sec': self.step_start_delay_sec,
+            }
+            # 로컬 executor도 동일 GO를 확인합니다.
+            with self.step_sync_condition:
+                self.step_sync_state[key]['GO'].add(self.agent_id)
+                self.step_sync_condition.notify_all()
+            msg = String()
+            msg.data = json.dumps(go_payload, ensure_ascii=False)
+            self.task_status_pub.publish(msg)
+
+    def wait_for_step_go(self, task, step_index):
+        self.publish_step_status(task, step_index, 'READY')
+        key = (
+            str(task['mission_id']),
+            int(task['plan_revision']),
+            str(task['guidebook_task_id']),
+            int(task.get('attempt', 0)),
+            int(step_index),
+        )
+        deadline = time.monotonic() + self.step_sync_timeout_sec
+        with self.step_sync_condition:
+            while rclpy.ok():
+                if (key[0], key[1]) in self.cooperative_aborted:
+                    raise RuntimeError('협동 계획이 중단되었습니다.')
+                state = self.step_sync_state.get(key, {})
+                if state.get('FAILED'):
+                    raise RuntimeError('다른 Agent가 이 협동 단계에서 실패했습니다.')
+                if state.get('GO'):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError(
+                        f'협동 단계 동기화 시간 초과: step={step_index}'
+                    )
+                self.step_sync_condition.wait(timeout=min(0.5, remaining))
+        time.sleep(max(0.0, self.step_start_delay_sec))
 
     def apply_task_status(self, payload):
         """CLAIMED/EXECUTING/SUCCEEDED/FAILED를 로컬 Guidebook 상태에 반영합니다."""
@@ -720,9 +972,6 @@ class RobotAgentNode(Node):
             self.get_logger().warn(message)
 
     def get_cached_workspace_transform(self, agent_id=None):
-        if not self.use_tf_workspace:
-            return None
-
         cache_agent_id = self.agent_id if agent_id is None else str(agent_id).strip()
         target_frame = self.get_agent_base_frame(cache_agent_id)
 
@@ -766,9 +1015,6 @@ class RobotAgentNode(Node):
         최신 lookup이 timestamp mismatch 등으로 실패하면,
         최근 정상적으로 조회된 cached TF를 fallback으로 사용합니다.
         """
-        if not self.use_tf_workspace:
-            return None
-
         cache_agent_id = self.agent_id if agent_id is None else str(agent_id).strip()
         target_frame = self.get_agent_base_frame(cache_agent_id)
 
@@ -804,8 +1050,6 @@ class RobotAgentNode(Node):
                 ) from error
 
     def update_workspace_tf_cache(self):
-        if not self.use_tf_workspace:
-            return
         for agent_id, base_frame in self.agent_base_frames.items():
             try:
                 query_time = self.tf_lookup_time()
@@ -831,9 +1075,6 @@ class RobotAgentNode(Node):
 
     def workspace_point_to_robot(self, x_mm, y_mm, z_mm=0.0, agent_id=None):
         """workspace_0 기준 좌표(mm)를 agent별 robot base 기준 좌표(mm)로 변환합니다."""
-        if not self.use_tf_workspace:
-            return float(x_mm), float(y_mm), float(z_mm)
-
         transform = self.lookup_workspace_transform(agent_id).transform
         translation_m = np.array([
             float(transform.translation.x),
@@ -854,9 +1095,6 @@ class RobotAgentNode(Node):
 
     def workspace_yaw_to_robot(self, yaw_rad, agent_id=None):
         """workspace_0 평면 yaw(rad)를 agent별 robot base 평면 yaw(rad)로 변환합니다."""
-        if not self.use_tf_workspace:
-            return float(yaw_rad)
-
         transform = self.lookup_workspace_transform(agent_id).transform
         rotation = transform.rotation
         rotation_robot_workspace = self.quaternion_to_rotation_matrix(
@@ -911,8 +1149,6 @@ class RobotAgentNode(Node):
 
     def camera_point_to_workspace(self, x_m, y_m, z_m):
         """camera_color_optical_frame 기준 3D 점(m)을 workspace_0 기준 좌표(mm)로 변환합니다."""
-        if not self.use_tf_workspace:
-            raise RuntimeError('camera point를 workspace로 변환하려면 TF workspace가 필요합니다.')
         if not self.camera_frame:
             raise RuntimeError('CameraInfo header.frame_id를 아직 받지 못했습니다.')
 
@@ -939,57 +1175,14 @@ class RobotAgentNode(Node):
     def normalize_angle_rad(angle):
         return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
 
-    def get_xarm_command_frame_mode(self, agent_id=None):
-        agent_id = self.agent_id if agent_id is None else str(agent_id).strip()
-        mode = self.xarm_command_frame_mode
-        if mode == 'agent_legacy':
-            # 기존 aruco_calib.py의 /robot_1_target은 agent1에만 x,y 마이너스를 적용했고,
-            # agent2는 TF translation을 그대로 사용했다.
-            return 'neg_xy_z' if agent_id == 'agent1' else 'identity'
-        return mode
-
     def tf_pose_to_sdk_pose(self, x, y, z, yaw=0.0, agent_id=None):
-        """robot_N_base TF 좌표(mm, rad)를 xArm SDK set_position 좌표(mm, rad)로 변환한다.
-
-        주의:
-            workspace_point_to_robot()의 결과는 TF의 robot_N_base 좌표이다.
-            xArm SDK set_position()은 별도의 command/UI 좌표계를 쓰므로 이 변환을 거쳐야 한다.
-        """
-        mode = self.get_xarm_command_frame_mode(agent_id)
-        x_tf, y_tf, z_tf = float(x), float(y), float(z)
-        yaw_tf = float(yaw)
-
-        if mode in ('identity', 'none', ''):
-            x_sdk, y_sdk, z_sdk = x_tf, y_tf, z_tf
-            yaw_sdk = yaw_tf
-        elif mode in ('neg_xy', 'neg_xy_z', 'agent1_legacy'):
-            x_sdk, y_sdk, z_sdk = -x_tf, -y_tf, z_tf
-            yaw_sdk = yaw_tf + math.pi
-        elif mode in ('neg_x',):
-            x_sdk, y_sdk, z_sdk = -x_tf, y_tf, z_tf
-            yaw_sdk = math.atan2(math.sin(yaw_tf), -math.cos(yaw_tf))
-        elif mode in ('neg_y',):
-            x_sdk, y_sdk, z_sdk = x_tf, -y_tf, z_tf
-            yaw_sdk = math.atan2(-math.sin(yaw_tf), math.cos(yaw_tf))
-        elif mode in ('ui_inverse', 'ui_to_tf_inverse'):
-            # 예전 offset 추출 코드에 있었던 x=ui_y, y=-ui_x, z=-ui_z의 역변환 후보.
-            # 실제 z축까지 반전되므로, 검증 전 실기 이동에는 쓰지 않는 것을 권장한다.
-            x_sdk, y_sdk, z_sdk = -y_tf, x_tf, -z_tf
-            direction = np.array([math.cos(yaw_tf), math.sin(yaw_tf), 0.0], dtype=float)
-            mapped = np.array([-direction[1], direction[0], -direction[2]], dtype=float)
-            yaw_sdk = math.atan2(mapped[1], mapped[0])
-        else:
-            raise ValueError(
-                f'지원하지 않는 xarm_command_frame_mode={mode!r}. '
-                '사용 가능: agent_legacy, identity, neg_xy_z, neg_x, neg_y, ui_inverse'
-            )
-
+        """[MERGED] robot_N_base와 xArm SDK 좌표계를 identity로 고정합니다."""
         return {
-            'x': float(x_sdk),
-            'y': float(y_sdk),
-            'z': float(z_sdk),
-            'yaw': self.normalize_angle_rad(yaw_sdk),
-            'mode': mode,
+            'x': float(x),
+            'y': float(y),
+            'z': float(z),
+            'yaw': self.normalize_angle_rad(yaw),
+            'mode': 'identity',
         }
 
     def check_sdk_pose_or_raise(self, x, y, z, label=''):  # xArm SDK command 좌표 기준
@@ -1061,10 +1254,6 @@ class RobotAgentNode(Node):
             f'yaw={np.degrees(cmd["yaw"]):.1f}deg), mode={cmd["mode"]}'
         )
         return self.move_to_sdk(cmd['x'], cmd['y'], cmd['z'], yaw=cmd['yaw'], speed=speed, label=label)
-
-    def move_to(self, x, y, z, yaw=0.0, speed=100.0):
-        # 기존 HOME_POSE / SAFE_RETREAT_POSE는 xArm SDK command 좌표로 간주한다.
-        return self.move_to_sdk(x, y, z, yaw=yaw, speed=speed, label='sdk_direct')
 
     def return_to_home_joint_pose(self):
         """첨부 이미지의 기본 joint 자세로 복귀합니다."""
@@ -1138,20 +1327,14 @@ class RobotAgentNode(Node):
         return next((key for key in poses_dict if target in key or key in target), None)
 
     def convert_object_pose(self, reference_pose, assignee_id):
-        pose = dict(reference_pose)
-        if self.use_tf_workspace:
-            return self.workspace_object_to_robot_object(pose, agent_id=assignee_id)
-        if assignee_id != self.agent_id:
-            raise ValueError('TF workspace 없이 다른 Agent 좌표로 object pose를 변환할 수 없습니다.')
-        return pose
+        return self.workspace_object_to_robot_object(
+            dict(reference_pose), agent_id=assignee_id
+        )
 
     def convert_place_pose(self, reference_pose, assignee_id):
-        pose = dict(reference_pose)
-        if self.use_tf_workspace:
-            return self.workspace_place_to_robot_place(pose, agent_id=assignee_id)
-        if assignee_id != self.agent_id:
-            raise ValueError('TF workspace 없이 다른 Agent 좌표로 place pose를 변환할 수 없습니다.')
-        return pose
+        return self.workspace_place_to_robot_place(
+            dict(reference_pose), agent_id=assignee_id
+        )
 
     def zone_uv_to_xy(self, zone, u, v):
         bounds = self.ZONES[zone]
@@ -1327,6 +1510,240 @@ class RobotAgentNode(Node):
 
         raise FileNotFoundError(f'프롬프트 파일을 찾을 수 없습니다: {prompt_file}')
 
+    @staticmethod
+    def parse_llm_json_object(raw_text):
+        """LLM이 JSON 앞뒤에 짧은 문장을 붙인 경우에도 객체 하나를 추출합니다."""
+        raw_text = str(raw_text).strip()
+        try:
+            result = json.loads(raw_text)
+        except json.JSONDecodeError:
+            start, end = raw_text.find('{'), raw_text.rfind('}')
+            if start < 0 or end <= start:
+                raise ValueError('LLM 응답에서 JSON 객체를 찾을 수 없습니다.')
+            result = json.loads(raw_text[start:end + 1])
+        if not isinstance(result, dict):
+            raise ValueError('LLM 응답은 JSON 객체여야 합니다.')
+        return result
+
+    def _cooperative_object_pose(self, state, target_name):
+        if not state.get('valid'):
+            raise ValueError(
+                f"유효한 yolo_extra_perception 상태가 없습니다: {state.get('reason', '')}"
+            )
+        if str(state.get('frame_id', '')) != self.workspace_frame:
+            raise ValueError(
+                f'협동 좌표계는 {self.workspace_frame}이어야 합니다: '
+                f"{state.get('frame_id')}"
+            )
+        raw = state.get('objects', {}).get(target_name)
+        if not isinstance(raw, dict):
+            raise ValueError(f'손잡이 target을 찾을 수 없습니다: {target_name}')
+        return {
+            'x': float(raw['x_mm']),
+            'y': float(raw['y_mm']),
+            'z': float(raw['z_mm']),
+            'yaw': float(np.radians(float(raw.get('yaw_deg', 0.0)))),
+        }
+
+    def _hard_validate_cooperative_task(self, guidebook, task, state):
+        """LLM 판단 전에 TF와 안전 상자로 협동 계획을 결정론적으로 검증합니다."""
+        participants = [str(value) for value in task.get('participants', [])]
+        if len(participants) != 2 or len(set(participants)) != 2:
+            raise ValueError('협동 participants는 서로 다른 Agent 2개여야 합니다.')
+        if self.agent_id not in participants:
+            raise ValueError(f'{self.agent_id}가 협동 participants에 없습니다.')
+        targets = task.get('targets_by_agent')
+        if not isinstance(targets, dict) or set(targets) != set(participants):
+            raise ValueError('targets_by_agent가 participants와 일치하지 않습니다.')
+        target_name = str(targets[self.agent_id]).strip()
+        if len(set(map(str, targets.values()))) != 2:
+            raise ValueError('두 Agent는 서로 다른 손잡이에 할당되어야 합니다.')
+        actions = validate_cooperative_actions(task.get('actions'))
+        object_pose = self._cooperative_object_pose(state, target_name)
+
+        reach = (
+            state.get('reachability', {})
+            .get(self.agent_id, {})
+            .get('handles', {})
+            .get(target_name, {})
+        )
+        if not reach.get('within_safety_box', False):
+            raise ValueError(f'{self.agent_id}가 {target_name}에 안전하게 접근할 수 없습니다.')
+
+        current_workspace = np.array(
+            [object_pose['x'], object_pose['y'], object_pose['z']], dtype=float
+        )
+        grasped = False
+        for index, action in enumerate(actions):
+            api = action['api']
+            if api == 'move_to_object':
+                candidate = np.array([
+                    object_pose['x'],
+                    object_pose['y'],
+                    object_pose['z'] + action['z_offset'],
+                ])
+                current_workspace = candidate
+            elif api == 'control_gripper' and action['position'] <= 450:
+                grasped = True
+                continue
+            elif api == 'cooperative_move_relative':
+                if not grasped:
+                    raise ValueError('상대 협동 이동 전에 파지가 필요합니다.')
+                current_workspace = current_workspace + np.array([
+                    action['x_offset'], action['y_offset'], action['z_offset']
+                ])
+            else:
+                continue
+            bx, by, bz = self.workspace_point_to_robot(*current_workspace)
+            robot_yaw = self.workspace_yaw_to_robot(object_pose['yaw'])
+            command = self.tf_pose_to_sdk_pose(bx, by, bz, robot_yaw)
+            self.check_sdk_pose_or_raise(
+                command['x'], command['y'], command['z'],
+                label=f'cooperative precheck action {index}',
+            )
+
+        normalized = dict(task)
+        normalized['participants'] = participants
+        normalized['targets_by_agent'] = {
+            agent_id: str(targets[agent_id]).strip() for agent_id in participants
+        }
+        normalized['coordinator_id'] = str(
+            task.get('coordinator_id', min(participants))
+        )
+        normalized['actions'] = actions
+        return normalized, target_name, object_pose
+
+    def _ask_llm_for_cooperative_review(self, guidebook, task, state, object_pose):
+        template = Template(
+            self.cooperative_review_prompt_path.read_text(encoding='utf-8')
+        )
+        prompt = template.substitute(
+            local_agent_id=self.agent_id,
+            mission_id=str(guidebook.get('mission_id', '')),
+            plan_revision=str(guidebook.get('plan_revision', 0)),
+            guidebook_json=json.dumps(guidebook, ensure_ascii=False),
+            task_json=json.dumps(task, ensure_ascii=False),
+            perception_json=json.dumps(state, ensure_ascii=False),
+            local_target_json=json.dumps(object_pose, ensure_ascii=False),
+            safety_box_json=json.dumps({
+                'x_mm': [self.sdk_x_min, self.sdk_x_max],
+                'y_mm': [self.sdk_y_min, self.sdk_y_max],
+                'z_mm': [self.sdk_z_min, self.sdk_z_max],
+            }, ensure_ascii=False),
+        )
+        payload = {
+            'model': self.llm_model,
+            'prompt': prompt,
+            'format': 'json',
+            'stream': False,
+            'options': {'temperature': 0.0, 'num_predict': 512},
+        }
+        with self.llm_request_lock:
+            response = requests.post(
+                self.ollama_url,
+                json=payload,
+                timeout=self.cooperative_review_timeout_sec,
+            )
+            response.raise_for_status()
+        result = self.parse_llm_json_object(response.json()['response'])
+        if not isinstance(result.get('accept'), bool):
+            raise ValueError('협동 검토 응답은 accept(boolean)를 포함해야 합니다.')
+        reason = str(result.get('reason', '')).strip()
+        if not reason:
+            raise ValueError('협동 검토 응답의 reason이 비어 있습니다.')
+        return bool(result['accept']), reason
+
+    def review_cooperative_task(self, mission_id, revision, task_id):
+        """[MERGED] 중앙 계획을 이 Agent의 LLM이 승인하거나 거부합니다."""
+        key = (mission_id, revision, task_id)
+        accepted = False
+        reason = ''
+        try:
+            with self.guidebook_lock:
+                if (
+                    mission_id != self.current_mission_id
+                    or revision != self.current_plan_revision
+                ):
+                    return
+                guidebook = dict(self.current_guidebook)
+                task = dict(self.guidebook_tasks[task_id])
+            state = self.get_extra_perception_snapshot()
+            task, _, object_pose = self._hard_validate_cooperative_task(
+                guidebook, task, state
+            )
+            accepted, reason = self._ask_llm_for_cooperative_review(
+                guidebook, task, state, object_pose
+            )
+        except Exception as error:
+            reason = f'코드/LLM 검토 실패: {error}'
+
+        with self.guidebook_lock:
+            still_current = (
+                mission_id == self.current_mission_id
+                and revision == self.current_plan_revision
+            )
+        with self.step_sync_condition:
+            self.cooperative_review_inflight.discard(key)
+            if still_current:
+                self.cooperative_reviewed.add(key)
+        if still_current:
+            self.publish_plan_feedback(
+                mission_id, revision, task_id, accepted, reason
+            )
+
+    def build_cooperative_execution_task(self, guidebook_task):
+        """승인된 중앙 계획을 양 Agent가 공유하는 실행 메시지로 고정합니다."""
+        state = self.get_extra_perception_snapshot()
+        task, _, _ = self._hard_validate_cooperative_task(
+            self.current_guidebook,
+            guidebook_task,
+            state,
+        )
+        poses = {
+            agent_id: self._cooperative_object_pose(state, target_name)
+            for agent_id, target_name in task['targets_by_agent'].items()
+        }
+        return {
+            'execution_mode': 'cooperative',
+            'mission_id': self.current_mission_id,
+            'plan_revision': self.current_plan_revision,
+            'guidebook_task_id': str(task['task_id']),
+            'task_id': (
+                f'{self.current_mission_id}_r{self.current_plan_revision}_'
+                f'{task["task_id"]}'
+            ),
+            'coordinator_id': str(task['coordinator_id']),
+            'participants': list(task['participants']),
+            'targets_by_agent': dict(task['targets_by_agent']),
+            'target_poses_workspace': poses,
+            'actions': list(task['actions']),
+            'attempt': 0,
+            'description': str(task.get('description', '')),
+        }
+
+    def dispatch_ready_cooperative_task(self, task_id):
+        key = (self.current_mission_id, self.current_plan_revision, task_id)
+        with self.step_sync_condition:
+            if key in self.cooperative_dispatched:
+                return
+            self.cooperative_dispatched.add(key)
+        try:
+            with self.guidebook_lock:
+                task = dict(self.guidebook_tasks[task_id])
+                if self.guidebook_task_status.get(task_id) != 'READY':
+                    return
+            execution_task = self.build_cooperative_execution_task(task)
+            self.publish_task_status(task_id, 'CLAIMED')
+            msg = String()
+            msg.data = json.dumps(execution_task, ensure_ascii=False)
+            self.task_pub.publish(msg)
+            self.get_logger().info(
+                f'➡️ [{self.agent_id}] 협동 /agent_task 발행: {task_id}'
+            )
+        except Exception as error:
+            self.publish_task_status(task_id, 'FAILED')
+            self.get_logger().error(f'❌ 협동 Task 준비 실패: {task_id}: {error}')
+
 
     @staticmethod
     def poses_for_prompt(poses_dict):
@@ -1347,9 +1764,7 @@ class RobotAgentNode(Node):
         """Guidebook READY Task 하나를 위한 Agent LLM prompt를 생성합니다."""
         template_text = self.guidebook_prompt_path.read_text(encoding='utf-8')
         template = Template(template_text)
-        zone_frame_text = (
-            f'{self.workspace_frame} 기준' if self.use_tf_workspace else f'{self.agent_id} 기준'
-        )
+        zone_frame_text = f'{self.workspace_frame} 기준'
         return template.substitute(
             local_agent_id=self.agent_id,
             mission_id=str(guidebook.get('mission_id', '')),
@@ -1391,11 +1806,10 @@ class RobotAgentNode(Node):
             f'🧠 [{self.agent_id}] Guidebook {task_id} 정책 후보 생성 중...'
         )
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=300.0)
-            response.raise_for_status()
-            result = json.loads(response.json()['response'].strip())
-            if not isinstance(result, dict):
-                raise ValueError('Agent LLM 응답은 JSON 객체여야 합니다.')
+            with self.llm_request_lock:
+                response = requests.post(self.ollama_url, json=payload, timeout=300.0)
+                response.raise_for_status()
+            result = self.parse_llm_json_object(response.json()['response'])
             self.get_logger().info(
                 f'🤖 [{self.agent_id}] Guidebook {task_id} Policy 후보: {result}'
             )
@@ -1514,11 +1928,13 @@ class RobotAgentNode(Node):
         """READY Task 중 아직 후보를 만들지 않은 하나를 비동기로 계획합니다."""
         if not self.guidebook_policy_enabled:
             return
-        if not self.latest_poses:
-            return
 
         with self.guidebook_lock:
             mission_id = self.current_mission_id
+            revision = self.current_plan_revision
+            requires_plan_review = bool(
+                self.current_guidebook.get('requires_plan_review')
+            )
             if not mission_id:
                 return
             ready_ids = [
@@ -1530,10 +1946,37 @@ class RobotAgentNode(Node):
         if not ready_ids:
             return
 
+        # 협동 Task가 하나라도 포함된 mission은 두 Agent가 전체 계획을 승인한 뒤에만
+        # 일반 Task를 포함한 어떤 물리 이동도 시작합니다.
+        if (
+            requires_plan_review
+            and self.plan_approved_revision != revision
+        ):
+            return
+
+        # [MERGED] 협동 계획은 Workstation이 이미 actions까지 완성했습니다.
+        # 두 Agent 승인 후 coordinator만 공통 실행 메시지를 발행합니다.
+        for task_id in ready_ids:
+            with self.guidebook_lock:
+                task = dict(self.guidebook_tasks[task_id])
+            if not self.is_cooperative_task(task):
+                continue
+            if (
+                self.plan_approved_revision == revision
+                and self.agent_id == str(task.get('coordinator_id', ''))
+            ):
+                self.dispatch_ready_cooperative_task(task_id)
+
+        if not self.latest_poses:
+            return
+
         now = time.time()
         selected = None
         with self.guidebook_policy_lock:
             for task_id in ready_ids:
+                with self.guidebook_lock:
+                    if self.is_cooperative_task(self.guidebook_tasks[task_id]):
+                        continue
                 if task_id in self.guidebook_policy_candidates:
                     continue
                 if task_id in self.guidebook_policy_inflight:
@@ -1579,12 +2022,12 @@ class RobotAgentNode(Node):
             if not result:
                 return
 
-            legacy_policy, reason = self.validate_guidebook_policy_candidate(
+            normal_policy, reason = self.validate_guidebook_policy_candidate(
                 result,
                 task,
                 poses_dict,
             )
-            if legacy_policy is None:
+            if normal_policy is None:
                 # 동일 mission/task에서 실행 불가 판정을 매 poll마다 다시 LLM에 묻지 않습니다.
                 with self.guidebook_policy_lock:
                     self.guidebook_policy_candidates[task_id] = None
@@ -1595,7 +2038,7 @@ class RobotAgentNode(Node):
 
             # 핵심: 새 Guidebook 정책을 기존 build_tasks()에 맞춰 변환합니다.
             # TF / zone 계산 / actions 검증 / 기존 task 구조를 그대로 재사용합니다.
-            built = self.build_tasks(legacy_policy, poses_dict)
+            built = self.build_tasks(normal_policy, poses_dict)
             if len(built) != 1:
                 raise ValueError(
                     f'Guidebook Task 하나에서 실행 후보 {len(built)}개가 생성되었습니다.'
@@ -1637,46 +2080,13 @@ class RobotAgentNode(Node):
                 # 긴 timeout 뒤 즉시 재호출되지 않도록 종료 시각을 기준으로 retry합니다.
                 self.guidebook_policy_last_attempt[task_id] = time.time()
 
-    def load_policy_prompt(self, user_cmd, detected_items):
-        """robot_agent.py에서 .txt 프롬프트를 직접 로드하고 값을 채웁니다."""
-        template_text = self.prompt_path.read_text(encoding='utf-8')
-        template = Template(template_text)
-        zone_frame_text = (
-            f'{self.workspace_frame} 기준' if self.use_tf_workspace else 'agent1 기준'
-        )
-        return template.substitute(
-            detected_items=json.dumps(detected_items, ensure_ascii=False),
-            user_command=str(user_cmd),
-            agents=json.dumps(self.agent_specs, ensure_ascii=False),
-            zone_frame=zone_frame_text,
-            zones=json.dumps(self.ZONES, ensure_ascii=False),
-        )
-
-    def ask_llm_for_policy(self, user_cmd, detected_items):
-        prompt = self.load_policy_prompt(user_cmd, detected_items)
-        payload = {
-            'model': self.llm_model, 'prompt': prompt, 'format': 'json', 'stream': False,
-            'options': {'temperature': 0.0, 'num_predict': 1024}
-        }
-        self.get_logger().info('🧠 Gemma가 역할·순서·배치점·저수준 동작을 생성 중입니다...')
-        try:
-            response = requests.post(self.ollama_url, json=payload, timeout=60.0)
-            response.raise_for_status()
-            result = json.loads(response.json()['response'].strip())
-            self.get_logger().info(f'🤖 [AI 생성 오리지널 Policy]: {result}')
-            return result
-        except Exception as error:
-            self.get_logger().error(f'🚨 Code as Policy 생성 실패: {error}')
-            return {}
-
     def build_tasks(self, policy_result, poses_dict):
         raw_tasks = policy_result.get('generated_policy', [])
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise ValueError('generated_policy는 비어 있지 않은 배열이어야 합니다.')
 
-        if self.use_tf_workspace:
-            # TF listener가 최신 변환을 받을 수 있게 cache 갱신을 한 번 시도합니다.
-            self.update_workspace_tf_cache()
+        # TF listener가 최신 변환을 받을 수 있게 cache 갱신을 한 번 시도합니다.
+        self.update_workspace_tf_cache()
 
         with self.placed_points_lock:
             reserved = {zone: list(points) for zone, points in self.placed_points.items()}
@@ -1699,22 +2109,11 @@ class RobotAgentNode(Node):
                     f'{raw.get("target")}'
                 )
 
-            # 새 Guidebook 경로는 destination_spec을 사용합니다.
-            # 기존 user-command 경로는 destination/place_u/place_v를 그대로 받아
-            # 여기서 zone spec으로 감싸므로 회귀 없이 같은 resolver를 공유합니다.
             destination_spec = raw.get('destination_spec')
             if not isinstance(destination_spec, dict):
-                zone = self.normalize_zone(raw.get('destination', ''))
-                if zone is None:
-                    raise ValueError(
-                        f'정책 작업 #{order}: 기존 경로 destination은 A/B구역이어야 합니다.'
-                    )
-                destination_spec = {
-                    'type': 'zone',
-                    'zone': zone,
-                    'u': raw.get('place_u'),
-                    'v': raw.get('place_v'),
-                }
+                raise ValueError(
+                    f'정책 작업 #{order}: destination_spec JSON 객체가 필요합니다.'
+                )
 
             resolved = self.resolve_target_destination(
                 destination_spec,
@@ -1734,23 +2133,16 @@ class RobotAgentNode(Node):
             ref_place = dict(resolved['reference_place_pose'])
             robot_place = self.convert_place_pose(ref_place, assignee)
 
-            if self.use_tf_workspace:
-                base_frame = self.get_agent_base_frame(assignee)
-                z_text = (
-                    f", z={ref_place['z']:.1f}"
-                    if 'z' in ref_place else ''
-                )
-                robot_z_text = (
-                    f", z={robot_place['z']:.1f}"
-                    if 'z' in robot_place else ''
-                )
-                self.get_logger().info(
-                    f"🎯 Target Resolver: {assignee}/{resolved['type']} "
-                    f"workspace=({ref_place['x']:.1f}, {ref_place['y']:.1f}{z_text}, "
-                    f"yaw={np.degrees(ref_place['yaw']):.1f}deg) -> "
-                    f"{base_frame}=({robot_place['x']:.1f}, {robot_place['y']:.1f}"
-                    f"{robot_z_text}, yaw={np.degrees(robot_place['yaw']):.1f}deg)"
-                )
+            base_frame = self.get_agent_base_frame(assignee)
+            z_text = f", z={ref_place['z']:.1f}" if 'z' in ref_place else ''
+            robot_z_text = f", z={robot_place['z']:.1f}" if 'z' in robot_place else ''
+            self.get_logger().info(
+                f"🎯 Target Resolver: {assignee}/{resolved['type']} "
+                f"workspace=({ref_place['x']:.1f}, {ref_place['y']:.1f}{z_text}, "
+                f"yaw={np.degrees(ref_place['yaw']):.1f}deg) -> "
+                f"{base_frame}=({robot_place['x']:.1f}, {robot_place['y']:.1f}"
+                f"{robot_z_text}, yaw={np.degrees(robot_place['yaw']):.1f}deg)"
+            )
 
             task_data = {
                 'task_id': f'{plan_stamp}_{order:02d}',
@@ -1766,7 +2158,6 @@ class RobotAgentNode(Node):
                 'object_pose': self.convert_object_pose(ref_object, assignee),
                 'place_pose': robot_place,
                 'actions': actions,
-                'retry_count': 0,
             }
             if resolved['type'] == 'zone':
                 task_data['place_u'] = float(resolved['place_u'])
@@ -1783,60 +2174,46 @@ class RobotAgentNode(Node):
 
         return tasks
 
-    def command_callback(self, msg):
-        if self.is_moving:
-            self.get_logger().warn('⚠️ 현재 작업 또는 정책 생성이 진행 중입니다.')
-            return
-        if not self.latest_poses:
-            self.get_logger().warn('⚠️ 사용할 수 있는 객체 좌표가 없습니다.')
-            return
-        self.is_moving = True
-        threading.Thread(
-            target=self.plan_and_dispatch,
-            args=(msg.data, self.latest_poses.copy(), self.current_detected_items.copy()),
-            daemon=True,
-        ).start()
-
-    def plan_and_dispatch(self, user_cmd, poses_dict, detected_items):
-        local_count = 0
-        try:
-            self.get_logger().info(f'🧾 user_cmd = {user_cmd}')
-            self.get_logger().info(f'🧾 detected_items = {detected_items}')
-            self.get_logger().info(f'🧾 poses keys = {list(poses_dict.keys())}')
-            self.get_logger().info(f'🧾 agent_specs = {self.agent_specs}')
-            if self.use_tf_workspace:
-                self.get_logger().info(
-                    f'🧭 TF workspace mode = {self.agent_base_frames}, '
-                    f'workspace={self.workspace_frame}, ZONES(workspace mm) = {self.ZONES}'
-                )
-
-            policy_result = self.ask_llm_for_policy(user_cmd, detected_items)
-            tasks = self.build_tasks(policy_result, poses_dict)
-
-            if not tasks:
-                self.get_logger().warn('⚠️ 실행 가능한 정책이 없습니다.')
-                return
-
-            local_count = sum(task['assignee_id'] == self.agent_id for task in tasks)
-            for task in tasks:  # LLM 배열 순서 그대로 발행
-                msg = String()
-                msg.data = json.dumps(task, ensure_ascii=False)
-                self.task_pub.publish(msg)
-                self.get_logger().info(
-                    f"➡️ [{task['task_id']}] {task['target']} -> "
-                    f"{task['assignee_id']} / {task['destination']} / "
-                    f"place=({task['place_pose']['x']:.1f}, {task['place_pose']['y']:.1f}, "
-                    f"yaw={np.degrees(task['place_pose']['yaw']):.1f}deg)"
-                )
-                time.sleep(0.05)
-            self.get_logger().info('✅ 정책 배포 완료. Agent별 Queue를 순차 실행합니다.')
-        except Exception as error:
-            self.get_logger().error(f'🚨 정책 배포 오류: {error}')
-        finally:
-            if local_count == 0:
-                self.is_moving = False
-
     def validate_received_task(self, task):
+        execution_mode = str(task.get('execution_mode', 'single_agent')).strip()
+        if execution_mode == 'cooperative':
+            required = (
+                'mission_id', 'plan_revision', 'guidebook_task_id', 'task_id',
+                'coordinator_id', 'participants', 'targets_by_agent',
+                'target_poses_workspace', 'actions',
+            )
+            if any(key not in task for key in required):
+                raise ValueError('협동 작업 메시지에 필수 필드가 없습니다.')
+            participants = [str(value) for value in task['participants']]
+            if self.agent_id not in participants:
+                return False
+            with self.guidebook_lock:
+                if str(task['mission_id']) != self.current_mission_id:
+                    return False
+                if int(task['plan_revision']) != self.current_plan_revision:
+                    return False
+                plan_task = self.guidebook_tasks.get(str(task['guidebook_task_id']))
+            if not plan_task or not self.is_cooperative_task(plan_task):
+                raise ValueError('현재 guidebook과 일치하는 협동 Task가 없습니다.')
+            if set(participants) != set(map(str, plan_task.get('participants', []))):
+                raise ValueError('실행 메시지 participants가 승인 계획과 다릅니다.')
+            if task['targets_by_agent'] != plan_task.get('targets_by_agent'):
+                raise ValueError('실행 메시지 손잡이 할당이 승인 계획과 다릅니다.')
+            expected_actions = validate_cooperative_actions(plan_task.get('actions'))
+            actual_actions = validate_cooperative_actions(task.get('actions'))
+            if actual_actions != expected_actions:
+                raise ValueError('실행 메시지 actions가 승인 계획과 다릅니다.')
+            poses = task['target_poses_workspace']
+            if not isinstance(poses, dict) or set(poses) != set(participants):
+                raise ValueError('협동 target_poses_workspace가 올바르지 않습니다.')
+            for pose in poses.values():
+                for key in ('x', 'y', 'z', 'yaw'):
+                    if not math.isfinite(float(pose[key])):
+                        raise ValueError('협동 손잡이 pose에 유한한 숫자가 필요합니다.')
+            task['actions'] = actual_actions
+            task['participants'] = participants
+            return True
+
         required = (
             'task_id', 'assignee_id', 'target', 'destination', 'reference_object_pose',
             'reference_place_pose', 'object_pose', 'place_pose', 'actions'
@@ -1890,12 +2267,18 @@ class RobotAgentNode(Node):
                 task = self.task_queue.pop(0)
 
             guidebook_task_id = str(task.get('guidebook_task_id', '')).strip()
-            if guidebook_task_id:
+            cooperative = task.get('execution_mode') == 'cooperative'
+            coordinator = str(task.get('coordinator_id', '')) == self.agent_id
+            if guidebook_task_id and (not cooperative or coordinator):
                 self.publish_task_status(guidebook_task_id, 'EXECUTING')
 
-            success = self.execute_task(task)
+            success = (
+                self.execute_cooperative_task(task)
+                if cooperative
+                else self.execute_task(task)
+            )
 
-            if guidebook_task_id:
+            if guidebook_task_id and (not cooperative or coordinator or not success):
                 self.publish_task_status(
                     guidebook_task_id,
                     'SUCCEEDED' if success else 'FAILED'
@@ -1955,12 +2338,6 @@ class RobotAgentNode(Node):
             if not self.return_to_home_joint_pose():
                 return False
 
-            msg = Float32MultiArray()
-            msg.data = [
-                float(place['x']), float(place['y']),
-                float(place_base_z + self.PICK_PLACE_Z_OFFSET_MM), float(place['yaw'])
-            ]
-            self.pose_publisher.publish(msg)
             zone = self.normalize_zone(task['destination'])
             reference_place = task['reference_place_pose']
             if zone in self.placed_points:
@@ -1974,96 +2351,106 @@ class RobotAgentNode(Node):
             self.get_logger().error(f"🚨 [{task['task_id']}] 작업 오류: {error}")
             return False
 
-    def recover_to_safe_pose(self):
+    def wait_for_plan_approval(self, task):
+        mission_id = str(task['mission_id'])
+        revision = int(task['plan_revision'])
+        deadline = time.monotonic() + self.step_sync_timeout_sec
+        with self.step_sync_condition:
+            while rclpy.ok():
+                if (mission_id, revision) in self.cooperative_aborted:
+                    raise RuntimeError('Workstation이 협동 계획을 폐기/실패 처리했습니다.')
+                if self.plan_approved_revision == revision:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RuntimeError('Workstation 계획 승인 대기 시간 초과')
+                self.step_sync_condition.wait(timeout=min(0.5, remaining))
+
+    def execute_cooperative_task(self, task):
+        """[MERGED] 동일 action index마다 DDS barrier를 통과한 뒤 양팔을 이동합니다."""
+        task_id = str(task['task_id'])
+        local_pose = dict(task['target_poses_workspace'][self.agent_id])
+        workspace_position = np.array([
+            float(local_pose['x']), float(local_pose['y']), float(local_pose['z'])
+        ])
+        workspace_yaw = float(local_pose['yaw'])
         try:
+            self.wait_for_plan_approval(task)
             self.arm.clean_error()
-            time.sleep(0.5)
-            self.arm.motion_enable(True)
-            time.sleep(0.2)
             self.arm.set_state(0)
-            time.sleep(0.5)
-            x, y, z, yaw = self.SAFE_RETREAT_POSE
-            self.get_logger().info(f'🛡️ [{self.agent_id}] 안전 위치 ({x}, {y}, {z})로 대피')
-            return self.move_to(x, y, z, yaw=yaw)
+
+            for index, action in enumerate(task['actions']):
+                self.wait_for_step_go(task, index)
+                api = action['api']
+                self.get_logger().info(
+                    f'🤝 [{task_id}] synchronized action {index}: {action}'
+                )
+                if api == 'control_gripper':
+                    success = self.control_gripper(action['position'])
+                elif api == 'move_to_object':
+                    workspace_position = np.array([
+                        float(local_pose['x']),
+                        float(local_pose['y']),
+                        float(local_pose['z']) + float(action['z_offset']),
+                    ])
+                    bx, by, bz = self.workspace_point_to_robot(*workspace_position)
+                    robot_yaw = self.workspace_yaw_to_robot(workspace_yaw)
+                    success = self.move_to_robot_tf(
+                        bx, by, bz,
+                        yaw=robot_yaw,
+                        speed=action['speed'],
+                        label=f'{task_id} cooperative handle',
+                    )
+                elif api == 'cooperative_move_relative':
+                    workspace_position = workspace_position + np.array([
+                        float(action['x_offset']),
+                        float(action['y_offset']),
+                        float(action['z_offset']),
+                    ])
+                    bx, by, bz = self.workspace_point_to_robot(*workspace_position)
+                    robot_yaw = self.workspace_yaw_to_robot(workspace_yaw)
+                    success = self.move_to_robot_tf(
+                        bx, by, bz,
+                        yaw=robot_yaw,
+                        speed=action['speed'],
+                        label=f'{task_id} cooperative relative',
+                    )
+                elif api == 'wait':
+                    time.sleep(float(action['seconds']))
+                    success = True
+                elif api == 'return_home':
+                    success = self.return_to_home_joint_pose()
+                else:
+                    success = False
+                if not success:
+                    self.publish_step_status(
+                        task, index, 'FAILED', reason=f'{api} 실행 실패'
+                    )
+                    return False
+                self.publish_step_status(task, index, 'DONE')
+
+            # 마지막 action 완료까지 양쪽이 도착했음을 확인한 뒤 Task를 종료합니다.
+            final_index = len(task['actions'])
+            self.wait_for_step_go(task, final_index)
+            self.publish_step_status(task, final_index, 'DONE')
+            self.get_logger().info(f'✅ [{task_id}] 양팔 협동 작업 완료')
+            return True
         except Exception as error:
-            self.get_logger().error(f'🚨 대피 동작 오류: {error}')
+            self.get_logger().error(f'🚨 [{task_id}] 양팔 협동 작업 오류: {error}')
+            self.publish_step_status(task, -1, 'FAILED', reason=str(error))
             return False
 
-    def find_alternative_agent(self, task):
-        zone = self.normalize_zone(task['destination'])
-        return next(
-            (
-                agent_id for agent_id, zones in self.agent_specs.items()
-                if agent_id != self.agent_id and zone in zones
-            ),
-            None,
-        )
-
     def handle_task_failure(self, failed_task):
-        """실패 처리.
-
-        새 Guidebook 경로에서는 실패 원인이 확인되지 않은 상태에서 로봇을 자동으로
-        다시 enable한 뒤 SAFE_RETREAT로 움직이지 않는다. FAILED status가 이미 공유되므로
-        후속 depends_on Task는 BLOCKED 상태를 유지한다.
-
-        legacy /agent_task 경로만 기존 자동 복구/대체 Agent 로직을 유지한다.
-        """
+        """[MERGED] 실패 시 큐를 정지하고 자동 이동/재할당은 수행하지 않습니다."""
         self.get_logger().error(f"🚨 [{failed_task['task_id']}] 작업 실패")
-
-        guidebook_task_id = str(failed_task.get('guidebook_task_id', '')).strip()
-        if guidebook_task_id:
-            with self.task_queue_lock:
-                self.task_queue.clear()
-                self.task_worker_running = False
-            self.is_moving = False
-            self.get_logger().warn(
-                f"🛑 [{failed_task['task_id']}] Guidebook Task 실패: "
-                "자동 복구 이동/자동 재할당을 수행하지 않습니다. "
-                "로봇 상태와 실패 원인을 확인한 뒤 다음 mission을 실행하세요."
-            )
-            return
-
-        # 아래는 기존 legacy 경로 호환 동작.
-        self.get_logger().error(
-            f"🚨 [{failed_task['task_id']}] legacy Task 실패. 복구·대피를 시도합니다."
-        )
-        self.recover_to_safe_pose()
-
         with self.task_queue_lock:
-            remaining = [failed_task] + self.task_queue
             self.task_queue.clear()
             self.task_worker_running = False
-
-        for task in remaining:
-            if int(task.get('retry_count', 0)) >= 1:
-                self.get_logger().error(f"❌ [{task['task_id']}] 재시도 한도 초과")
-                continue
-            alternative = self.find_alternative_agent(task)
-            if alternative is None:
-                self.get_logger().error(
-                    f"❌ [{task['task_id']}] {task['destination']} 대체 Agent가 없습니다."
-                )
-                continue
-            try:
-                reassigned = dict(task)
-                reassigned['task_id'] = f"{task['task_id']}_retry"
-                reassigned['assignee_id'] = alternative
-                reassigned['retry_count'] = int(task.get('retry_count', 0)) + 1
-                reassigned['object_pose'] = self.convert_object_pose(
-                    task['reference_object_pose'], alternative
-                )
-                reassigned['place_pose'] = self.convert_place_pose(
-                    task['reference_place_pose'], alternative
-                )
-                msg = String()
-                msg.data = json.dumps(reassigned, ensure_ascii=False)
-                self.task_pub.publish(msg)
-                self.get_logger().warn(
-                    f"🔄 [{task['task_id']}] {alternative}에게 재할당"
-                )
-            except Exception as error:
-                self.get_logger().error(f"🚨 [{task['task_id']}] 재할당 실패: {error}")
         self.is_moving = False
+        self.get_logger().warn(
+            '🛑 자동 복구 이동/자동 재할당을 하지 않습니다. '
+            '두 로봇의 상태와 파지 상태를 확인하세요.'
+        )
 
     def color_callback(self, msg):
         try:

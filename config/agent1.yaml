@@ -3,16 +3,13 @@
     agent_id: agent1
     robot_ip: 192.168.1.218
     enable_perception: true
-    enable_command_input: true
 
     # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
     agent_specs: ["agent1:A", "agent2:B"]
     agent_base_frames: ["agent1:robot_1_base", "agent2:robot_2_base"]
 
-    use_tf_workspace: true
     robot_base_frame: robot_1_base
     workspace_frame: workspace_0
-    xarm_command_frame_mode: identity
 
     tf_lookup_timeout_sec: 1.0
     tf_cache_period_sec: 0.2
@@ -38,18 +35,18 @@
 
     llm_model: gemma4:e4b
     ollama_url: http://localhost:11434/api/generate
-    prompt_file: agent_policy.txt
     guidebook_prompt_file: agent_guidebook_policy.txt
+    cooperative_review_prompt_file: agent_cooperative_review.txt
     guidebook_policy_enabled: true
     guidebook_policy_poll_sec: 1.0
     guidebook_policy_retry_sec: 5.0
     guidebook_topic: /mission/guidebook
 
-    # Guidebook 기반 Agent 간 ROS coordination
-    coordination_enabled: true
+    # [MERGED] Guidebook/Agent 검토/action barrier 통신
     task_claim_topic: /mission/task_claim
     task_status_topic: /mission/task_status
-    claim_window_sec: 2.0
-    status_sync_grace_sec: 2.0
-    ignore_startup_retained_guidebook: true
-    startup_retained_guard_sec: 5.0
+    extra_perception_topic: /perception/yolo_extra
+    extra_perception_max_age_sec: 2.0
+    cooperative_review_timeout_sec: 60.0
+    step_sync_timeout_sec: 30.0
+    step_start_delay_sec: 0.25

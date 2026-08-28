@@ -22,6 +22,11 @@ def generate_launch_description():
         "config",
         "calibration.yaml",
     )
+    extra_perception_config = os.path.join(
+        cap_share,
+        "config",
+        "yolo_extra_perception.yaml",
+    )
 
     fixed_camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(realsense_launch),
@@ -42,7 +47,17 @@ def generate_launch_description():
         parameters=[calibration_config],
     )
 
+    # [MERGED] ArUco와 분리된 바구니 손잡이 인식 노드입니다.
+    yolo_extra_perception = Node(
+        package="cap_robot",
+        executable="yolo_extra_perception",
+        name="yolo_extra_perception",
+        output="screen",
+        parameters=[extra_perception_config],
+    )
+
     return LaunchDescription([
         fixed_camera,
         aruco_calib,
+        yolo_extra_perception,
     ])

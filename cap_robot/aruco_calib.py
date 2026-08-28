@@ -1,17 +1,16 @@
 import time
-from collections import deque
 
 import cv2
 import cv2.aruco as aruco
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Point, TransformStamped
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from scipy.spatial.transform import Rotation as R
-from tf2_ros import Buffer, StaticTransformBroadcaster, TransformBroadcaster, TransformListener
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 
 class ArucoCalibNode(Node):
@@ -23,6 +22,7 @@ class ArucoCalibNode(Node):
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('marker_size_m', 0.05)
         self.declare_parameter('target_debug_log_period_sec', 2.0)
+        self.declare_parameter('show_window', False)
         self.declare_parameter(
             'offset_1',
             [-0.195949, 0.004359, 0.026819, 0.020803, 0.005481, 0.696245, 0.717482],
@@ -51,6 +51,7 @@ class ArucoCalibNode(Node):
         self.target_debug_log_period_sec = float(
             self.get_parameter('target_debug_log_period_sec').value
         )
+        self.show_window = bool(self.get_parameter('show_window').value)
         self._last_warn_time = {}
         self._last_detected_ids_log_time = 0.0
 
@@ -76,16 +77,11 @@ class ArucoCalibNode(Node):
             self.get_parameter('workspace_marker_offsets_mm').value,
         )
 
-        self.x1_buf, self.y1_buf, self.z1_buf = deque(maxlen=10), deque(maxlen=10), deque(maxlen=10)
-        self.x2_buf, self.y2_buf, self.z2_buf = deque(maxlen=10), deque(maxlen=10), deque(maxlen=10)
-
         self.bridge = CvBridge()
         self.camera_info_received = False
 
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # marker -> robot_base는 고정 캘리브레이션이므로 /tf_static으로 1회 송신한다.
         # camera -> marker는 매 프레임 동적으로 송신하므로, 이 static transform과 연결되어
@@ -100,7 +96,8 @@ class ArucoCalibNode(Node):
         camera_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
+            # [MERGED] RealSense의 SensorDataQoS(BEST_EFFORT)와 호환합니다.
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
 
@@ -117,10 +114,8 @@ class ArucoCalibNode(Node):
             camera_qos,
         )
 
-        self.target_pub_1 = self.create_publisher(Point, '/robot_1_target', 10)
-        self.target_pub_2 = self.create_publisher(Point, '/robot_2_target', 10)
-
         self.get_logger().info(
+            # [MERGED] ArUco 노드는 캘리브레이션/TF 발행만 담당합니다.
             '🔥 멀티 에이전트(1&2) ArUco TF 노드 가동 완료 '
             f'(image={self.image_topic}, camera_info={self.camera_info_topic}, '
             f'camera_frame={self.camera_frame}, marker_size_m={self.marker_size_m}) 🔥'
@@ -306,10 +301,9 @@ class ArucoCalibNode(Node):
                     f'corner_count={len(object_points)} (필요: 4개 이상 corner, 현재 ids={detected_ids})'
                 )
 
-            self.publish_targets()
-
-        cv2.imshow('Final System', color_image)
-        cv2.waitKey(1)
+        if self.show_window:
+            cv2.imshow('ArUco calibration', color_image)
+            cv2.waitKey(1)
 
     def broadcast_tf(self, parent, child, tvec, rvec, stamp, quat=None):
         t = TransformStamped()
@@ -331,42 +325,6 @@ class ArucoCalibNode(Node):
         t.transform.rotation.z = float(q[2])
         t.transform.rotation.w = float(q[3])
         self.tf_broadcaster.sendTransform(t)
-
-    def publish_targets(self):
-        try:
-            trans1 = self.tf_buffer.lookup_transform('robot_1_base', 'workspace_0', rclpy.time.Time())
-            robot1_x = trans1.transform.translation.x * 1000
-            robot1_y = trans1.transform.translation.y * 1000
-            robot1_z = trans1.transform.translation.z * 1000
-
-            self.x1_buf.append(robot1_x)
-            self.y1_buf.append(robot1_y)
-            self.z1_buf.append(robot1_z)
-            msg1 = Point()
-            msg1.x = float(np.mean(self.x1_buf))
-            msg1.y = float(np.mean(self.y1_buf))
-            msg1.z = float(np.mean(self.z1_buf))
-            self.target_pub_1.publish(msg1)
-        except Exception as error:
-            self.warn_throttled('robot_1_target', f'robot_1_base <- workspace_0 조회 실패: {error}')
-
-        try:
-            trans2 = self.tf_buffer.lookup_transform('robot_2_base', 'workspace_0', rclpy.time.Time())
-            robot2_x = trans2.transform.translation.x * 1000
-            robot2_y = trans2.transform.translation.y * 1000
-            robot2_z = trans2.transform.translation.z * 1000
-
-            self.x2_buf.append(robot2_x)
-            self.y2_buf.append(robot2_y)
-            self.z2_buf.append(robot2_z)
-            msg2 = Point()
-            msg2.x = float(np.mean(self.x2_buf))
-            msg2.y = float(np.mean(self.y2_buf))
-            msg2.z = float(np.mean(self.z2_buf))
-            self.target_pub_2.publish(msg2)
-        except Exception as error:
-            self.warn_throttled('robot_2_target', f'robot_2_base <- workspace_0 조회 실패: {error}')
-
 
 def main(args=None):
     rclpy.init(args=args)

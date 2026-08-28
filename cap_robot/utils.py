@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -63,15 +63,6 @@ def parse_matrix_4x4(value: Any, key_name: str = 'matrix') -> np.ndarray:
     return arr
 
 
-def transform_msg_to_matrix(transform_stamped_msg: Any) -> np.ndarray:
-    tr = transform_stamped_msg.transform.translation
-    rot = transform_stamped_msg.transform.rotation
-    T = np.eye(4, dtype=float)
-    T[:3, :3] = quaternion_xyzw_to_matrix([rot.x, rot.y, rot.z, rot.w])
-    T[:3, 3] = [tr.x, tr.y, tr.z]
-    return T
-
-
 def matrix_to_transform_stamped(T: np.ndarray, parent: str, child: str, stamp) -> Any:
     from geometry_msgs.msg import TransformStamped
     qx, qy, qz, qw = matrix_to_quaternion_xyzw(T[:3, :3])
@@ -87,20 +78,3 @@ def matrix_to_transform_stamped(T: np.ndarray, parent: str, child: str, stamp) -
     msg.transform.rotation.z = float(qz)
     msg.transform.rotation.w = float(qw)
     return msg
-
-
-def transform_xyz(T_parent_child: np.ndarray, xyz_child: Iterable[float]) -> np.ndarray:
-    p = np.ones(4, dtype=float)
-    p[:3] = np.asarray(list(xyz_child), dtype=float).reshape(3)
-    out = T_parent_child @ p
-    return out[:3]
-
-
-def get_optional_float(node, name: str) -> Optional[float]:
-    value = node.get_parameter(name).value
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except TypeError:
-        return None

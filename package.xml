@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>cap_robot</name>
-  <version>0.1.0</version>
-  <description>ROS2 xArm6 LLM multi-agent manipulation package</description>
+  <version>0.2.0</version>
+  <description>ROS2 Humble xArm6 LLM multi-agent and synchronized dual-arm package</description>
 
   <maintainer email="maintainer@example.com">capstone-team</maintainer>
   <license>Apache-2.0</license>
@@ -31,6 +31,8 @@
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>python3-requests</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>
