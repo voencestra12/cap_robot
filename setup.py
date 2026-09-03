@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name + '/prompts', glob('prompts/*.txt')),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/urdf', glob('urdf/*.xacro')),
+        ('share/' + package_name + '/models', glob('models/*.pt')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
