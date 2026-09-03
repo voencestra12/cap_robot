@@ -105,7 +105,10 @@ class RobotAgentNode(Node):
         self.declare_parameter('guidebook_policy_enabled', True)
         self.declare_parameter('guidebook_policy_poll_sec', 1.0)
         self.declare_parameter('guidebook_policy_retry_sec', 5.0)
-        self.declare_parameter('yolo_model_path', 'yolo11m-seg.pt')
+        self.declare_parameter(
+            'yolo_model_paths',
+            ['models/yolo11m-seg.pt', 'models/yolo-bread.pt'],
+        )
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_claim_topic', '/mission/task_claim')
         self.declare_parameter('task_status_topic', '/mission/task_status')
@@ -158,7 +161,11 @@ class RobotAgentNode(Node):
         self.guidebook_policy_retry_sec = float(
             self.get_parameter('guidebook_policy_retry_sec').value
         )
-        self.yolo_model_path = str(self.get_parameter('yolo_model_path').value).strip()
+        self.yolo_model_paths = [
+            str(path).strip()
+            for path in self.get_parameter('yolo_model_paths').value
+            if str(path).strip()
+        ]
         self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
         self.task_claim_topic = str(self.get_parameter('task_claim_topic').value).strip()
         self.task_status_topic = str(self.get_parameter('task_status_topic').value).strip()
@@ -296,7 +303,7 @@ class RobotAgentNode(Node):
         self.placed_points = {'A': [], 'B': []}
         self.placed_points_lock = threading.Lock()
 
-        self.model = None
+        self.models = []
         self.bridge = None
         self.color_sub = None
         self.depth_sub = None
@@ -313,7 +320,18 @@ class RobotAgentNode(Node):
         if self.enable_perception:
             if cv2 is None or CvBridge is None or YOLO is None:
                 raise ImportError('perception 사용 시 OpenCV, cv_bridge, ultralytics가 필요합니다.')
-            self.model = YOLO(self.yolo_model_path)
+            package_share = Path(get_package_share_directory('cap_robot'))
+            for configured_path in self.yolo_model_paths:
+                model_path = Path(configured_path).expanduser()
+                if not model_path.is_absolute():
+                    model_path = package_share / model_path
+                if not model_path.is_file():
+                    raise FileNotFoundError(f'YOLO model not found: {model_path}')
+                model = YOLO(str(model_path))
+                self.models.append((model_path.name, model))
+                self.get_logger().info(
+                    f'YOLO model loaded: {model_path} (task={model.task})'
+                )
             self.bridge = CvBridge()
             image_qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
@@ -2529,8 +2547,10 @@ class RobotAgentNode(Node):
         return float(np.median(valid))
 
     def run_perception(self):
-        class_map_ko = {46: '바나나', 47: '사과', 49: '오렌지', 64: '마우스'}
-        class_map_en = {46: 'Banana', 47: 'Apple', 49: 'Orange', 64: 'Mouse'}
+        name_map_ko = {
+            'banana': '바나나', 'apple': '사과', 'orange': '오렌지',
+            'mouse': '마우스', 'bread': '빵',
+        }
         try:
             while rclpy.ok():
                 # ROS callback(/tf, /tf_static, camera topics, command, timer)은
@@ -2547,68 +2567,87 @@ class RobotAgentNode(Node):
                     continue
 
                 img, depth_img, intrinsics = frames
-                results = self.model.predict(
-                    source=img, classes=[46, 47, 49, 64], conf=0.3, verbose=False
-                )
                 current_poses, current_items = {}, []
 
-                for result in results:
-                    if result.masks is None or self.is_moving:
-                        continue
-                    for index, mask_array in enumerate(result.masks.xy):
-                        mask_np = mask_array.astype(np.float32)
-                        if len(mask_np) < 5:
+                for model_filename, model in self.models:
+                    wanted_class_ids = [
+                        class_id for class_id, class_name in model.names.items()
+                        if str(class_name).lower() in name_map_ko
+                    ]
+                    results = model.predict(
+                        source=img,
+                        classes=wanted_class_ids or None,
+                        conf=0.3,
+                        verbose=False,
+                    )
+                    for result in results:
+                        if self.is_moving or result.boxes is None:
                             continue
+                        masks = result.masks.xy if result.masks is not None else None
+                        for index, detected_box in enumerate(result.boxes):
+                            if masks is not None:
+                                mask_np = masks[index].astype(np.float32)
+                            else:
+                                x1, y1, x2, y2 = detected_box.xyxy[0].cpu().numpy()
+                                mask_np = np.array(
+                                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                                    dtype=np.float32,
+                                )
+                            if len(mask_np) < 5:
+                                # Detection 모델의 사각형 contour는 점이 4개입니다.
+                                if len(mask_np) != 4:
+                                    continue
 
-                        class_id = int(result.boxes.cls[index])
-                        name_ko = class_map_ko.get(class_id, f'물체_{class_id}')
-                        name_en = class_map_en.get(class_id, f'Obj_{class_id}')
-                        if name_ko not in current_items:
-                            current_items.append(name_ko)
+                            class_id = int(detected_box.cls[0])
+                            model_class_name = str(model.names[class_id]).lower()
+                            name_ko = name_map_ko.get(model_class_name, model_class_name)
+                            name_en = model_class_name.title()
+                            if name_ko not in current_items:
+                                current_items.append(name_ko)
 
-                        moments = cv2.moments(mask_np)
-                        if moments['m00'] == 0:
-                            continue
-                        cx = int(moments['m10'] / moments['m00'])
-                        cy = int(moments['m01'] / moments['m00'])
+                            moments = cv2.moments(mask_np)
+                            if moments['m00'] == 0:
+                                continue
+                            cx = int(moments['m10'] / moments['m00'])
+                            cy = int(moments['m01'] / moments['m00'])
 
-                        box = np.int32(cv2.boxPoints(cv2.minAreaRect(mask_np)))
-                        d01 = np.linalg.norm(box[0] - box[1])
-                        d12 = np.linalg.norm(box[1] - box[2])
-                        if d01 > d12:
-                            pt1, pt2 = (box[1] + box[2]) / 2, (box[0] + box[3]) / 2
-                        else:
-                            pt1, pt2 = (box[0] + box[1]) / 2, (box[2] + box[3]) / 2
-                        center_px = np.array([cx, cy])
-                        front_pt = pt1 if np.linalg.norm(center_px - pt1) > np.linalg.norm(center_px - pt2) else pt2
+                            box = np.int32(cv2.boxPoints(cv2.minAreaRect(mask_np)))
+                            d01 = np.linalg.norm(box[0] - box[1])
+                            d12 = np.linalg.norm(box[1] - box[2])
+                            if d01 > d12:
+                                pt1, pt2 = (box[1] + box[2]) / 2, (box[0] + box[3]) / 2
+                            else:
+                                pt1, pt2 = (box[0] + box[1]) / 2, (box[2] + box[3]) / 2
+                            center_px = np.array([cx, cy])
+                            front_pt = pt1 if np.linalg.norm(center_px - pt1) > np.linalg.norm(center_px - pt2) else pt2
 
-                        dist_z = self.median_depth_m(depth_img, cx, cy)
-                        if dist_z is None:
-                            continue
+                            dist_z = self.median_depth_m(depth_img, cx, cy)
+                            if dist_z is None:
+                                continue
 
-                        p3d = self.deproject_pixel_to_point(cx, cy, dist_z, intrinsics)
-                        try:
-                            wx, wy, wz = self.camera_point_to_workspace(*p3d)
-                            p3d_front = self.deproject_pixel_to_point(
-                                int(front_pt[0]), int(front_pt[1]), dist_z, intrinsics
+                            p3d = self.deproject_pixel_to_point(cx, cy, dist_z, intrinsics)
+                            try:
+                                wx, wy, wz = self.camera_point_to_workspace(*p3d)
+                                p3d_front = self.deproject_pixel_to_point(
+                                    int(front_pt[0]), int(front_pt[1]), dist_z, intrinsics
+                                )
+                                wx_front, wy_front, _ = self.camera_point_to_workspace(*p3d_front)
+                            except Exception:
+                                continue
+                            yaw = np.arctan2(wy_front - wy, wx_front - wx)
+                            current_poses[name_ko] = (wx, wy, wz, yaw)
+
+                            cv2.drawContours(img, [box], 0, (255, 0, 0), 2)
+                            cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
+                            cv2.arrowedLine(
+                                img, (cx, cy), (int(front_pt[0]), int(front_pt[1])),
+                                (0, 255, 0), 3, tipLength=0.3
                             )
-                            wx_front, wy_front, _ = self.camera_point_to_workspace(*p3d_front)
-                        except Exception:
-                            continue
-                        yaw = np.arctan2(wy_front - wy, wx_front - wx)
-                        current_poses[name_ko] = (wx, wy, wz, yaw)
-
-                        cv2.drawContours(img, [box], 0, (255, 0, 0), 2)
-                        cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
-                        cv2.arrowedLine(
-                            img, (cx, cy), (int(front_pt[0]), int(front_pt[1])),
-                            (0, 255, 0), 3, tipLength=0.3
-                        )
-                        cv2.putText(
-                            img, f'[{name_en}] WS Yaw:{int(np.degrees(yaw))}',
-                            (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (0, 255, 255), 2
-                        )
+                            cv2.putText(
+                                img, f'[{name_en}] WS Yaw:{int(np.degrees(yaw))}',
+                                (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 255, 255), 2
+                            )
 
                 if not self.is_moving:
                     self.latest_poses = current_poses
