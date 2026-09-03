@@ -1259,7 +1259,7 @@ class RobotAgentNode(Node):
             f'yaw={np.degrees(cmd["yaw"]):.1f}deg), mode={cmd["mode"]}'
         )
         return self.move_to_sdk(cmd['x'], cmd['y'], cmd['z'], yaw=cmd['yaw'], speed=speed, label=label)
-
+    
     def return_to_home_joint_pose(self):
         """첨부 이미지의 기본 joint 자세로 복귀합니다."""
         target = list(self.HOME_JOINT_ANGLES_DEG)

@@ -48,6 +48,12 @@
 5. return_home
    - {"api":"return_home"}
 
+6. cooperative_move_relative
+   - {"api":"cooperative_move_relative","x_offset": number,"y_offset": number,"z_offset": number,"speed": number}
+   - 양팔 협동 작업(바구니 옮기기 등)에서 두 로봇이 함께 물체를 잡고 이동할 때 반드시 사용.
+   - offset 범위: 축별 -300~300 mm
+   - speed 범위: 10~80   
+
 현재 validator가 허용하는 Pick-and-Place 상태 순서:
 1. gripper open
 2. move_to_object: 높은 접근 위치(z_offset 150 이상)
@@ -58,6 +64,17 @@
 7. move_to_place: 실제 place 위치(z_offset 정확히 $pick_place_z_offset_mm)
 8. gripper open
 9. move_to_place: retreat(z_offset 150 이상)
+
+현재 validator가 허용하는 협동(Cooperative) 작업 상태 순서 (대상 물체가 '바구니' 등 양팔 파지일 경우):
+ 1. gripper open (position 700 이상)
+ 2. move_to_object: 높은 접근 위치 (z_offset 100 이상)
+ 3. move_to_object: 실제 손잡이 파지 위치 (z_offset 60 이하)
+ 4. gripper close (position 450 이하)
+ 5. cooperative_move_relative: 양팔 동기화 들어올리기 (z_offset 양수, 예: 100)
+ 6. cooperative_move_relative: 양팔 동기화 수평/수직 이동 (x, y, z offset)
+ 7. cooperative_move_relative: 양팔 동기화 내려놓기 (z_offset 음수, 예: -100)
+ 8. gripper open (position 700 이상)
+ 9. return_home (협동 작업 후 필수)
 
 여기까지가 표준 Pick-and-Place의 완료이다.
 return_home은 Task가 명시적으로 home 복귀를 요구하거나 별도의 안전/협업 이유가 있을 때만 추가한다.
@@ -85,7 +102,8 @@ $default_pnp_actions
    - 단순 방향 표현이면 충돌하지 않는 보수적인 offset을 선택한다.
    - 좌표 관례: 오른쪽=+X, 왼쪽=-X, 위/앞=+Y, 아래/뒤=-Y.
 5. 사용자가 workspace_0의 절대 좌표를 명시했거나 Mission에 절대 좌표가 주어지면 workspace를 사용한다.
-   - 특별 규칙: 목적지가 "바구니"인 경우, $detected_poses 에 있는 `basket_handle_0`과 `basket_handle_1`의 좌표를 확인하고, 두 좌표의 x_mm 평균값과 y_mm 평균값을 계산하여 정중앙(바구니 안)을 구한 뒤 이를 workspace 절대 좌표로 사용한다. 절대 단일 손잡이 좌표에 그대로 배치하지 않는다.
+   - 특별 규칙 (바구니가 목적지인 경우): 대상 물체(마우스, 바나나 등)를 "바구니 안으로 옮길" 때는, $detected_poses 에 있는 `basket_handle_0`과 `basket_handle_1`의 좌표를 확인하고, 두 좌표의 x_mm 평균값과 y_mm 평균값을 계산하여 정중앙(바구니 안)을 workspace 절대 좌표로 사용한다. 절대 단일 손잡이 좌표에 그대로 배치하지 않는다.
+   - 특별 규칙 (바구니가 타겟인 경우): "바구니를 옮긴다"와 같이 바구니 자체가 조작 대상일 경우, 단일 로봇 PnP를 쓰면 안 된다. actions는 반드시 앞서 정의된 '협동(Cooperative) 작업 상태 순서'를 따르며, 이동은 'cooperative_move_relative' API로 생성한다.
    - x/y만 주어진 경우:
      {"type":"workspace","x_mm":number,"y_mm":number,"yaw_deg":number}
    - z까지 주어진 경우:
@@ -93,7 +111,7 @@ $default_pnp_actions
    - 사용자가 z를 주지 않았다면 z_mm을 추측하거나 현재 물체 높이에서 복사해 생성하지 않는다.
    - zone이나 상대 위치를 표현하기 위해 임의의 절대 좌표를 만들지 않는다.
    - z_mm이 있을 때만 move_to_place의 z_offset을 더하기 전 workspace 기준 배치 높이로 사용한다.
-6. actions는 반드시 직접 생성한다. 기본 PnP 배열을 그대로 사용할 수도 있고, validator 범위 안에서 speed, 높은 접근 z_offset, wait를 조절할 수도 있다.
+6. actions는 반드시 직접 생성한다. 단일 작업은 기본 PnP 배열을, 양팔 협동 작업(바구니 옮기기)은 협동 작업 배열을 따르며, validator 범위 안에서 speed, 높은 접근 z_offset, wait, 상대 이동 offset을 조절할 수 있다.
 7. 존재하지 않는 API를 만들지 않는다.
 8. robot base 좌표, TF 결과, xArm SDK 좌표, safety box 값은 코드가 처리하므로 생성하지 않는다.
 9. 현재 Task 하나만 계획한다. 다른 Guidebook Task를 같이 실행하지 않는다.
