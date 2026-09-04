@@ -10,6 +10,8 @@ API_MOVE_TO_PLACE = 'move_to_place'
 API_WAIT = 'wait'
 API_RETURN_HOME = 'return_home'
 API_COOPERATIVE_MOVE_RELATIVE = 'cooperative_move_relative'
+API_REQUEST_TOKEN = 'request_token'
+API_RELEASE_TOKEN = 'release_token'
 
 ALLOWED_APIS = {
     API_CONTROL_GRIPPER,
@@ -17,6 +19,8 @@ ALLOWED_APIS = {
     API_MOVE_TO_PLACE,
     API_WAIT,
     API_RETURN_HOME,
+    API_REQUEST_TOKEN, 
+    API_RELEASE_TOKEN,
 }
 
 COOPERATIVE_ALLOWED_APIS = {
@@ -25,6 +29,8 @@ COOPERATIVE_ALLOWED_APIS = {
     API_WAIT,
     API_RETURN_HOME,
     API_COOPERATIVE_MOVE_RELATIVE,
+    API_REQUEST_TOKEN,
+    API_RELEASE_TOKEN,
 }
 
 # [MERGED] 세트 1의 바구니 협동 시퀀스를 cap_robot API 형식으로 표현합니다.

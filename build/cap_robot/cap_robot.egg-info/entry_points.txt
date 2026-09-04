@@ -1,0 +1,7 @@
+[console_scripts]
+aruco_calib = cap_robot.aruco_calib:main
+mount_tf = cap_robot.mount_tf:main
+robot_agent = cap_robot.robot_agent:main
+workstation_llm = cap_robot.workstation_llm:main
+yolo_extra_perception = cap_robot.yolo_extra_perception:main
+
