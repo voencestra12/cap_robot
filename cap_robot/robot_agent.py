@@ -18,6 +18,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from xarm.wrapper import XArmAPI
+from std_srvs.srv import Trigger
 
 try:
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
@@ -38,6 +39,10 @@ except ImportError:
     CvBridge = None
     YOLO = None
 
+
+# (주의: 파일 맨 윗부분 import 모여있는 곳에 아래 두 줄이 없다면 꼭 추가해주세요)
+# from std_srvs.srv import Trigger
+# import time
 
 class RobotAgentNode(Node):
     # 공통 설계값은 코드에 유지하고, 에이전트마다 달라지는 값만 ROS 파라미터로 받습니다.
@@ -60,10 +65,10 @@ class RobotAgentNode(Node):
     HOME_JOINT_ANGLES_DEG = [0.0, -60.0, -30.0, 0.0, 90.0, 0.0]
     HOME_JOINT_SPEED_DEG_S = 20.0
     CLAIM_WAIT_SEC = 2.0
-
+     
     def __init__(self):
         super().__init__('robot_agent_node')
-
+        
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
         self.declare_parameter('enable_perception', True)
@@ -94,7 +99,7 @@ class RobotAgentNode(Node):
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
-        self.declare_parameter('llm_model', 'gemma4:e4b')
+        self.declare_parameter('llm_model', 'qwen3.8:27b')
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
         self.declare_parameter('guidebook_prompt_file', 'agent_guidebook_policy.txt')
         # [MERGED] Workstation이 완성한 협동 계획은 별도 Agent LLM 프롬프트로 검토합니다.
@@ -117,7 +122,7 @@ class RobotAgentNode(Node):
         self.declare_parameter('cooperative_review_timeout_sec', 60.0)
         self.declare_parameter('step_sync_timeout_sec', 30.0)
         self.declare_parameter('step_start_delay_sec', 0.25)
-
+        
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
@@ -190,7 +195,7 @@ class RobotAgentNode(Node):
         self.cooperative_review_prompt_path = self.resolve_prompt_path(
             self.cooperative_review_prompt_file
         )
-
+        
         if not self.agent_id or not self.robot_ip:
             raise ValueError('agent_id와 robot_ip는 비어 있을 수 없습니다.')
         if self.agent_id not in self.agent_specs:
@@ -201,6 +206,7 @@ class RobotAgentNode(Node):
             raise ValueError('agent_base_frames는 비어 있을 수 없습니다.')
         if self.enable_perception and (not self.color_topic or not self.depth_topic or not self.camera_info_topic):
             raise ValueError('perception 사용 시 color/depth/camera_info topic은 비어 있을 수 없습니다.')
+            
         # [MERGED] R8/R9 제거: workspace TF와 identity SDK frame만 지원합니다.
         # workspace_tf_cache[agent_id] = (TransformStamped, cache_update_wall_time_sec)
         self.workspace_tf_cache = {}
@@ -218,11 +224,11 @@ class RobotAgentNode(Node):
         self.get_logger().info(
             f'🧭 [{self.agent_id}] TF workspace 필수: {frame_text}'
         )
-
+        
         self.get_logger().info(f'🔌 [{self.agent_id}] 로봇 연결 중... IP={self.robot_ip}')
         self.arm = XArmAPI(self.robot_ip, is_radian=False)
         self.get_logger().info(f'✅ [{self.agent_id}] 로봇 연결 완료!')
-
+        
         # Workstation이 발행한 동일한 가이드북을 모든 Agent가 받아 상태를 공유합니다.
         self.current_mission_id = None
         self.current_plan_revision = -1
@@ -230,7 +236,7 @@ class RobotAgentNode(Node):
         self.guidebook_tasks = {}
         self.guidebook_task_status = {}
         self.guidebook_lock = threading.Lock()
-
+        
         # [MERGED] 협동 계획 검토와 action 단위 barrier 상태입니다.
         self.plan_approved_revision = -1
         self.cooperative_review_inflight = set()
@@ -244,18 +250,18 @@ class RobotAgentNode(Node):
         self.step_go_sent = set()
         self.cooperative_aborted = set()
         self.llm_request_lock = threading.Lock()
-
+        
         # 일반 READY Task를 Agent LLM 실행 후보로 변환합니다.
         self.guidebook_policy_candidates = {}
         self.guidebook_policy_inflight = set()
         self.guidebook_policy_last_attempt = {}
         self.guidebook_policy_lock = threading.Lock()
-
+        
         # 일반 Task의 claim 후보와 결정된 winner를 저장합니다.
         self.guidebook_claims = {}
         self.guidebook_claim_started = set()
         self.guidebook_claim_lock = threading.Lock()
-
+        
         guidebook_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -272,7 +278,7 @@ class RobotAgentNode(Node):
             max(0.2, self.guidebook_policy_poll_sec),
             self.poll_ready_guidebook_tasks,
         )
-
+        
         # 별도 custom msg 없이 std_msgs/String JSON으로 claim/plan/task/step을 공유합니다.
         self.task_claim_pub = self.create_publisher(String, self.task_claim_topic, 10)
         self.task_claim_sub = self.create_subscription(
@@ -288,11 +294,18 @@ class RobotAgentNode(Node):
             self.extra_perception_callback,
             10,
         )
-
+        
         # 기존 /agent_task 기반 실행 경로는 회귀 방지를 위해 그대로 유지합니다.
         # 모든 Agent가 같은 토픽을 구독하고 assignee_id가 자신인 작업만 실행합니다.
         self.task_pub = self.create_publisher(String, '/agent_task', 10)
         self.task_sub = self.create_subscription(String, '/agent_task', self.task_callback, 10)
+        
+        # ==============================================================
+        # [추가] 토큰(Mutex) 관리자 클라이언트 초기화
+        # ==============================================================
+        self.req_token_cli = self.create_client(Trigger, 'request_token')
+        self.rel_token_cli = self.create_client(Trigger, 'release_token')
+        # ==============================================================
 
         self.latest_poses = {}
         self.current_detected_items = []
@@ -302,7 +315,7 @@ class RobotAgentNode(Node):
         self.task_worker_running = False
         self.placed_points = {'A': [], 'B': []}
         self.placed_points_lock = threading.Lock()
-
+        
         self.models = []
         self.bridge = None
         self.color_sub = None
@@ -317,6 +330,7 @@ class RobotAgentNode(Node):
         self.last_tf_error_log_time = {}
         self._ros_executor = None
         self._ros_spin_thread = None
+        
         if self.enable_perception:
             if cv2 is None or CvBridge is None or YOLO is None:
                 raise ImportError('perception 사용 시 OpenCV, cv_bridge, ultralytics가 필요합니다.')
@@ -352,7 +366,7 @@ class RobotAgentNode(Node):
                 f'📷 [{self.agent_id}] ROS camera topic 구독: '
                 f'color={self.color_topic}, depth={self.depth_topic}, info={self.camera_info_topic}'
             )
-
+            
         self.init_robot()
         self.get_logger().info(
             f'🧠 LLM 설정: model={self.llm_model}, url={self.ollama_url}, '
@@ -2329,6 +2343,7 @@ class RobotAgentNode(Node):
             for index, action in enumerate(task['actions'], start=1):
                 api = action['api']
                 self.get_logger().info(f"💻 [{task['task_id']}] Action {index}: {action}")
+                
                 if api == 'control_gripper':
                     success = self.control_gripper(action['position'])
                 elif api == 'move_to_object':
@@ -2348,11 +2363,39 @@ class RobotAgentNode(Node):
                     success = True
                 elif api == 'return_home':
                     success = self.return_to_home_joint_pose()
+                    
+                # ==============================================================
+                # [추가] 공용 구역 신호등(Mutex) 제어 로직
+                # ==============================================================
+                elif api == 'request_token':
+                    self.get_logger().info("🚦 A+B 공용 구역 진입 대기 중... 신호등 확인(토큰 요청)")
+                    req = Trigger.Request()
+                    # 초록불(success=True)을 받을 때까지 무한 대기
+                    while rclpy.ok():
+                        future = self.req_token_cli.call_async(req)
+                        rclpy.spin_until_future_complete(self, future)
+                        if future.result().success:
+                            self.get_logger().info("✅ 초록불 확인(토큰 획득)! A+B 공용 구역에 진입합니다.")
+                            success = True
+                            break
+                        else:
+                            self.get_logger().warn("🔴 다른 로봇이 공용 구역 사용 중입니다. 0.5초 대기...")
+                            time.sleep(0.5)
+                            
+                elif api == 'release_token':
+                    req = Trigger.Request()
+                    future = self.rel_token_cli.call_async(req)
+                    rclpy.spin_until_future_complete(self, future)
+                    self.get_logger().info("🔓 공용 구역 작업 완료, 신호등 반납(토큰 반납) 완료!")
+                    success = True
+                # ==============================================================
+                
                 else:
                     success = False
+                    
                 if not success:
                     return False
-
+                    
             # 일반 PnP가 끝나면 두 Agent 모두 같은 기본 자세로 복귀합니다.
             # 복귀가 성공해야 Guidebook Task를 SUCCEEDED로 처리합니다.
             self.get_logger().info(
@@ -2360,7 +2403,7 @@ class RobotAgentNode(Node):
             )
             if not self.return_to_home_joint_pose():
                 return False
-
+                
             zone = self.normalize_zone(task['destination'])
             reference_place = task['reference_place_pose']
             if zone in self.placed_points:
@@ -2370,6 +2413,7 @@ class RobotAgentNode(Node):
                     ))
             self.get_logger().info(f"✅ [{task['task_id']}] 작업 완료")
             return True
+            
         except Exception as error:
             self.get_logger().error(f"🚨 [{task['task_id']}] 작업 오류: {error}")
             return False

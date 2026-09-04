@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from cap_robot.llm_api import get_capability_catalog, validate_cooperative_actions
-
+from std_srvs.srv import Trigger
 
 class WorkstationLLM(Node):
     """중앙 LLM 계획, Agent 검토 수집, 최대 1회 재계획을 담당합니다."""
@@ -26,7 +26,7 @@ class WorkstationLLM(Node):
     def __init__(self):
         super().__init__('workstation_llm')
 
-        self.declare_parameter('llm_model', 'gemma4:12b')
+        self.declare_parameter('llm_model', 'qwen3.8:27b')
         self.declare_parameter('ollama_url', 'http://localhost:11434')
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_status_topic', '/mission/task_status')
@@ -93,6 +93,15 @@ class WorkstationLLM(Node):
         self._active_review = None
         self._executor = None
         self._spin_thread = None
+
+        self.is_zone_locked = False  # False: A+B 구역 비어있음, True: 누군가 사용 중
+        
+        self.srv_request = self.create_service(
+            Trigger, 'request_token', self.request_token_callback
+        )
+        self.srv_release = self.create_service(
+            Trigger, 'release_token', self.release_token_callback
+        )
         self._reset()
         self._log(
             'SESSION_STARTED',
@@ -101,7 +110,27 @@ class WorkstationLLM(Node):
             task_status_topic=self.task_status_topic,
             extra_perception_topic=self.extra_perception_topic,
         )
+    def request_token_callback(self, request, response):
+        if self.is_zone_locked:
+            # 이미 누군가 쓰고 있다면 거절 (False)
+            response.success = False
+            response.message = "Locked"
+        else:
+            # 비어있다면 사용권 부여 (True) 하고 잠금
+            self.is_zone_locked = True
+            response.success = True
+            response.message = "Granted"
+            self.get_logger().info("🚦 공용 구역 토큰 발급됨!")
+        return response
 
+    def release_token_callback(self, request, response):
+        # 사용권 반납
+        self.is_zone_locked = False
+        response.success = True
+        response.message = "Released"
+        self.get_logger().info("🟢 공용 구역 토큰 반납됨! (비어있음)")
+        return response
+    
     def _load_prompt(self):
         prompt_path = (
             Path(get_package_share_directory('cap_robot'))
