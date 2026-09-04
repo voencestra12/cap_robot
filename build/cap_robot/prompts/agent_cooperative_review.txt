@@ -1,1 +1,0 @@
-/home/kimhakjin/colcon_ws/src/cap_robot/prompts/agent_cooperative_review.txt
