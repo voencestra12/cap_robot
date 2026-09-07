@@ -93,7 +93,8 @@ API 순서와 speed/높이 값은 Task에 맞게 결정하되 위 validator 규�
 $default_pnp_actions
 
 판단 규칙:
-1. 이 Agent가 현재 Task의 대상 물체를 인식하지 못하면 can_execute=false로 출력한다.
+판단 규칙:
+1. 이 Agent가 현재 Task의 대상 물체를 로컬 인식(local perception)하지 못하더라도, 전체 미션이나 다른 에이전트와의 협업 상황상 내가 처리해야 하거나 시야 공유 범위 내에 있다면 유연하게 판단한다. 단, 도저히 조작할 수 없는 위치라면 can_execute=false로 출력한다.
 2. can_execute=true일 때 target은 반드시 현재 인식 물체 중 하나여야 한다.
 3. 목적지가 A/B 배치 구역이면 zone을 사용한다.
    {"type":"zone","zone":"A 또는 B","u":0.0~1.0,"v":0.0~1.0}
@@ -107,6 +108,7 @@ $default_pnp_actions
    - 사용자가 거리를 명시하면 그 값을 우선 사용한다.
    - 단순 방향 표현이면 충돌하지 않는 보수적인 offset을 선택한다.
    - 좌표 관례: 오른쪽=+X, 왼쪽=-X, 위/앞=+Y, 아래/뒤=-Y.
+   - 만약 현재 Task의 대상 물체가 내 로컬 인식(local perception) 목록에 없더라도, 전체 guidebook이나 mission 목표상 내가 담당해야 하는 역할이고 workspace 내에 존재한다면, 가장 가까운 인식 물체나 공용 구역/워크스페이스 좌표를 기준으로 정책을 생성하여 실행할 수 있다.
 5. 사용자가 workspace_0의 절대 좌표를 명시했거나 Mission에 절대 좌표가 주어지면 workspace를 사용한다.
    - 특별 규칙 (바구니가 목적지인 경우): 대상 물체(마우스, 바나나 등)를 "바구니 안으로 옮길" 때는, $detected_poses 에 있는 `basket_handle_0`과 `basket_handle_1`의 좌표를 확인하고, 두 좌표의 x_mm 평균값과 y_mm 평균값을 계산하여 정중앙(바구니 안)을 workspace 절대 좌표로 사용한다. 절대 단일 손잡이 좌표에 그대로 배치하지 않는다.
    - 특별 규칙 (바구니가 타겟인 경우): "바구니를 옮긴다"와 같이 바구니 자체가 조작 대상일 경우, 단일 로봇 PnP를 쓰면 안 된다. actions는 반드시 앞서 정의된 '협동(Cooperative) 작업 상태 순서'를 따르며, 이동은 'cooperative_move_relative' API로 생성한다.

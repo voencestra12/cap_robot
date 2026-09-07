@@ -1089,7 +1089,7 @@ class RobotAgentNode(Node):
                     base_frame,
                     self.workspace_frame,
                     query_time,
-                    timeout=Duration(seconds=0.01),
+                    timeout=Duration(seconds=0.1),  # 0.01에서 0.1초로 변경
                 )
                 with self.tf_cache_lock:
                     self.workspace_tf_cache[agent_id] = (transform, self.now_sec())
