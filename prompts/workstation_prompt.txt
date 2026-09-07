@@ -101,17 +101,20 @@ cooperative actions에서 허용되는 API:
 
 4. {"api":"wait","seconds":number}, 0~2초
 5. {"api":"return_home"}
+6. {"api":"request_token"}   
+7. {"api":"release_token"}   
 
 cooperative actions의 필수 상태 순서:
-
-1. control_gripper로 열기(position>=700)
-2. move_to_object로 높은 접근(z_offset>=100)
-3. move_to_object로 손잡이 접근(z_offset<=60)
-4. control_gripper로 파지(position<=450)
-5. cooperative_move_relative를 한 번 이상 수행
-6. control_gripper로 해제(position>=700)
-7. move_to_object로 안전 후퇴(z_offset>=100)
-8. 필요하면 return_home
+1. request_token으로 공용 구역(A+B) 진입 권한 요청   # 👈 1번에 추가
+2. control_gripper로 열기(position>=700)
+3. move_to_object로 높은 접근(z_offset>=100)
+4. move_to_object로 손잡이 접근(z_offset<=60)
+5. control_gripper로 파지(position<=450)
+6. cooperative_move_relative를 한 번 이상 수행
+7. control_gripper로 해제(position>=700)
+8. move_to_object로 안전 후퇴(z_offset>=100)
+9. release_token으로 공용 구역 권한 반납          # 👈 해제 후 반납 추가
+10. 필요하면 return_home
 
 두 팔이 파지한 뒤 해제 전까지 위치 이동은 cooperative_move_relative만 사용한다.
 사용자가 방향/거리를 주면 각 offset에 그대로 보존한다.
