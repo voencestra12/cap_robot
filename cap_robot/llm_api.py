@@ -158,6 +158,18 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
             actions.append({'api': api})
             continue
 
+        if api == API_REQUEST_TOKEN:
+            zone = str(raw.get('zone', '')).strip()
+            # 예: phase가 'OPEN' 또는 'LIFTED' 직전 등 필요한 위치에 맞추거나, 
+            # 단순히 특정 단계에서 요청할 수 있게 허용
+            actions.append({'api': api, 'zone': zone})
+            continue
+
+        if api == API_RELEASE_TOKEN:
+            zone = str(raw.get('zone', '')).strip()
+            actions.append({'api': api, 'zone': zone})
+            continue
+        
         raise ValueError(f"허용되지 않은 API: '{api}'")
 
     if phase not in ('RETREATED', 'HOME'):
