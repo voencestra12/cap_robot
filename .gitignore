@@ -29,3 +29,10 @@ credentials.yaml
 
 # Local backup files
 *_backup*
+
+# ROS 2 build artifacts
+build/
+install/
+log/
+COLCON_IGNORE
+*.egg-info/

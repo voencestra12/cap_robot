@@ -1,1 +1,0 @@
-/home/kimhakjin/colcon_ws/src/cap_robot/prompts/workstation_prompt.txt
