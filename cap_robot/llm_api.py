@@ -330,6 +330,20 @@ API_REGISTRY = {
             'synchronized_release',
         ],
     },
+    API_REQUEST_TOKEN: {
+        'description': '공용 구역(바구니 영역 등)에 진입하기 전 토큰 승인을 요청합니다.',
+        'provides': [
+            'token_control',
+            'shared_zone_access',
+        ],
+    },
+    API_RELEASE_TOKEN: {
+        'description': '공용 구역 작업이 끝난 후 토큰을 반납합니다.',
+        'provides': [
+            'token_control',
+            'shared_zone_release',
+        ],
+    },
 }
 
 
@@ -344,6 +358,9 @@ CAPABILITY_DESCRIPTIONS = {
     'dual_arm_grasp': '두 로봇이 서로 다른 손잡이를 동기화하여 파지하는 능력',
     'cooperative_transport': '두 로봇이 공유 물체를 workspace 기준으로 함께 이동하는 능력',
     'synchronized_release': '두 로봇이 공유 물체를 동기화하여 해제하는 능력',
+    'token_control': '공용 구역 접근 및 제어를 위해 뮤텍스 토큰을 관리하는 능력',
+    'shared_zone_access': '다중 로봇 충돌 방지를 위해 공용 구역 진입 전 토큰을 요청하는 능력',
+    'shared_zone_release': '공용 구역 작업 완료 후 다른 로봇을 위해 토큰을 반납하는 능력',
 }
 
 
