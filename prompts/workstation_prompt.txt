@@ -99,7 +99,7 @@ cooperative actions에서 허용되는 API:
 * 축별 offset -300~300mm, 하나 이상의 offset은 0이 아님, speed 10~80
 
 
-4. {"api":"wait","seconds":number}, 0~2초
+4. {"api":"wait","seconds":number}, 0~30초 (긴 대기는 wait 하나에 큰 값을 쓰고 반복하지 않는다)
 5. {"api":"return_home"}
 6. {"api":"request_token"}   
 7. {"api":"release_token"}   

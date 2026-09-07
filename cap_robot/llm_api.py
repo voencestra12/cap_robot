@@ -13,13 +13,16 @@ API_COOPERATIVE_MOVE_RELATIVE = 'cooperative_move_relative'
 API_REQUEST_TOKEN = 'request_token'
 API_RELEASE_TOKEN = 'release_token'
 
+# 두 Agent가 공유하는 작업 구역. request_token / release_token은 이 구역 하나만 대상으로 합니다.
+SHARED_ZONE = 'A+B'
+
 ALLOWED_APIS = {
     API_CONTROL_GRIPPER,
     API_MOVE_TO_OBJECT,
     API_MOVE_TO_PLACE,
     API_WAIT,
     API_RETURN_HOME,
-    API_REQUEST_TOKEN, 
+    API_REQUEST_TOKEN,
     API_RELEASE_TOKEN,
 }
 
@@ -79,6 +82,14 @@ DEFAULT_PNP_ACTIONS = [
 ]
 
 
+def _normalize_shared_zone(raw_zone):
+    """공용 구역 토큰의 zone 값을 검증합니다. 생략하면 기본 공용 구역을 사용합니다."""
+    zone = str(SHARED_ZONE if raw_zone is None else raw_zone).strip() or SHARED_ZONE
+    if zone != SHARED_ZONE:
+        raise ValueError(f"토큰 zone은 '{SHARED_ZONE}'만 지원합니다: '{zone}'")
+    return zone
+
+
 def validate_actions(raw_actions, pick_place_z_offset_mm):
     """LLM 정책의 API 순서와 수치 범위를 검증합니다.
 
@@ -89,6 +100,7 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
 
     pick_place_z_offset_mm = float(pick_place_z_offset_mm)
     phase = 'START'
+    token_held = False
     actions = []
 
     for index, raw in enumerate(raw_actions):
@@ -146,8 +158,8 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
 
         if api == API_WAIT:
             seconds = float(raw.get('seconds'))
-            if not 0.0 <= seconds <= 2.0:
-                raise ValueError('wait는 0~2초이어야 합니다.')
+            if not 0.0 <= seconds <= 30.0:
+                raise ValueError('wait는 0~30초이어야 합니다.')
             actions.append({'api': api, 'seconds': seconds})
             continue
 
@@ -159,21 +171,27 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
             continue
 
         if api == API_REQUEST_TOKEN:
-            zone = str(raw.get('zone', '')).strip()
-            # 예: phase가 'OPEN' 또는 'LIFTED' 직전 등 필요한 위치에 맞추거나, 
-            # 단순히 특정 단계에서 요청할 수 있게 허용
+            zone = _normalize_shared_zone(raw.get('zone'))
+            if token_held:
+                raise ValueError(f'이미 획득한 {zone} 토큰을 다시 요청할 수 없습니다.')
+            token_held = True
             actions.append({'api': api, 'zone': zone})
             continue
 
         if api == API_RELEASE_TOKEN:
-            zone = str(raw.get('zone', '')).strip()
+            zone = _normalize_shared_zone(raw.get('zone'))
+            if not token_held:
+                raise ValueError(f'획득하지 않은 {zone} 토큰을 반납할 수 없습니다.')
+            token_held = False
             actions.append({'api': api, 'zone': zone})
             continue
-        
+
         raise ValueError(f"허용되지 않은 API: '{api}'")
 
     if phase not in ('RETREATED', 'HOME'):
         raise ValueError('정책이 물체 해제 후 안전 후퇴까지 완료되지 않았습니다.')
+    if token_held:
+        raise ValueError('요청한 공용 구역 토큰을 반납하는 release_token이 없습니다.')
 
     return actions
 
@@ -188,6 +206,7 @@ def validate_cooperative_actions(raw_actions):
         raise ValueError('협동 actions는 1~30개의 JSON 배열이어야 합니다.')
 
     phase = 'START'
+    token_held = False
     actions = []
     cooperative_move_count = 0
 
@@ -201,8 +220,8 @@ def validate_cooperative_actions(raw_actions):
 
         if api == API_WAIT:
             seconds = float(raw.get('seconds'))
-            if not 0.0 <= seconds <= 2.0:
-                raise ValueError('협동 wait는 0~2초이어야 합니다.')
+            if not 0.0 <= seconds <= 30.0:
+                raise ValueError('협동 wait는 0~30초이어야 합니다.')
             actions.append({'api': api, 'seconds': seconds})
             continue
 
@@ -275,10 +294,28 @@ def validate_cooperative_actions(raw_actions):
             actions.append({'api': api})
             continue
 
+        if api == API_REQUEST_TOKEN:
+            zone = _normalize_shared_zone(raw.get('zone'))
+            if token_held:
+                raise ValueError(f'이미 획득한 {zone} 토큰을 다시 요청할 수 없습니다.')
+            token_held = True
+            actions.append({'api': api, 'zone': zone})
+            continue
+
+        if api == API_RELEASE_TOKEN:
+            zone = _normalize_shared_zone(raw.get('zone'))
+            if not token_held:
+                raise ValueError(f'획득하지 않은 {zone} 토큰을 반납할 수 없습니다.')
+            token_held = False
+            actions.append({'api': api, 'zone': zone})
+            continue
+
     if cooperative_move_count < 1:
         raise ValueError('협동 계획에는 cooperative_move_relative가 하나 이상 필요합니다.')
     if phase not in ('RETREATED', 'HOME'):
         raise ValueError('협동 계획이 동시 해제 후 안전 후퇴까지 완료되지 않았습니다.')
+    if token_held:
+        raise ValueError('요청한 공용 구역 토큰을 반납하는 release_token이 없습니다.')
     return actions
 
 
