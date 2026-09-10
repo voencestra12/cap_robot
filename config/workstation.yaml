@@ -1,0 +1,29 @@
+# 역할: 워크스테이션 계획·감시·CSV 설정. 인터페이스: config_file.
+# [변경] 작업 순서 없이 LLM 모델과 운용 한계만 설정.
+agents:
+- agent1
+- agent2
+llm:
+  url: http://localhost:11434/api/generate
+  model: gemma4:12b
+  timeout: 45.0
+heartbeat_timeout: 2.0
+task_timeout: 180.0
+log_dir: ~/.ros/cap_robot
+planning:
+  max_tasks: 32
+cooperative:
+  enabled: true
+  world_frame: workspace_0
+  max_translation_step: 0.015
+  max_speed: 0.02
+  relative_tolerance: 0.006
+  pose_tolerance: 0.015
+  start_delay: 1.0
+  prepare_timeout: 0.6
+  max_start_skew: 0.05
+  plan_timeout: 60.0
+  command_timeout: 25.0
+  observation_max_age: 2.0
+  gate_timeout: 0.5
+  permit_timeout: 1.5

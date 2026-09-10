@@ -1,25 +1,54 @@
-/aruco_calib:
-  ros__parameters:
-    image_topic: /fixed_camera/camera/color/image_raw
-    camera_info_topic: /fixed_camera/camera/color/camera_info
-    camera_frame: fixed_camera/camera_color_optical_frame
-    marker_size_m: 0.05
-    target_debug_log_period_sec: 2.0
-    show_window: false
-
-    # [x, y, z, qx, qy, qz, qw]
-    # offset_1: [-0.195949, 0.004359, 0.026819, 0.020803, 0.005481, 0.696245, 0.717482]
-    # offset_1: [-0.185429, 0.003176, 0.018006, -0.011176, 0.002573, 0.698863, 0.715164]
-    offset_1: [-0.199929, 0.023176, 0.020006, -0.011176, 0.002573, 0.698863, 0.715164]
-    offset_2: [-0.198899, -0.001916, 0.024214, 0.014971, 0.013757, 0.706619, 0.707302]
-
-    workspace_marker_ids: [0, 2, 4, 11, 13, 15]
-    # marker ID 순서대로 [x, y, z]를 이어 붙인 값, 단위 mm
-    workspace_marker_offsets_mm: [
-      0.0, 0.0, 0.0,
-      300.0, 0.0, 0.0,
-      600.0, 0.0, 0.0,
-      600.0, 350.0, 0.0,
-      300.0, 350.0, 0.0,
-      0.0, 350.0, 0.0
-    ]
+# 역할: ArUco TF 설정. 인터페이스: calibration_node.
+# [변경] 원본 mm 배치를 m로 통일. 수치는 재검증 필요.
+image_topic: /fixed_camera/camera/color/image_raw
+camera_info_topic: /fixed_camera/camera/color/camera_info
+workspace_frame: workspace_0
+marker_size_m: 0.05
+max_image_age: 0.5
+max_reprojection_error_px: 2.0
+robot_offsets:
+- marker: marker_1
+  base: robot_1_base
+  pose:
+  - -0.199929
+  - 0.023176
+  - 0.020006
+  - -0.011176
+  - 0.002573
+  - 0.698863
+  - 0.715164
+- marker: marker_12
+  base: robot_2_base
+  pose:
+  - -0.198899
+  - -0.001916
+  - 0.024214
+  - 0.014971
+  - 0.013757
+  - 0.706619
+  - 0.707302
+workspace_markers:
+  0:
+  - 0.0
+  - 0.0
+  - 0.0
+  2:
+  - 0.3
+  - 0.0
+  - 0.0
+  4:
+  - 0.6
+  - 0.0
+  - 0.0
+  11:
+  - 0.6
+  - 0.35
+  - 0.0
+  13:
+  - 0.3
+  - 0.35
+  - 0.0
+  15:
+  - 0.0
+  - 0.35
+  - 0.0

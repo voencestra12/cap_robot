@@ -1,4 +1,6 @@
 <?xml version="1.0"?>
+<!-- 역할: xArm6 FK/원본 hand-eye link6. 인터페이스: xacro -> robot_state_publisher. -->
+<!-- [변경] 관절 상태는 안전 노드에서 제공. SDK 제어 연결은 한 개만 사용. -->
 <robot xmlns:xacro="http://ros.org/wiki/xacro" name="cap_robot_xarm_tf_only">
   <!--
     TF-only xArm model wrapper.

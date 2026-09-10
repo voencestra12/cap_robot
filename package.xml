@@ -1,40 +1,25 @@
 <?xml version="1.0"?>
+<!-- 역할: ROS 2 Humble 의존성. 인터페이스: rosdep/colcon. -->
+<!-- [변경] 안전/감시/서비스와 rosbag 의존성을 명시한다. -->
 <package format="3">
-  <name>cap_robot</name>
-  <version>0.2.0</version>
-  <description>ROS2 Humble xArm6 LLM multi-agent and synchronized dual-arm package</description>
-
-  <maintainer email="maintainer@example.com">capstone-team</maintainer>
+  <!-- [변경] 기본 demo launch 인자 충돌 수정 배포. -->
+  <name>cap_robot</name><version>1.0.1</version>
+  <description>Independent LLM dual xArm agents with mandatory safety gateway</description>
+  <maintainer email="maintainer@example.com">Capstone team</maintainer>
   <license>Apache-2.0</license>
-
   <buildtool_depend>ament_python</buildtool_depend>
-
-  <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>launch</exec_depend>
-  <exec_depend>launch_ros</exec_depend>
-  <exec_depend>robot_state_publisher</exec_depend>
-  <exec_depend>xacro</exec_depend>
-
-  <exec_depend>xarm_api</exec_depend>
-  <exec_depend>xarm_description</exec_depend>
-  <exec_depend>uf_ros_lib</exec_depend>
-  <exec_depend>realsense2_camera</exec_depend>
-
-  <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>rclpy</exec_depend><exec_depend>ament_index_python</exec_depend>
+  <exec_depend>std_msgs</exec_depend><exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend><exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend><exec_depend>cv_bridge</exec_depend>
+  <exec_depend>launch</exec_depend><exec_depend>launch_ros</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend><exec_depend>xacro</exec_depend>
+  <exec_depend>xarm_description</exec_depend><exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>rosbag2_transport</exec_depend>
+  <exec_depend>python3-yaml</exec_depend><exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend><exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-requests</exec_depend>
-  <exec_depend>python3-opencv</exec_depend>
-
   <test_depend>python3-pytest</test_depend>
-
-  <export>
-    <build_type>ament_python</build_type>
-  </export>
+  <test_depend>rcl_interfaces</test_depend>
+  <export><build_type>ament_python</build_type></export>
 </package>

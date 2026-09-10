@@ -1,3 +1,4 @@
-# ROS apt 패키지 밖의 Python 런타임 의존성
-ultralytics
-xArm-Python-SDK
+# 역할: rosdep 외 실기 Python 의존성. 인터페이스: pip install -r.
+# [변경] API 기준 SDK 하한 고정; 실제 사용 버전은 검증 보고서에 기록.
+xarm-python-sdk>=1.17.3,<2
+ultralytics>=8.3,<9
