@@ -1,7 +1,0 @@
-# 역할: 수정 전 기본 demo 실행의 시작 오류 발췌. 인터페이스: 회귀 실패 증거.
-[metrics-8] IsADirectoryError: [Errno 21] Is a directory: '.'
-[cooperative_node-9] IsADirectoryError: [Errno 21] Is a directory: '.'
-[workstation_node-7] IsADirectoryError: [Errno 21] Is a directory: '.'
-[ERROR] [metrics-8]: process has died [pid 9952, exit code 1, cmd '/home/kj/.codex/.chatgpt-projects/g-p-69526b11e9a88191bb2c5831bcaaf2f8/.verification/install/cap_robot/lib/cap_robot/metrics --ros-args --params-file /tmp/launch_params_y8cdwfvw'].
-[ERROR] [cooperative_node-9]: process has died [pid 9954, exit code 1, cmd '/home/kj/.codex/.chatgpt-projects/g-p-69526b11e9a88191bb2c5831bcaaf2f8/.verification/install/cap_robot/lib/cap_robot/cooperative_node --ros-args --params-file /tmp/launch_params_vfnfu5x6'].
-[ERROR] [workstation_node-7]: process has died [pid 9950, exit code 1, cmd '/home/kj/.codex/.chatgpt-projects/g-p-69526b11e9a88191bb2c5831bcaaf2f8/.verification/install/cap_robot/lib/cap_robot/workstation_node --ros-args --params-file /tmp/launch_params_d4wgv3iz'].

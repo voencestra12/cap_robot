@@ -1,5 +1,3 @@
-# 역할: 원본 link6-camera hand-eye 참고값. 인터페이스: mount_tf.
-# [변경] 실측 검증 전 자동 사용하지 않으며 원본 좌표계 유지.
 description: "Agent 1 idealized hand-eye TF: agent1_link6 -> agent1/camera_link"
 parent_frame: agent1_link6
 child_frame: agent1/camera_link

@@ -1,41 +1,34 @@
-"""역할: Python/ROS 리소스 설치. 인터페이스: colcon build, console_scripts."""
-
 from glob import glob
-from pathlib import Path
 from setuptools import find_packages, setup
 
-# [변경] SDK는 safety_node만 소유하며 각 실행 모듈을 독립 프로세스로 설치.
-modules = [
-    "safety_node",
-    "agent_node",
-    "workstation_node",
-    "cooperative_node",
-    "perception_node",
-    "calibration_node",
-    "mount_tf",
-    "metrics",
-    "metrics_report",
-    "cli",
-]
+package_name = 'cap_robot'
+
 setup(
-    name="cap_robot",
-    version="1.0.1",  # [변경] 기본 demo launch 인자 충돌 수정 배포.
-    packages=find_packages(exclude=["test"]),
+    name=package_name,
+    version='0.2.0',
+    packages=find_packages(exclude=['test']),
     data_files=[
-        ("share/ament_index/resource_index/packages", ["resource/cap_robot"]),
-        ("share/cap_robot", ["package.xml", "README.md"]),
-    ]
-    + [
-        (f"share/cap_robot/{d}", [p for p in glob(f"{d}/*") if Path(p).is_file()])
-        for d in ["config", "prompts", "launch", "models", "urdf", "docs"]
+        ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/config', glob('config/*.yaml')),
+        ('share/' + package_name + '/prompts', glob('prompts/*.txt')),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/urdf', glob('urdf/*.xacro')),
+        ('share/' + package_name + '/models', glob('models/*.pt')),
     ],
-    install_requires=["setuptools", "PyYAML", "requests", "numpy", "scipy"],
-    # [변경] colcon이 unittest 대신 pytest 시험을 실제 수집하도록 명시한다.
-    tests_require=["pytest"],
-    zip_safe=False,
-    maintainer="Capstone team",
-    maintainer_email="maintainer@example.com",
-    description="Independent LLM dual xArm agents with mandatory safety gateway",
-    license="Apache-2.0",
-    entry_points={"console_scripts": [f"{m} = cap_robot.{m}:main" for m in modules]},
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='capstone-team',
+    maintainer_email='maintainer@example.com',
+    description='ROS2 Humble xArm6 LLM multi-agent and synchronized dual-arm package',
+    license='Apache-2.0',
+    entry_points={
+        'console_scripts': [
+            'aruco_calib = cap_robot.aruco_calib:main',
+            'robot_agent = cap_robot.robot_agent:main',
+            'workstation_llm = cap_robot.workstation_llm:main',
+            'mount_tf = cap_robot.mount_tf:main',
+            'yolo_extra_perception = cap_robot.yolo_extra_perception:main',
+        ],
+    },
 )

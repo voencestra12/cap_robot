@@ -1,40 +1,42 @@
-"""역할: 검증된 hand-eye rigid transform 게시. 인터페이스: config_file -> /tf_static.
+#!/usr/bin/env python3
+from __future__ import annotations
 
-# [변경] 원본 link6 기준 변환 유지; TCP 기준으로 임의 재해석하지 않는다.
-"""
+from pathlib import Path
 
-import numpy as np
-from scipy.spatial.transform import Rotation
+import rclpy
+import yaml
 from rclpy.node import Node
-from tf2_ros import StaticTransformBroadcaster
-from .ros_support import parameter, load_config, run_node
-from .calibration_node import CalibrationNode
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+
+from .utils import matrix_to_transform_stamped, parse_matrix_4x4
 
 
-class MountTF(Node):
-    def __init__(self):
-        super().__init__("mount_tf")
-        c = load_config(parameter(self, "config_file", ""))
-        matrix = np.array(c["T_parent_child"]["matrix"], dtype=float)
-        if (
-            matrix.shape != (4, 4)
-            or not np.isfinite(matrix).all()
-            or not np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-8)
-            or not np.allclose(matrix[:3, :3].T @ matrix[:3, :3], np.eye(3), atol=1e-6)
-            or not np.isclose(np.linalg.det(matrix[:3, :3]), 1.0, atol=1e-6)
-        ):
-            raise ValueError("hand-eye matrix must be finite rigid transform in metres")
-        self.tf = StaticTransformBroadcaster(self)
-        self.tf.sendTransform(
-            CalibrationNode.msg(
-                c["parent_frame"],
-                c["child_frame"],
-                matrix[:3, 3],
-                Rotation.from_matrix(matrix[:3, :3]).as_quat(),
-                self.get_clock().now().to_msg(),
-            )
-        )
+class StaticTfFromYaml(Node):
+    def __init__(self) -> None:
+        super().__init__('mount_tf')
+        self.declare_parameter('result_yaml', 'handeye_camera_link_result.yaml')
+        path = Path(str(self.get_parameter('result_yaml').value)).expanduser()
+        with path.open('r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        parent = str(data['parent_frame'])
+        child = str(data['child_frame'])
+        T = parse_matrix_4x4(data['T_parent_child']['matrix'], 'T_parent_child.matrix')
+        msg = matrix_to_transform_stamped(T, parent, child, self.get_clock().now().to_msg())
+        self.broadcaster = StaticTransformBroadcaster(self)
+        self.broadcaster.sendTransform(msg)
+        self.get_logger().info(f'Published static TF {parent} -> {child} from {path}')
+        self.get_logger().info('Keep this node alive. If it stops, robot and camera TF trees may disconnect.')
 
 
-def main(args=None):
-    run_node(MountTF, args)
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = StaticTfFromYaml()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

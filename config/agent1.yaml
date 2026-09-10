@@ -1,108 +1,52 @@
-# 역할: 로봇별 통합 설정. 인터페이스: 각 노드 config_file.
-# [변경] 기본값은 SDK 연결 없는 dry_run + 명시적 모의 관측. 실측 수치가 아니다.
-agent_id: agent1
-robot_ip: 192.168.1.218
-base_frame: robot_1_base
-dry_run: true
-commissioning:
-  calibration_verified: false
-  workspace_verified: false
-  cooperative_verified: false
-  orientation_verified: false
-safety:
-  min_xyz:
-  - 0.1
-  - -0.4
-  - 0.1
-  max_xyz:
-  - 0.65
-  - 0.4
-  - 0.65
-  max_speed: 0.08
-  max_accel: 0.2
-  tcp_radius: 0.02
-  initial_position:
-  - 0.3
-  - 0.0
-  - 0.35
-  initial_rpy:
-  - 3.141592653589793
-  - 0.0
-  - 0.0
-  permit_timeout: 1.5
-  command_timeout: 20.0
-  state_timeout: 0.5
-  command_max_age: 1.0
-  max_step: 0.3
-  gripper_min: 0.0
-  gripper_max: 850.0
-  max_rotation_step: 0.15
-  max_angular_speed: 0.1
-  max_angular_accel: 0.2
-llm:
-  url: http://localhost:11434/api/generate
-  model: gemma4:e4b
-  timeout: 45.0
-planning:
-  max_replans: 2
-  observation_max_age: 2.0
-  search_max_views: 4
-  search_min:
-  - 0.15
-  - -0.3
-  - 0.15
-  search_max:
-  - 0.6
-  - 0.3
-  - 0.6
-  search_views:
-  - - 0.3
-    - -0.1
-    - 0.4
-  - - 0.3
-    - 0.1
-    - 0.4
-  command_timeout: 25.0
-perception:
-  backend: mock
-  color_topic: /agent1/camera/color/image_raw
-  depth_topic: /agent1/camera/aligned_depth_to_color/image_raw
-  camera_info_topic: /agent1/camera/color/camera_info
-  model_paths:
-  - models/yolo11m-seg.pt
-  - models/yolo-bread.pt
-  label_aliases: {}
-  confidence: 0.45
-  max_age: 1.0
-  sync_slop: 0.08
-  mock_objects:
-  - id: agent1_bread_1
-    label: bread
-    position:
-    - 0.32
-    - 0.05
-    - 0.2
-    confidence: 1.0
-  - id: agent1_handle_1
-    label: handle
-    position:
-    - 0.3
-    - 0.0
-    - 0.3
-    confidence: 1.0
-  detect_red_handles: true
-cooperative:
-  enabled: true
-  world_frame: workspace_0
-  max_translation_step: 0.015
-  max_speed: 0.02
-  relative_tolerance: 0.006
-  pose_tolerance: 0.015
-  start_delay: 1.0
-  prepare_timeout: 0.6
-  max_start_skew: 0.05
-  plan_timeout: 60.0
-  command_timeout: 25.0
-  observation_max_age: 2.0
-  gate_timeout: 0.5
-  permit_timeout: 1.5
+/agent1/robot_agent_node:
+  ros__parameters:
+    agent_id: agent1
+    robot_ip: 192.168.1.218
+    enable_perception: true
+
+    # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
+    agent_specs: ["agent1:A", "agent2:B"]
+    agent_base_frames: ["agent1:robot_1_base", "agent2:robot_2_base"]
+
+    robot_base_frame: robot_1_base
+    workspace_frame: workspace_0
+
+    tf_lookup_timeout_sec: 1.0
+    tf_cache_period_sec: 0.2
+    tf_cache_max_age_sec: 60.0
+    tf_buffer_cache_sec: 60.0
+    tf_lookup_delay_sec: 0.5
+    tf_debug_log_period_sec: 2.0
+
+    # 안전을 위해 기본값은 dry_run입니다. 실제 구동 확인 후 false로 바꾸세요.
+    dry_run: false
+    enable_sdk_safety_box: true
+    sdk_x_min: 50.0
+    sdk_x_max: 750.0
+    sdk_y_min: -600.0
+    sdk_y_max: 600.0
+    sdk_z_min: 20.0
+    sdk_z_max: 700.0
+
+    color_topic: /agent1/camera/color/image_raw
+    depth_topic: /agent1/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /agent1/camera/color/camera_info
+    yolo_model_paths: [models/yolo11m-seg.pt, models/yolo-bread.pt]
+
+    llm_model: gemma4:e4b
+    ollama_url: http://localhost:11434/api/generate
+    guidebook_prompt_file: agent_guidebook_policy.txt
+    cooperative_review_prompt_file: agent_cooperative_review.txt
+    guidebook_policy_enabled: true
+    guidebook_policy_poll_sec: 1.0
+    guidebook_policy_retry_sec: 5.0
+    guidebook_topic: /mission/guidebook
+
+    # [MERGED] Guidebook/Agent 검토/action barrier 통신
+    task_claim_topic: /mission/task_claim
+    task_status_topic: /mission/task_status
+    extra_perception_topic: /perception/yolo_extra
+    extra_perception_max_age_sec: 2.0
+    cooperative_review_timeout_sec: 60.0
+    step_sync_timeout_sec: 30.0
+    step_start_delay_sec: 0.25
