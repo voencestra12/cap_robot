@@ -158,6 +158,11 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
             actions.append({'api': api})
             continue
 
+        if api in (API_REQUEST_TOKEN, API_RELEASE_TOKEN):
+            # 공용 구역 잠금은 이제 robot_agent의 기하 게이트가 자동 처리합니다.
+            # 구버전 계획/프롬프트 호환을 위해 조용히 무시합니다(phase·순서에 영향 없음).
+            continue
+
         raise ValueError(f"허용되지 않은 API: '{api}'")
 
     if phase not in ('RETREATED', 'HOME'):
@@ -186,6 +191,11 @@ def validate_cooperative_actions(raw_actions):
         api = str(raw.get('api', '')).strip()
         if api not in COOPERATIVE_ALLOWED_APIS:
             raise ValueError(f"협동 작업에서 허용되지 않은 API: '{api}'")
+
+        if api in (API_REQUEST_TOKEN, API_RELEASE_TOKEN):
+            # 공용 구역 토큰은 coordinator가 자동 확보/반납합니다(P3).
+            # 구버전 계획 호환을 위해 조용히 무시합니다.
+            continue
 
         if api == API_WAIT:
             seconds = float(raw.get('seconds'))

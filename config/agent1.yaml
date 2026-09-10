@@ -50,3 +50,15 @@
     cooperative_review_timeout_sec: 60.0
     step_sync_timeout_sec: 30.0
     step_start_delay_sec: 0.25
+
+    # A+B 공용 구역 토큰 / 기하 게이트 (zone_token_manager 노드 1개를 함께 실행)
+    zone_token_enabled: true
+    zone_token_request_topic: /zone_token/request
+    zone_token_state_topic: /zone_token/state
+    zone_token_acquire_timeout_sec: 60.0
+    zone_token_lease_sec: 45.0          # zone_token_manager의 lease_sec과 일치시킬 것
+    shared_zone_x_min: 150.0            # workspace_0 절대좌표(mm)
+    shared_zone_x_max: 450.0
+    shared_zone_y_min: -50.0
+    shared_zone_y_max: 500.0
+    shared_zone_margin_mm: 0.0

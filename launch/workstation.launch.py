@@ -56,8 +56,24 @@ def generate_launch_description():
         parameters=[extra_perception_config],
     )
 
+    # A+B 공용 구역 토큰 매니저. 시스템 전체에서 정확히 1개만 실행합니다.
+    # lease_sec 은 각 agent yaml 의 zone_token_lease_sec 과 일치시켜야 합니다.
+    zone_token_manager = Node(
+        package="cap_robot",
+        executable="zone_token_manager",
+        name="zone_token_manager",
+        output="screen",
+        parameters=[{
+            "request_topic": "/zone_token/request",
+            "state_topic": "/zone_token/state",
+            "lease_sec": 45.0,
+            "tick_period_sec": 1.0,
+        }],
+    )
+
     return LaunchDescription([
         fixed_camera,
         aruco_calib,
         yolo_extra_perception,
+        zone_token_manager,
     ])

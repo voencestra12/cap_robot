@@ -38,6 +38,26 @@ class LlmApiValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_cooperative_actions(actions)
 
+    def test_legacy_token_apis_are_ignored_not_rejected(self):
+        # P4: 구버전 계획이 토큰 API를 남겨도 검증이 실패하지 않고 조용히 무시한다.
+        pnp = (
+            [{'api': 'request_token'}]
+            + list(DEFAULT_PNP_ACTIONS)
+            + [{'api': 'release_token'}]
+        )
+        actions = validate_actions(pnp, 40.0)
+        self.assertEqual(len(actions), len(DEFAULT_PNP_ACTIONS))
+        self.assertTrue(all(a['api'] not in ('request_token', 'release_token')
+                            for a in actions))
+
+        coop = (
+            [{'api': 'request_token'}]
+            + list(DEFAULT_COOPERATIVE_ACTIONS)
+            + [{'api': 'release_token'}]
+        )
+        coop_actions = validate_cooperative_actions(coop)
+        self.assertEqual(len(coop_actions), len(DEFAULT_COOPERATIVE_ACTIONS))
+
     def test_cooperative_capabilities_are_registered(self):
         catalog = get_capability_catalog()
         self.assertIn('dual_arm_grasp', catalog)

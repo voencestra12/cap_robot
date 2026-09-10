@@ -2,6 +2,7 @@ import json
 import math
 import threading
 import time
+import uuid
 from pathlib import Path
 from string import Template
 
@@ -9,6 +10,7 @@ import numpy as np
 import requests
 import rclpy
 from ament_index_python.packages import get_package_share_directory
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -18,17 +20,18 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from xarm.wrapper import XArmAPI
-from std_srvs.srv import Trigger
 
 try:
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from .llm_api import validate_cooperative_actions
     from .llm_api import validate_actions as validate_llm_actions
+    from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from llm_api import validate_cooperative_actions
     from llm_api import validate_actions as validate_llm_actions
+    from shared_zone import classify_shared_zone_entry, expand_aabb
 
 try:
     import cv2
@@ -39,10 +42,6 @@ except ImportError:
     CvBridge = None
     YOLO = None
 
-
-# (주의: 파일 맨 윗부분 import 모여있는 곳에 아래 두 줄이 없다면 꼭 추가해주세요)
-# from std_srvs.srv import Trigger
-# import time
 
 class RobotAgentNode(Node):
     # 공통 설계값은 코드에 유지하고, 에이전트마다 달라지는 값만 ROS 파라미터로 받습니다.
@@ -122,7 +121,19 @@ class RobotAgentNode(Node):
         self.declare_parameter('cooperative_review_timeout_sec', 60.0)
         self.declare_parameter('step_sync_timeout_sec', 30.0)
         self.declare_parameter('step_start_delay_sec', 0.25)
-        
+
+        # A+B 공용 구역 토큰 / 기하 게이트 파라미터
+        self.declare_parameter('zone_token_enabled', True)
+        self.declare_parameter('zone_token_request_topic', '/zone_token/request')
+        self.declare_parameter('zone_token_state_topic', '/zone_token/state')
+        self.declare_parameter('zone_token_acquire_timeout_sec', 60.0)
+        self.declare_parameter('zone_token_lease_sec', 45.0)
+        self.declare_parameter('shared_zone_x_min', 150.0)
+        self.declare_parameter('shared_zone_x_max', 450.0)
+        self.declare_parameter('shared_zone_y_min', -50.0)
+        self.declare_parameter('shared_zone_y_max', 500.0)
+        self.declare_parameter('shared_zone_margin_mm', 0.0)
+
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
@@ -188,6 +199,30 @@ class RobotAgentNode(Node):
         )
         self.step_start_delay_sec = float(
             self.get_parameter('step_start_delay_sec').value
+        )
+        self.zone_token_enabled = bool(
+            self.get_parameter('zone_token_enabled').value
+        )
+        self.zone_token_request_topic = str(
+            self.get_parameter('zone_token_request_topic').value
+        ).strip()
+        self.zone_token_state_topic = str(
+            self.get_parameter('zone_token_state_topic').value
+        ).strip()
+        self.zone_token_acquire_timeout_sec = float(
+            self.get_parameter('zone_token_acquire_timeout_sec').value
+        )
+        self.zone_token_lease_sec = float(
+            self.get_parameter('zone_token_lease_sec').value
+        )
+        self.shared_zone_box = {
+            'x_min': float(self.get_parameter('shared_zone_x_min').value),
+            'x_max': float(self.get_parameter('shared_zone_x_max').value),
+            'y_min': float(self.get_parameter('shared_zone_y_min').value),
+            'y_max': float(self.get_parameter('shared_zone_y_max').value),
+        }
+        self.shared_zone_margin_mm = float(
+            self.get_parameter('shared_zone_margin_mm').value
         )
         self.guidebook_prompt_path = self.resolve_prompt_path(
             self.guidebook_prompt_file
@@ -301,10 +336,36 @@ class RobotAgentNode(Node):
         self.task_sub = self.create_subscription(String, '/agent_task', self.task_callback, 10)
         
         # ==============================================================
-        # [추가] 토큰(Mutex) 관리자 클라이언트 초기화
+        # A+B 공용 구역 토큰: 토픽 기반 클라이언트 (zone_token_manager 노드와 통신)
+        # 안전 보장은 execute_task 의 기하 게이트가 담당하고, 여기서는 요청/상태만.
         # ==============================================================
-        self.req_token_cli = self.create_client(Trigger, 'request_token')
-        self.rel_token_cli = self.create_client(Trigger, 'release_token')
+        self._zone_cbg = ReentrantCallbackGroup()
+        self.zone_token_pub = self.create_publisher(
+            String, self.zone_token_request_topic, 10
+        )
+        zone_state_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.zone_token_state_sub = self.create_subscription(
+            String,
+            self.zone_token_state_topic,
+            self.zone_token_state_callback,
+            zone_state_qos,
+            callback_group=self._zone_cbg,
+        )
+        self._zone_cond = threading.Condition()
+        self._zone_state = {'holder': None, 'queue': [], 'epoch': 0}
+        self._zone_token_held = False
+        self._zone_token_epoch = None
+        if self.zone_token_enabled:
+            self._zone_hb_timer = self.create_timer(
+                max(5.0, self.zone_token_lease_sec / 3.0),
+                self._zone_token_heartbeat,
+                callback_group=self._zone_cbg,
+            )
         # ==============================================================
 
         self.latest_poses = {}
@@ -2325,6 +2386,142 @@ class RobotAgentNode(Node):
                 self.handle_task_failure(task)
                 return
 
+    # ==================================================================
+    # A+B 공용 구역 토큰 클라이언트 (zone_token_manager 노드와 토픽 통신)
+    # ==================================================================
+    def zone_token_state_callback(self, msg):
+        """zone_token_manager가 latch로 발행하는 현재 소유 상태를 반영합니다."""
+        try:
+            state = json.loads(msg.data)
+            if not isinstance(state, dict):
+                return
+        except (ValueError, json.JSONDecodeError):
+            return
+        with self._zone_cond:
+            self._zone_state = state
+            if self._zone_token_held and state.get('holder') != self.agent_id:
+                self.get_logger().warn(
+                    f'⚠️ [{self.agent_id}] 공용 구역 토큰을 잃었습니다 '
+                    f'(holder={state.get("holder")}). lease 만료/매니저 재시작 가능성.'
+                )
+                self._zone_token_held = False
+                self._zone_token_epoch = None
+            self._zone_cond.notify_all()
+
+    def _publish_zone_request(self, action, request_id=None, epoch=None):
+        payload = {'agent_id': self.agent_id, 'action': str(action)}
+        if request_id is not None:
+            payload['request_id'] = str(request_id)
+        if epoch is not None:
+            payload['epoch'] = int(epoch)
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        try:
+            self.zone_token_pub.publish(msg)
+        except Exception as error:  # 노드 종료 중 publish 실패가 finally 반환값을 가리지 않도록
+            self.get_logger().warn(f'⚠️ zone_token 요청 발행 실패({action}): {error}')
+
+    def _shared_zone_box(self):
+        return expand_aabb(self.shared_zone_box, self.shared_zone_margin_mm)
+
+    def task_shared_zone_plan(self, task):
+        """workspace_0 좌표로 이 Task가 공용 구역에 들어가는지 판정합니다.
+
+        - pick 지점이 공용 구역 안 → 첫 move_to_object 전에 토큰
+        - place 지점이 공용 구역 안, 또는 pick→place 직선이 공용 구역을 통과
+          → 첫 move_to_place 전에 토큰
+        - 좌표를 못 구하면 보수적으로 토큰을 요구
+        """
+        if not self.zone_token_enabled:
+            return {'needed': False, 'acquire_before_api': None, 'reason': 'disabled'}
+
+        box = self._shared_zone_box()
+        obj = task.get('reference_object_pose') or {}
+        place = task.get('reference_place_pose') or {}
+        try:
+            ox, oy = float(obj['x']), float(obj['y'])
+            px, py = float(place['x']), float(place['y'])
+        except (KeyError, TypeError, ValueError):
+            self.get_logger().warn(
+                f'⚠️ [{task.get("task_id")}] workspace 좌표 확인 불가 '
+                '→ 공용 구역 토큰을 보수적으로 요구합니다.'
+            )
+            return {
+                'needed': True,
+                'acquire_before_api': 'move_to_object',
+                'reason': 'workspace 좌표 불명',
+            }
+
+        acquire_before_api, reason = classify_shared_zone_entry(ox, oy, px, py, box)
+        return {
+            'needed': acquire_before_api is not None,
+            'acquire_before_api': acquire_before_api,
+            'reason': reason,
+        }
+
+    def acquire_zone_token(self, task_id, timeout_sec=None):
+        """공용 구역 토큰을 획득할 때까지(또는 timeout까지) 이 워커 스레드를 블록합니다."""
+        if not self.zone_token_enabled:
+            return True
+        if self._zone_token_held:
+            return True
+
+        if timeout_sec is None:
+            timeout_sec = self.zone_token_acquire_timeout_sec
+        req_id = uuid.uuid4().hex[:8]
+        self.get_logger().info(
+            f'🎟️ [{task_id}] 공용 구역 토큰 요청 (req={req_id})'
+        )
+        deadline = time.monotonic() + float(timeout_sec)
+        last_pub = 0.0
+        with self._zone_cond:
+            while rclpy.ok():
+                now = time.monotonic()
+                if now - last_pub > 2.0:
+                    self._publish_zone_request('acquire', request_id=req_id)
+                    last_pub = now
+                if self._zone_state.get('holder') == self.agent_id:
+                    self._zone_token_held = True
+                    self._zone_token_epoch = self._zone_state.get('epoch')
+                    self.get_logger().info(
+                        f'✅ [{task_id}] 공용 구역 토큰 획득 '
+                        f'(epoch={self._zone_token_epoch})'
+                    )
+                    return True
+                remaining = deadline - now
+                if remaining <= 0.0:
+                    self.get_logger().error(
+                        f'⏰ [{task_id}] 공용 구역 토큰 획득 timeout '
+                        f'({float(timeout_sec):.0f}s). '
+                        f'holder={self._zone_state.get("holder")}, '
+                        f'queue={self._zone_state.get("queue")} '
+                        '(zone_token_manager 노드가 실행 중인지 확인)'
+                    )
+                    # P5: 대기열에 남은 유령 waiter가 되지 않도록 명시적으로 취소합니다.
+                    self._publish_zone_request('abandon', request_id=req_id)
+                    return False
+                self._zone_cond.wait(timeout=min(1.0, remaining))
+        # rclpy 종료 등으로 루프를 빠져나온 경우에도 대기열을 정리합니다.
+        self._publish_zone_request('abandon', request_id=req_id)
+        return False
+
+    def release_zone_token(self, task_id):
+        if not self.zone_token_enabled:
+            return
+        with self._zone_cond:
+            epoch = self._zone_token_epoch
+            self._zone_token_held = False
+            self._zone_token_epoch = None
+        self._publish_zone_request('release', epoch=epoch)
+        self.get_logger().info(
+            f'🟢 [{task_id}] 공용 구역 토큰 반납 (epoch={epoch})'
+        )
+
+    def _zone_token_heartbeat(self):
+        """토큰 보유 중에는 주기적으로 acquire를 재발행해 lease를 갱신합니다."""
+        if self._zone_token_held:
+            self._publish_zone_request('acquire', request_id='hb')
+
     def execute_task(self, task):
         obj = task['object_pose']
         place = task['place_pose']
@@ -2337,13 +2534,49 @@ class RobotAgentNode(Node):
             f"place=({float(place['x']):.1f}, {float(place['y']):.1f}, "
             f"{place_base_z:.1f}, yaw={np.degrees(float(place['yaw'])):.1f}deg)"
         )
+
+        # 공용 구역(A+B) 진입 여부를 workspace_0 좌표로 결정론적으로 판정합니다.
+        zone_plan = self.task_shared_zone_plan(task)
+        self.get_logger().info(
+            f"🚧 [{task['task_id']}] 공용 구역 판정: needed={zone_plan['needed']} "
+            f"({zone_plan['reason']})"
+            + (
+                f", 토큰 확보 시점=첫 {zone_plan['acquire_before_api']}"
+                if zone_plan['needed'] else ''
+            )
+        )
+        acquired_here = False
         try:
             self.arm.clean_error()
             self.arm.set_state(0)
             for index, action in enumerate(task['actions'], start=1):
                 api = action['api']
+
+                # 공용 구역에 처음 들어가는 모션 직전에 토큰을 확보합니다.
+                if (
+                    zone_plan['needed']
+                    and not acquired_here
+                    and api == zone_plan['acquire_before_api']
+                ):
+                    if not self.acquire_zone_token(task['task_id']):
+                        return False
+                    acquired_here = True
+
+                # P5: 확보했던 토큰을 모션 도중 상실했으면(매니저 재시작 등)
+                # 공용 구역으로 더 움직이지 않고 즉시 중단합니다.
+                if (
+                    acquired_here
+                    and not self._zone_token_held
+                    and api in ('move_to_object', 'move_to_place')
+                ):
+                    self.get_logger().error(
+                        f"🛑 [{task['task_id']}] 공용 구역 토큰을 상실한 상태에서 "
+                        "모션을 시도하여 작업을 중단합니다. 두 로봇 위치를 확인하세요."
+                    )
+                    return False
+
                 self.get_logger().info(f"💻 [{task['task_id']}] Action {index}: {action}")
-                
+
                 if api == 'control_gripper':
                     success = self.control_gripper(action['position'])
                 elif api == 'move_to_object':
@@ -2363,39 +2596,18 @@ class RobotAgentNode(Node):
                     success = True
                 elif api == 'return_home':
                     success = self.return_to_home_joint_pose()
-                    
-                # ==============================================================
-                # [추가] 공용 구역 신호등(Mutex) 제어 로직
-                # ==============================================================
-                elif api == 'request_token':
-                    self.get_logger().info("🚦 A+B 공용 구역 진입 대기 중... 신호등 확인(토큰 요청)")
-                    req = Trigger.Request()
-                    # 초록불(success=True)을 받을 때까지 무한 대기
-                    while rclpy.ok():
-                        future = self.req_token_cli.call_async(req)
-                        rclpy.spin_until_future_complete(self, future)
-                        if future.result().success:
-                            self.get_logger().info("✅ 초록불 확인(토큰 획득)! A+B 공용 구역에 진입합니다.")
-                            success = True
-                            break
-                        else:
-                            self.get_logger().warn("🔴 다른 로봇이 공용 구역 사용 중입니다. 0.5초 대기...")
-                            time.sleep(0.5)
-                            
-                elif api == 'release_token':
-                    req = Trigger.Request()
-                    future = self.rel_token_cli.call_async(req)
-                    rclpy.spin_until_future_complete(self, future)
-                    self.get_logger().info("🔓 공용 구역 작업 완료, 신호등 반납(토큰 반납) 완료!")
+                elif api in ('request_token', 'release_token'):
+                    # 구버전 계획 호환: 공용 구역 잠금은 이제 기하 게이트가 자동 처리합니다.
+                    self.get_logger().debug(
+                        f"ℹ️ [{task['task_id']}] {api} 무시 (기하 게이트 사용)"
+                    )
                     success = True
-                # ==============================================================
-                
                 else:
                     success = False
-                    
+
                 if not success:
                     return False
-                    
+
             # 일반 PnP가 끝나면 두 Agent 모두 같은 기본 자세로 복귀합니다.
             # 복귀가 성공해야 Guidebook Task를 SUCCEEDED로 처리합니다.
             self.get_logger().info(
@@ -2403,7 +2615,7 @@ class RobotAgentNode(Node):
             )
             if not self.return_to_home_joint_pose():
                 return False
-                
+
             zone = self.normalize_zone(task['destination'])
             reference_place = task['reference_place_pose']
             if zone in self.placed_points:
@@ -2413,10 +2625,14 @@ class RobotAgentNode(Node):
                     ))
             self.get_logger().info(f"✅ [{task['task_id']}] 작업 완료")
             return True
-            
+
         except Exception as error:
             self.get_logger().error(f"🚨 [{task['task_id']}] 작업 오류: {error}")
             return False
+        finally:
+            # 성공/실패/예외 어느 경로로 끝나든 확보한 토큰은 반드시 반납합니다.
+            if acquired_here:
+                self.release_zone_token(task['task_id'])
 
     def wait_for_plan_approval(self, task):
         mission_id = str(task['mission_id'])
@@ -2434,15 +2650,49 @@ class RobotAgentNode(Node):
                 self.step_sync_condition.wait(timeout=min(0.5, remaining))
 
     def execute_cooperative_task(self, task):
-        """[MERGED] 동일 action index마다 DDS barrier를 통과한 뒤 양팔을 이동합니다."""
+        """[MERGED] 동일 action index마다 DDS barrier를 통과한 뒤 양팔을 이동합니다.
+
+        공용 구역 토큰 규칙(P3):
+        - coordinator만 협동 작업 전체 구간 토큰을 확보/반납한다 (belt-and-suspenders).
+        - 비-coordinator participant는 토큰을 절대 요청하지 않는다. 양쪽이 단일
+          토큰을 잡으면 wait_for_step_go barrier에서 상호 대기 → 데드락이 된다.
+        - 같은 Agent에서 단일 task와 협동 task는 직렬 큐(process_task_queue) 덕분에
+          동시에 실행되지 않는다.
+        """
         task_id = str(task['task_id'])
+        is_coordinator = str(task.get('coordinator_id', '')) == self.agent_id
         local_pose = dict(task['target_poses_workspace'][self.agent_id])
         workspace_position = np.array([
             float(local_pose['x']), float(local_pose['y']), float(local_pose['z'])
         ])
         workspace_yaw = float(local_pose['yaw'])
+
+        # 불변식: 협동 진입 시 단일 task 토큰이 남아 있으면 안 된다. 방어적으로 반납.
+        if self._zone_token_held:
+            self.get_logger().error(
+                f'🛑 [{task_id}] 불변식 위반: 협동 진입 시 이미 공용 구역 토큰 보유 중. '
+                '방어적으로 반납합니다.'
+            )
+            self.release_zone_token(task_id)
+
+        coop_token_held = False
         try:
             self.wait_for_plan_approval(task)
+
+            if is_coordinator and self.zone_token_enabled:
+                coop_timeout = min(
+                    self.zone_token_acquire_timeout_sec, self.step_sync_timeout_sec
+                )
+                self.get_logger().info(
+                    f'🎟️ [{task_id}] coordinator가 협동 구간 공용 구역 토큰 확보 시도'
+                )
+                if not self.acquire_zone_token(task_id, timeout_sec=coop_timeout):
+                    self.publish_step_status(
+                        task, -1, 'FAILED', reason='공용 구역 토큰 확보 실패'
+                    )
+                    return False
+                coop_token_held = True
+
             self.arm.clean_error()
             self.arm.set_state(0)
 
@@ -2452,6 +2702,21 @@ class RobotAgentNode(Node):
                 self.get_logger().info(
                     f'🤝 [{task_id}] synchronized action {index}: {action}'
                 )
+
+                # P5: coordinator가 협동 구간 토큰을 상실했으면 즉시 중단합니다.
+                if (
+                    coop_token_held
+                    and not self._zone_token_held
+                    and api in ('move_to_object', 'cooperative_move_relative')
+                ):
+                    self.get_logger().error(
+                        f'🛑 [{task_id}] 협동 구간 공용 구역 토큰 상실 → 작업 중단'
+                    )
+                    self.publish_step_status(
+                        task, index, 'FAILED', reason='공용 구역 토큰 상실'
+                    )
+                    return False
+
                 if api == 'control_gripper':
                     success = self.control_gripper(action['position'])
                 elif api == 'move_to_object':
@@ -2506,6 +2771,10 @@ class RobotAgentNode(Node):
             self.get_logger().error(f'🚨 [{task_id}] 양팔 협동 작업 오류: {error}')
             self.publish_step_status(task, -1, 'FAILED', reason=str(error))
             return False
+        finally:
+            # coordinator가 확보한 협동 구간 토큰을 모든 종료 경로에서 반납합니다.
+            if coop_token_held:
+                self.release_zone_token(task_id)
 
     def handle_task_failure(self, failed_task):
         """[MERGED] 실패 시 큐를 정지하고 자동 이동/재할당은 수행하지 않습니다."""

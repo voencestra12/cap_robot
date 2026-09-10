@@ -7,7 +7,7 @@
 
 | 컴퓨터 | 실행 | 역할 |
 |---|---|---|
-| 연구실 컴퓨터 | `ros2 launch cap_robot workstation.launch.py` | 고정 RealSense, ArUco TF, 손잡이 인식 |
+| 연구실 컴퓨터 | `ros2 launch cap_robot workstation.launch.py` | 고정 RealSense, ArUco TF, 손잡이 인식, **공용 구역 토큰 매니저(`zone_token_manager`)** |
 | 연구실 컴퓨터 | `ros2 run cap_robot workstation_llm` | 자연어 해석, 전체 계획 작성, Agent 검토 수집, 최대 1회 재계획 |
 | 노트북 1 | `ros2 launch cap_robot agent1.launch.py` | Agent 1 LLM, YOLO perception, xArm6(192.168.1.218) 실행 |
 | 노트북 2 | `ros2 launch cap_robot agent2.launch.py` | Agent 2 LLM, YOLO perception, xArm6(192.168.1.198) 실행 |
@@ -38,6 +38,35 @@
 동기화는 ROS 메시지 기반의 단계 barrier이며 실시간 제어 버스는 아닙니다. 두 노트북의
 네트워크 지연 편차가 크면 `step_start_delay_sec`를 늘리십시오.
 
+### 공용 구역(A+B) 충돌 방지 — 토큰(Mutex)
+
+두 로봇이 `depends_on` 없이 병렬로 움직일 때 중앙 workspace에서 부딪히는 것을 막기
+위해, **공용 구역 점유를 런타임에 직렬화**합니다. 안전 보장은 LLM 출력과 무관하며
+`robot_agent`가 `workspace_0` 좌표로 결정론적으로 판정합니다.
+
+- **구역 정의**: `SHARED_ZONE` 사각형(`workspace_0` 절대좌표, mm). 기본값
+  `x∈[150,450]`, `y∈[-50,500]`. `agent*.yaml`의 `shared_zone_x_min/x_max/y_min/y_max`,
+  `shared_zone_margin_mm`로 조정합니다. A-only / B-only 구역은 자유 진입.
+- **판정**(`task_shared_zone_plan`): pick 지점이 구역 내부면 첫 `move_to_object` 전,
+  place 지점이 내부이거나 pick→place 직선이 구역을 통과하면 첫 `move_to_place` 전에
+  토큰을 확보합니다. 구역에 닿지 않는 Task는 토큰을 전혀 쓰지 않아 완전 병렬로 실행됩니다.
+- **Pick**: 각자 구역에서 이뤄지면 토큰 불필요 → 두 로봇 동시 집기 가능.
+- **Dual(협동)**: `cooperative_move_relative` 등 양팔 동시 이동은 이미 step barrier로
+  동기화되므로 토큰 불필요. 단, coordinator(`min(participants)`)가 belt-and-suspenders로
+  협동 구간 전체 토큰을 확보하고, 비-coordinator는 토큰을 요청하지 않습니다(barrier
+  상호 대기 데드락 방지).
+- **매니저**(`zone_token_manager`, 시스템 전체 1개): `holder` 1명 + FIFO 대기열.
+  반납 시 대기 중인 상대에게 우선 이전(공정 큐), 재요청자는 큐 뒤로. grant마다 `epoch`가
+  증가하여 lease 회수 후 지각 반납은 무시됩니다.
+- **lease / 하트비트**: grant에 `lease_sec`(기본 45초) 만료 시각이 붙고, 보유 중인
+  Agent는 `lease_sec/3`마다 재-acquire로 갱신합니다. 홀더 프로세스가 죽으면 lease 만료로
+  자동 회수됩니다. 획득 실패(`zone_token_acquire_timeout_sec`, 기본 60초)·모션 중 토큰
+  상실 시 해당 Task는 즉시 실패 처리되고 자동 복구 이동은 하지 않습니다.
+- **끄기**: `zone_token_enabled: false`로 게이트 전체를 비활성화할 수 있습니다.
+
+> `agent*.yaml`의 `zone_token_lease_sec`와 `workstation.launch.py`의
+> `zone_token_manager` `lease_sec`을 같은 값으로 유지하십시오.
+
 ## 주요 토픽
 
 | 토픽 | 형식 | 용도 |
@@ -49,6 +78,8 @@
 | `/perception/yolo_extra` | `std_msgs/String` JSON | 손잡이 및 Agent별 접근성 |
 | `/basket/handle_0_pose` | `geometry_msgs/PoseStamped` | workspace_0 기준 손잡이 0(m) |
 | `/basket/handle_1_pose` | `geometry_msgs/PoseStamped` | workspace_0 기준 손잡이 1(m) |
+| `/zone_token/request` | `std_msgs/String` JSON | 공용 구역 토큰 `acquire`/`release`/`abandon` (Agent → 매니저) |
+| `/zone_token/state` | `std_msgs/String` JSON (latched) | 현재 `holder`, `queue`, `epoch`, `lease_remaining_sec` (매니저 → 전체) |
 
 ## 빌드
 
@@ -73,7 +104,12 @@ ros2 topic echo /perception/yolo_extra --once
 ros2 run tf2_ros tf2_echo robot_1_base workspace_0
 ros2 run tf2_ros tf2_echo robot_2_base workspace_0
 ros2 topic info /mission/task_status -v
+ros2 topic echo /zone_token/state --qos-durability transient_local --once
 ```
+
+`/zone_token/state`가 `holder: null`로 한 번 이상 발행되어야 `zone_token_manager`가
+정상 기동한 것입니다. 이 노드가 없으면 공용 구역을 지나는 Task마다
+`zone_token_acquire_timeout_sec`만큼 대기 후 실패합니다.
 
 `/perception/yolo_extra`의 `valid`가 `true`이고 두 손잡이 및 두 Agent의
 `within_safety_box`가 올바른지 확인한 다음 협동 명령을 입력하십시오.
@@ -107,6 +143,13 @@ ros2 topic info /mission/task_status -v
 
 ## 검증 범위
 
-`test/test_llm_api.py`는 일반/협동 action 상태기와 금지 API를 검사합니다. ROS 2가 설치된
-실제 환경에서는 `colcon test --packages-select cap_robot` 후, 반드시 `dry_run` 분산 통합
-시험을 별도로 수행하십시오.
+- `test/test_llm_api.py` — 일반/협동 action 상태기와 금지 API (레거시 토큰 API는 예외
+  없이 무시되는지 포함)
+- `test/test_zone_token.py` — 토큰 코어(`ZoneTokenCore`): 획득/대기열/공정 이전/epoch/
+  lease 회수/하트비트/`abandon`
+- `test/test_shared_zone.py` — 공용 구역 기하 판정: 점·선분 vs AABB, pick/place/transit 분류
+
+ROS 2가 설치된 실제 환경에서는 `colcon test --packages-select cap_robot` 후, 반드시
+`dry_run` 분산 통합 시험을 별도로 수행하십시오. 토큰 동작은
+`ros2 topic echo /zone_token/state`로 두 로봇이 중앙 구역을 두고 순차 진입하는지,
+각자 구역만 쓰는 Task에서는 토큰 트래픽이 없는지 확인합니다.

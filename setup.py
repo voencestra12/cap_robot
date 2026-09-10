@@ -27,6 +27,7 @@ setup(
             'aruco_calib = cap_robot.aruco_calib:main',
             'robot_agent = cap_robot.robot_agent:main',
             'workstation_llm = cap_robot.workstation_llm:main',
+            'zone_token_manager = cap_robot.zone_token_manager:main',
             'mount_tf = cap_robot.mount_tf:main',
             'yolo_extra_perception = cap_robot.yolo_extra_perception:main',
         ],
