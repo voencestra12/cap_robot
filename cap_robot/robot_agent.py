@@ -585,15 +585,16 @@ class RobotAgentNode(Node):
             self.get_logger().error(f'❌ Guidebook 수신/해석 실패: {error}')
 
     def refresh_guidebook_task_states_locked(self):
-        """guidebook_lock을 잡은 상태에서 depends_on만으로 READY/BLOCKED를 계산합니다."""
+        """guidebook_lock을 잡은 상태에서 상태를 계산합니다."""
         for task_id, task in self.guidebook_tasks.items():
             current = self.guidebook_task_status.get(task_id)
             if current in ('CLAIMED', 'EXECUTING', 'SUCCEEDED', 'FAILED'):
                 continue
-
             dependencies = task.get('depends_on', [])
+            
+            # [수정] SUCCEEDED 뿐만 아니라 EXECUTING 상태여도 선행 조건 통과로 인정
             ready = all(
-                self.guidebook_task_status.get(dep) == 'SUCCEEDED'
+                self.guidebook_task_status.get(dep) in ('SUCCEEDED', 'EXECUTING')
                 for dep in dependencies
             )
             self.guidebook_task_status[task_id] = 'READY' if ready else 'BLOCKED'
