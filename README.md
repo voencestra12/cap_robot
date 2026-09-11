@@ -99,6 +99,8 @@ Ollama에는 연구실 컴퓨터의 Workstation 모델과 각 노트북의 Agent
 
 Agent LLM의 thinking은 각 `agent*.yaml`의 `llm_think`로 제어합니다. 실행 중에도 다음
 명령으로 변경할 수 있으며, 변경값은 다음 LLM 요청부터 적용됩니다.
+`true`이면 Ollama의 추론 토큰과 최종 JSON 응답이 각 노드를 실행한 터미널에 실시간으로
+분리 출력됩니다. Workstation LLM도 기본적으로 thinking이 켜져 있습니다.
 
 ```bash
 # Agent 1 thinking 켜기/끄기
@@ -108,6 +110,10 @@ ros2 param set /agent1/robot_agent_node llm_think false
 # Agent 2 thinking 켜기/끄기
 ros2 param set /agent2/robot_agent_node llm_think true
 ros2 param set /agent2/robot_agent_node llm_think false
+
+# Workstation thinking 켜기/끄기
+ros2 param set /workstation_llm llm_think true
+ros2 param set /workstation_llm llm_think false
 ```
 
 ## 실행 전 점검

@@ -25,12 +25,14 @@ try:
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from .llm_api import validate_cooperative_actions
     from .llm_api import validate_actions as validate_llm_actions
+    from .ollama_stream import consume_ollama_stream
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from llm_api import validate_cooperative_actions
     from llm_api import validate_actions as validate_llm_actions
+    from ollama_stream import consume_ollama_stream
     from shared_zone import classify_shared_zone_entry, expand_aabb
 
 try:
@@ -1626,6 +1628,29 @@ class RobotAgentNode(Node):
             raise ValueError('LLM 응답은 JSON 객체여야 합니다.')
         return result
 
+    def request_ollama_generate(self, payload, *, label, timeout):
+        """Ollama generate 응답과 thinking을 스트리밍하고 최종 본문을 반환합니다."""
+        request_payload = dict(payload)
+        request_payload['stream'] = True
+        think_enabled = bool(request_payload.get('think', False))
+        with self.llm_request_lock:
+            with requests.post(
+                self.ollama_url,
+                json=request_payload,
+                timeout=timeout,
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                content, _thinking = consume_ollama_stream(
+                    response,
+                    endpoint='generate',
+                    label=f'{self.agent_id} {label}',
+                    show_thinking=think_enabled,
+                )
+        if not content:
+            raise RuntimeError('Ollama가 최종 응답을 반환하지 않았습니다.')
+        return content
+
     def _cooperative_object_pose(self, state, target_name):
         if not state.get('valid'):
             raise ValueError(
@@ -1736,18 +1761,15 @@ class RobotAgentNode(Node):
             'model': self.llm_model,
             'prompt': prompt,
             'format': 'json',
-            'stream': False,
             'think': bool(self.get_parameter('llm_think').value),
             'options': {'temperature': 0.0, 'num_predict': 512},
         }
-        with self.llm_request_lock:
-            response = requests.post(
-                self.ollama_url,
-                json=payload,
-                timeout=self.cooperative_review_timeout_sec,
-            )
-            response.raise_for_status()
-        result = self.parse_llm_json_object(response.json()['response'])
+        raw = self.request_ollama_generate(
+            payload,
+            label='협동 계획 검토',
+            timeout=self.cooperative_review_timeout_sec,
+        )
+        result = self.parse_llm_json_object(raw)
         if not isinstance(result.get('accept'), bool):
             raise ValueError('협동 검토 응답은 accept(boolean)를 포함해야 합니다.')
         reason = str(result.get('reason', '')).strip()
@@ -1900,7 +1922,6 @@ class RobotAgentNode(Node):
             'model': self.llm_model,
             'prompt': prompt,
             'format': 'json',
-            'stream': False,
             'think': bool(self.get_parameter('llm_think').value),
             'options': {'temperature': 0.0, 'num_predict': 2048},
         }
@@ -1909,10 +1930,12 @@ class RobotAgentNode(Node):
             f'🧠 [{self.agent_id}] Guidebook {task_id} 정책 후보 생성 중...'
         )
         try:
-            with self.llm_request_lock:
-                response = requests.post(self.ollama_url, json=payload, timeout=300.0)
-                response.raise_for_status()
-            result = self.parse_llm_json_object(response.json()['response'])
+            raw = self.request_ollama_generate(
+                payload,
+                label=f'Guidebook {task_id} 정책',
+                timeout=300.0,
+            )
+            result = self.parse_llm_json_object(raw)
             self.get_logger().info(
                 f'🤖 [{self.agent_id}] Guidebook {task_id} Policy 후보: {result}'
             )

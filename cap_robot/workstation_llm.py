@@ -18,6 +18,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
 from cap_robot.llm_api import get_capability_catalog, validate_cooperative_actions
+from cap_robot.ollama_stream import consume_ollama_stream
 
 class WorkstationLLM(Node):
     """중앙 LLM 계획, Agent 검토 수집, 최대 1회 재계획을 담당합니다."""
@@ -35,6 +36,7 @@ class WorkstationLLM(Node):
         self.declare_parameter('plan_review_timeout_sec', 90.0)
         self.declare_parameter('log_dir', '~/capstone_ws/log/cap_robot')
         self.declare_parameter('timeout_sec', 300.0)
+        self.declare_parameter('llm_think', True)
 
         self.model = str(self.get_parameter('llm_model').value)
         self.ollama_url = str(self.get_parameter('ollama_url').value).rstrip('/')
@@ -163,11 +165,12 @@ class WorkstationLLM(Node):
         return state
 
     def _ask_ollama(self, messages=None):
+        think_enabled = bool(self.get_parameter('llm_think').value)
         payload = {
             'model': self.model,
             'messages': messages if messages is not None else self.messages,
-            'stream': False,
-            'think': True,
+            'stream': True,
+            'think': think_enabled,
             'format': 'json',
             'keep_alive': '10m',
             'options': {
@@ -180,13 +183,17 @@ class WorkstationLLM(Node):
         started = time.monotonic()
         try:
             with self._llm_lock:
-                response = requests.post(
-                    f'{self.ollama_url}/api/chat',
-                    json=payload,
-                    timeout=(10, self.timeout),
-                )
-                response.raise_for_status()
-                data = response.json()
+                with requests.post(
+                    f'{self.ollama_url}/api/chat', json=payload,
+                    timeout=(10, self.timeout), stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    content, thinking = consume_ollama_stream(
+                        response,
+                        endpoint='chat',
+                        label='Workstation',
+                        show_thinking=think_enabled,
+                    )
         except requests.RequestException as error:
             detail = (
                 error.response.text.strip()
@@ -194,12 +201,9 @@ class WorkstationLLM(Node):
                 else str(error)
             )
             raise RuntimeError(f'Ollama 요청 실패: {detail}') from error
-        except ValueError as error:
+        except (ValueError, RuntimeError) as error:
             raise RuntimeError(f'Ollama 응답 해석 실패: {error}') from error
 
-        message = data.get('message', {})
-        content = str(message.get('content', '')).strip()
-        thinking = str(message.get('thinking', '')).strip()
         if not content:
             raise RuntimeError(
                 'Ollama가 최종 답변을 반환하지 않았습니다. '
@@ -208,6 +212,7 @@ class WorkstationLLM(Node):
         self._log(
             'LLM_RESPONSE',
             latency_sec=round(time.monotonic() - started, 2),
+            thinking=thinking,
             content=content,
         )
         return content
