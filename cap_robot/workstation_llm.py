@@ -167,7 +167,7 @@ class WorkstationLLM(Node):
             'model': self.model,
             'messages': messages if messages is not None else self.messages,
             'stream': False,
-            'think': False,
+            'think': True,
             'format': 'json',
             'keep_alive': '10m',
             'options': {

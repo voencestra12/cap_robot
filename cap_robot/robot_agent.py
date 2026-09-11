@@ -100,6 +100,8 @@ class RobotAgentNode(Node):
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('llm_model', 'qwen3.8:27b')
         self.declare_parameter('ollama_url', 'http://localhost:11434/api/generate')
+        # 매 LLM 요청 직전에 읽으므로 실행 중 ros2 param set으로 변경할 수 있습니다.
+        self.declare_parameter('llm_think', True)
         self.declare_parameter('guidebook_prompt_file', 'agent_guidebook_policy.txt')
         # [MERGED] Workstation이 완성한 협동 계획은 별도 Agent LLM 프롬프트로 검토합니다.
         self.declare_parameter(
@@ -431,6 +433,7 @@ class RobotAgentNode(Node):
         self.init_robot()
         self.get_logger().info(
             f'🧠 LLM 설정: model={self.llm_model}, url={self.ollama_url}, '
+            f'think={bool(self.get_parameter("llm_think").value)}, '
             f'normal_prompt={self.guidebook_prompt_path}, '
             f'cooperative_review_prompt={self.cooperative_review_prompt_path}'
         )
@@ -1734,6 +1737,7 @@ class RobotAgentNode(Node):
             'prompt': prompt,
             'format': 'json',
             'stream': False,
+            'think': bool(self.get_parameter('llm_think').value),
             'options': {'temperature': 0.0, 'num_predict': 512},
         }
         with self.llm_request_lock:
@@ -1897,6 +1901,7 @@ class RobotAgentNode(Node):
             'prompt': prompt,
             'format': 'json',
             'stream': False,
+            'think': bool(self.get_parameter('llm_think').value),
             'options': {'temperature': 0.0, 'num_predict': 2048},
         }
         task_id = str(task.get('task_id', ''))

@@ -35,6 +35,7 @@
 
     llm_model: gemma4:e4b
     ollama_url: http://localhost:11434/api/generate
+    llm_think: true                   # true: 추론 켜기, false: 추론 끄기
     guidebook_prompt_file: agent_guidebook_policy.txt
     cooperative_review_prompt_file: agent_cooperative_review.txt
     guidebook_policy_enabled: true

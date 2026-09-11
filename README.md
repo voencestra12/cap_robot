@@ -97,6 +97,19 @@ Ollama에는 연구실 컴퓨터의 Workstation 모델과 각 노트북의 Agent
 합니다. 기본값은 각각 `gemma4:12b`, `gemma4:e4b`이며 YAML/ROS 파라미터로 변경할 수
 있습니다.
 
+Agent LLM의 thinking은 각 `agent*.yaml`의 `llm_think`로 제어합니다. 실행 중에도 다음
+명령으로 변경할 수 있으며, 변경값은 다음 LLM 요청부터 적용됩니다.
+
+```bash
+# Agent 1 thinking 켜기/끄기
+ros2 param set /agent1/robot_agent_node llm_think true
+ros2 param set /agent1/robot_agent_node llm_think false
+
+# Agent 2 thinking 켜기/끄기
+ros2 param set /agent2/robot_agent_node llm_think true
+ros2 param set /agent2/robot_agent_node llm_think false
+```
+
 ## 실행 전 점검
 
 ```bash
