@@ -116,6 +116,34 @@ ros2 param set /workstation_llm llm_think true
 ros2 param set /workstation_llm llm_think false
 ```
 
+## 빵·양상추 모델 통합
+
+두 Agent는 `models/yolo11m-seg.pt`와 `models/yolo-bread-lettuce.pt`를 함께
+로드합니다. 추가 모델은 segmentation 모델이며 클래스는 `0: bread`, `1: lettuce`입니다.
+인식 결과는 각각 **빵**, **양상추**로 기존 Agent perception에 들어갑니다.
+마스크와 정렬 depth로 구한 위치·yaw를 `workspace_0` 좌표로 변환하고,
+기존 `latest_poses`와 `current_detected_items`를 통해 Agent LLM의 target 및
+relative_object reference 선택에 사용합니다. 각 모델에는 시각화 전 원본 영상을 입력합니다.
+
+모델은 패키지 share 디렉터리 기준 상대 경로로 로드합니다. 새 모델을 배치한 뒤
+각 Agent 실행 환경에서 아래 명령으로 설치 목록과 설정을 갱신하세요.
+
+```bash
+cd ~/capstone_ws
+colcon build --packages-select cap_robot --symlink-install
+source install/setup.bash
+```
+
+시작 로그의 `YOLO model loaded`에서 새 파일명과 두 클래스를 확인하고,
+Agent 카메라 화면에서 `Bread`, `Lettuce`와 좌표 변환 후 표시되는 yaw를 확인합니다.
+재료 인식은 각 Agent의 카메라에서 수행하며, `/perception/yolo_extra`는 기존
+고정 카메라의 바구니 손잡이 인식용입니다.
+
+이번 통합은 인식 입력 연결까지입니다. 현재 물체 상태는 클래스 이름당 좌표 한 개를
+저장하므로 여러 빵 조각을 개별 식별하지 않습니다. 샌드위치 조립에는 이후 개체 구분,
+쌓을 위치·높이, 재료별 파지 설정을 정해야 합니다. 실제 재료의 검출 품질과 파지 자세는
+카메라·로봇 환경에서 별도로 확인해야 합니다.
+
 ## 실행 전 점검
 
 ```bash

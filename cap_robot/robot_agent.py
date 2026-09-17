@@ -115,7 +115,7 @@ class RobotAgentNode(Node):
         self.declare_parameter('guidebook_policy_retry_sec', 5.0)
         self.declare_parameter(
             'yolo_model_paths',
-            ['models/yolo11m-seg.pt', 'models/yolo-bread.pt'],
+            ['models/yolo11m-seg.pt', 'models/yolo-bread-lettuce.pt'],
         )
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_claim_topic', '/mission/task_claim')
@@ -409,7 +409,8 @@ class RobotAgentNode(Node):
                 model = YOLO(str(model_path))
                 self.models.append((model_path.name, model))
                 self.get_logger().info(
-                    f'YOLO model loaded: {model_path} (task={model.task})'
+                    f'YOLO model loaded: {model_path} '
+                    f'(task={model.task}, classes={model.names})'
                 )
             self.bridge = CvBridge()
             image_qos = QoSProfile(
@@ -2891,7 +2892,7 @@ class RobotAgentNode(Node):
     def run_perception(self):
         name_map_ko = {
             'banana': '바나나', 'apple': '사과', 'orange': '오렌지',
-            'mouse': '마우스', 'bread': '빵',
+            'mouse': '마우스', 'bread': '빵', 'lettuce': '양상추',
         }
         try:
             while rclpy.ok():
@@ -2909,6 +2910,8 @@ class RobotAgentNode(Node):
                     continue
 
                 img, depth_img, intrinsics = frames
+                # 앞 모델의 시각화가 다음 모델의 추론 입력에 섞이지 않게 합니다.
+                inference_image = img.copy()
                 current_poses, current_items = {}, []
 
                 for model_filename, model in self.models:
@@ -2917,7 +2920,7 @@ class RobotAgentNode(Node):
                         if str(class_name).lower() in name_map_ko
                     ]
                     results = model.predict(
-                        source=img,
+                        source=inference_image,
                         classes=wanted_class_ids or None,
                         conf=0.3,
                         verbose=False,

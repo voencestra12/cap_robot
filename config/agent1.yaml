@@ -31,7 +31,8 @@
     color_topic: /agent1/camera/color/image_raw
     depth_topic: /agent1/camera/aligned_depth_to_color/image_raw
     camera_info_topic: /agent1/camera/color/camera_info
-    yolo_model_paths: [models/yolo11m-seg.pt, models/yolo-bread.pt]
+    # 기본 물체 + 샌드위치 재료(bread, lettuce) 세그멘테이션 모델
+    yolo_model_paths: [models/yolo11m-seg.pt, models/yolo-bread-lettuce.pt]
 
     llm_model: gemma4:e4b
     ollama_url: http://localhost:11434/api/generate
