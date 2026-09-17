@@ -29,7 +29,7 @@
    - {"api":"control_gripper","position": number}
    - position 범위: 0~850
    - 열기: 700 이상
-   - 파지: 450 이하
+   - 파지: 300 이하
 
 2. move_to_object
    - {"api":"move_to_object","z_offset": number,"speed": number}
