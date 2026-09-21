@@ -1925,7 +1925,11 @@ class RobotAgentNode(Node):
             'prompt': prompt,
             'format': 'json',
             'think': bool(self.get_parameter('llm_think').value),
-            'options': {'temperature': 0.0, 'num_predict': 2048},
+            'options': {
+                'temperature': 0.0,
+                'num_predict': 8192,
+                'num_ctx': 16384,
+            },
         }
         task_id = str(task.get('task_id', ''))
         self.get_logger().info(
