@@ -111,11 +111,12 @@ $default_pnp_actions
    - 사용자가 z를 주지 않았다면 z_mm을 추측하거나 현재 물체 높이에서 복사해 생성하지 않는다.
    - zone이나 상대 위치를 표현하기 위해 임의의 절대 좌표를 만들지 않는다.
    - z_mm이 있을 때만 move_to_place의 z_offset을 더하기 전 workspace 기준 배치 높이로 사용한다.
-6. actions는 반드시 직접 생성한다. 단일 작업은 기본 PnP 배열을, 양팔 협동 작업(바구니 옮기기)은 협동 작업 배열을 따르며, validator 범위 안에서 speed, 높은 접근 z_offset, wait, 상대 이동 offset을 조절할 수 있다.
-7. 존재하지 않는 API를 만들지 않는다.
-8. robot base 좌표, TF 결과, xArm SDK 좌표, safety box 값은 코드가 처리하므로 생성하지 않는다.
-9. 현재 Task 하나만 계획한다. 다른 Guidebook Task를 같이 실행하지 않는다.
-10. 공용 구역(A+B / 바구니 근처) 충돌 방지는 robot_agent가 workspace 좌표로 자동 판정하여 토큰을 확보/반납한다. actions에 토큰 관련 API를 넣지 않는다.
+6. [절대 규칙: 목적지 보존] Task 목표나 설명에 '바구니', '접시' 등 명확한 목적지가 주어졌다면, 해당 작업이 조립(Assembly)인지 단순 이동(Pick & Place)인지 무관하게 무조건 명시된 목적지를 destination으로 설정하라. 조립 작업이라는 핑계로 사용자가 지시한 목적지를 임의의 '기본 조립 위치'로 절대 덮어쓰지 마라.
+7. actions는 반드시 직접 생성한다. 단일 작업은 기본 PnP 배열을, 양팔 협동 작업(바구니 옮기기)은 협동 작업 배열을 따르며, validator 범위 안에서 speed, 높은 접근 z_offset, wait, 상대 이동 offset을 조절할 수 있다.
+8. 존재하지 않는 API를 만들지 않는다.
+9. robot base 좌표, TF 결과, xArm SDK 좌표, safety box 값은 코드가 처리하므로 생성하지 않는다.
+10. 현재 Task 하나만 계획한다. 다른 Guidebook Task를 같이 실행하지 않는다.
+11. 공용 구역(A+B / 바구니 근처) 충돌 방지는 robot_agent가 workspace 좌표로 자동 판정하여 토큰을 확보/반납한다. actions에 토큰 관련 API를 넣지 않는다.
 
 destination 선택 예:
 - A구역 중앙:
