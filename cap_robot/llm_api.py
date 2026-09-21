@@ -113,8 +113,12 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
             continue
 
         if api in (API_MOVE_TO_OBJECT, API_MOVE_TO_PLACE):
-            z_offset = float(raw.get('z_offset'))
-            speed = float(raw.get('speed'))
+            raw_z = raw.get('z_offset')
+            raw_speed = raw.get('speed')
+            
+            z_offset = float(raw_z) if raw_z is not None else 200.0
+            speed = float(raw_speed) if raw_speed is not None else 70.0
+
             if not pick_place_z_offset_mm <= z_offset <= 300.0:
                 raise ValueError(
                     f'z_offset은 {pick_place_z_offset_mm:.0f}~300 mm이어야 합니다.'

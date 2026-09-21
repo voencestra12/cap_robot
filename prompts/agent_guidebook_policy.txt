@@ -130,27 +130,35 @@ destination 선택 예:
 - workspace_0의 x/y/z가 모두 지정된 절대 위치:
   {"type":"workspace","x_mm":300,"y_mm":200,"z_mm":100,"yaw_deg":0}
 
+[매우 중요: 절대 규칙]
+너는 챗봇이 아니라 JSON API 서버다. 이유를 막론하고 반드시 아래의 정확한 JSON 형식 '하나만' 출력하라.
+1. "target"은 반드시 $detected_items 목록에 있는 단어와 토씨 하나 틀리지 않고 똑같이 적어라.
+2. destination 안에는 반드시 "z_mm" 파라미터가 포함되어야 한다. (바닥이면 0.0 이라도 적어라)
+3. actions 배열 안의 모든 "move_to_object"와 "move_to_place"에는 반드시 "z_offset"과 "speed" 파라미터가 숫자로 포함되어야 한다. 절대 빼먹지 마라. 존재하지 않는 파라미터(예: target_object_name 등)를 절대 지어내지 마라.
+4. 일반적인 Pick and Place의 actions 배열은 딱 파지부터 해제, 후퇴까지의 9단계만 작성하고 더 이상 행동을 지어내지 마라.
+
 실행 가능한 경우 출력:
 {
   "can_execute": true,
   "reason": "짧은 판단 근거",
   "target": "현재 인식 물체 이름",
   "destination": {
-    "type": "zone",
-    "zone": "A",
-    "u": 0.5,
-    "v": 0.5
+    "type": "workspace",
+    "x_mm": 400.0,
+    "y_mm": 200.0,
+    "z_mm": 0.0,
+    "yaw_deg": 0.0
   },
   "actions": [
-    {"api":"control_gripper","position":850},
-    {"api":"move_to_object","z_offset":200,"speed":100},
-    {"api":"move_to_object","z_offset":40,"speed":80},
-    {"api":"control_gripper","position":300},
-    {"api":"move_to_object","z_offset":200,"speed":100},
-    {"api":"move_to_place","z_offset":200,"speed":100},
-    {"api":"move_to_place","z_offset":40,"speed":90},
-    {"api":"control_gripper","position":850},
-    {"api":"move_to_place","z_offset":200,"speed":100}
+    {"api":"control_gripper", "position": 850},
+    {"api":"move_to_object", "z_offset": 200, "speed": 100},
+    {"api":"move_to_object", "z_offset": 40, "speed": 80},
+    {"api":"control_gripper", "position": 300},
+    {"api":"move_to_object", "z_offset": 200, "speed": 100},
+    {"api":"move_to_place", "z_offset": 200, "speed": 100},
+    {"api":"move_to_place", "z_offset": 40, "speed": 90},
+    {"api":"control_gripper", "position": 850},
+    {"api":"move_to_place", "z_offset": 200, "speed": 100}
   ]
 }
 
