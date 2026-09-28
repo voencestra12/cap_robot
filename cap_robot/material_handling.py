@@ -33,6 +33,7 @@ def material_profile(material, agent_id=None, for_assembly=False):
     if set(overrides) - {
         'grip_position', 'place_tcp_offset_mm', 'place_roll_offset_deg',
         'place_pitch_offset_deg', 'place_tilt_speed',
+        'pick_rpy_robot_deg', 'place_rpy_robot_deg',
     }:
         raise ValueError('Agent별 설정은 파지/TCP 보정/배치 기울임 항목만 지원합니다.')
     profile.update(overrides)
@@ -44,6 +45,17 @@ def material_profile(material, agent_id=None, for_assembly=False):
     profile['place_tilt_speed'] = number(
         profile.get('place_tilt_speed', 20.0), f'{material}.place_tilt_speed', 1, 150
     )
+    # Base 절대 자세는 파지/배치 쌍으로 검증하여 SDK 호출 전에 설정 오류를 거부한다.
+    taught_keys = ('pick_rpy_robot_deg', 'place_rpy_robot_deg')
+    if any(key in profile for key in taught_keys):
+        for key in taught_keys:
+            value = profile.get(key)
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                raise ValueError(f'{material}.{key}: Base 기준 [Roll, Pitch, Yaw]가 필요합니다.')
+            profile[key] = [
+                number(angle, f'{material}.{key}[{axis}]')
+                for axis, angle in zip(('roll', 'pitch', 'yaw'), value)
+            ]
     if for_assembly:
         profile['thickness_mm'] = thickness(material)
         profile['place_tcp_offset_mm'] = number(
@@ -186,6 +198,8 @@ def placement_tilt(target, agent_id=None):
     if target not in settings.OBJECT_PROFILES:
         return None
     profile = material_profile(target, agent_id)
+    if 'place_rpy_robot_deg' in profile:
+        return profile
     if not (profile['place_roll_offset_deg'] or profile['place_pitch_offset_deg']):
         return None
     return profile

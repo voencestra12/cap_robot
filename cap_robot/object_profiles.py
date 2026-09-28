@@ -13,7 +13,7 @@ OBJECT_PROFILES = {
         "thickness_mm": 20.0,
         # 기울인 배치 자세에서 실측할 TCP 높이 보정값.
         "place_tcp_offset_mm": 0.0,
-        "place_roll_offset_deg": 30.0,
+        "place_roll_offset_deg": 0.0,
         "place_pitch_offset_deg": 0.0,
         "place_tilt_speed": 75.0,
     },
@@ -38,10 +38,16 @@ BASKET_FLOOR_Z_MM = 0.0
 # 조립 X/Y는 /perception/yolo_extra의 두 basket_handle 좌표 평균을 사용합니다.
 BASKET_YAW_DEG = 0.0
 
-# 기울임은 workspace의 Rz(yaw) Ry(pitch) Rx(roll) 자세입니다.
-# 기본 수직 자세 roll=180°, pitch=0°에 위 offset을 더합니다.
-# 빵은 roll=+30°를 시험값으로 사용. 방향을 뒤집으려면 -30°, 다른 축은 pitch offset 사용.
-# 30°만으로 충돌 회피가 보장되지는 않습니다. TCP 보정은 이 자세에서 실측합니다.
-# 장착 차이는 grip_position/place_tcp_offset_mm 및 place_* 기울임 항목을 Agent별로 덮어씁니다.
-# 예: {"agent2": {"빵": {"grip_position": 실험값}}}
-AGENT_PROFILE_OVERRIDES = {}
+# offset 방식은 workspace의 기본 roll=180°, pitch=0°에 더하는 시험 설정입니다.
+# 빵의 공통 offset은 0으로 해제합니다. 실측 Base 자세는 해당 Agent에만 적용합니다.
+# *_rpy_robot_deg는 UFactory Base 기준 [Roll, Pitch, Yaw] 절대각(degree)입니다.
+# 두 자세를 함께 지정하면 offset 방식보다 우선하며 workspace 자세 TF를 적용하지 않습니다.
+# TCP 위치는 인식/적층 계산을 사용합니다. 사진의 XYZ와 J1~J6는 재사용하지 않습니다.
+AGENT_PROFILE_OVERRIDES = {
+    "agent2": {  # UFactory 사진의 robot IP: 192.168.1.198
+        "빵": {
+            "pick_rpy_robot_deg": [179.4, 0.0, -0.1],
+            "place_rpy_robot_deg": [141.5, -0.1, -0.1],
+        },
+    },
+}

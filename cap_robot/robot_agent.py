@@ -1123,11 +1123,6 @@ class RobotAgentNode(Node):
                 f'age={age_sec:.2f}s > limit={self.tf_cache_max_age_sec:.2f}s'
             )
 
-        self.get_logger().warn(
-            f'⚠️ 최신 TF 조회 실패 → cached TF 사용: '
-            f'{cache_agent_id} {target_frame} <- {self.workspace_frame}, '
-            f'cache_age={age_sec:.2f}s, tf_stamp={self.transform_stamp_to_sec(cached):.3f}'
-        )
         return cached
 
     def lookup_workspace_transform(self, agent_id=None):
@@ -1187,11 +1182,9 @@ class RobotAgentNode(Node):
                     self.get_logger().info(
                         f'🧭 TF OK: {agent_id} {base_frame} <- {self.workspace_frame}'
                     )
-            except Exception as error:
-                self.warn_tf_throttled(
-                    f'tf_cache_{agent_id}',
-                    f'⏳ TF cache 대기/실패: {agent_id} {base_frame} <- {self.workspace_frame} / {error}'
-                )
+            except Exception:
+                # 주기적 갱신 실패는 출력하지 않는다. 사용 시 TF가 없거나
+                # 캐시가 만료되면 lookup_workspace_transform에서 오류를 보고한다.
                 continue
 
     def workspace_point_to_robot(self, x_mm, y_mm, z_mm=0.0, agent_id=None):
@@ -1393,6 +1386,7 @@ class RobotAgentNode(Node):
             f'🧭 TF→SDK{f"[{label}]" if label else ""}: '
             f'tf=({float(x):.1f}, {float(y):.1f}, {float(z):.1f}, yaw={np.degrees(float(yaw)):.1f}deg) '
             f'-> sdk=({cmd["x"]:.1f}, {cmd["y"]:.1f}, {cmd["z"]:.1f}, '
+            f'roll={float(roll_deg):.1f}, pitch={float(pitch_deg):.1f}, '
             f'yaw={np.degrees(cmd["yaw"]):.1f}deg), mode={cmd["mode"]}'
         )
         return self.move_to_sdk(
@@ -2720,13 +2714,20 @@ class RobotAgentNode(Node):
                 yaw=target_pose['yaw'], speed=action['speed'], label=label,
             )
 
-        # 두 로봇 모두 workspace에 대해 같은 방향으로 기울인다.
-        yaw_workspace = task['reference_place_pose'].get('yaw', 0.0)
-        nominal = self.workspace_rpy_to_robot(math.pi, 0.0, yaw_workspace)
-        tilted = self.workspace_rpy_to_robot(
-            math.radians(180.0 + tilt['place_roll_offset_deg']),
-            math.radians(tilt['place_pitch_offset_deg']), yaw_workspace,
-        )
+        if 'place_rpy_robot_deg' in tilt:
+            # 이미 robot Base 기준인 UFactory 절대 자세. workspace TF를 다시 곱하지 않는다.
+            nominal = dict(zip(('roll', 'pitch', 'yaw'),
+                               map(math.radians, tilt['pick_rpy_robot_deg'])))
+            tilted = dict(zip(('roll', 'pitch', 'yaw'),
+                              map(math.radians, tilt['place_rpy_robot_deg'])))
+        else:
+            # 기존 workspace offset 방식은 실측 Base 자세가 없는 설정에만 적용한다.
+            yaw_workspace = task['reference_place_pose'].get('yaw', 0.0)
+            nominal = self.workspace_rpy_to_robot(math.pi, 0.0, yaw_workspace)
+            tilted = self.workspace_rpy_to_robot(
+                math.radians(180.0 + tilt['place_roll_offset_deg']),
+                math.radians(tilt['place_pitch_offset_deg']), yaw_workspace,
+            )
         speed = min(action['speed'], tilt['place_tilt_speed'])
 
         def move(attitude, suffix):
@@ -2766,6 +2767,9 @@ class RobotAgentNode(Node):
             return False
         basket_center = task.get('basket_center_workspace')
         placement_state = {'started': False, 'released': False}
+        placement_profile = placement_tilt(task['target'], self.agent_id)
+        pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
+                    if placement_profile is not None else None)
         obj = task['object_pose']
         place = task['place_pose']
         # 기존 zone Task에는 place.z가 없으므로 obj.z를 그대로 사용합니다.
@@ -2829,10 +2833,15 @@ class RobotAgentNode(Node):
                     if success and action.get('mode') == 'release':
                         placement_state['released'] = True
                 elif api == 'move_to_object':
+                    attitude = (
+                        dict(roll_deg=pick_rpy[0], pitch_deg=pick_rpy[1],
+                             yaw=math.radians(pick_rpy[2]))
+                        if pick_rpy is not None else dict(yaw=obj['yaw'])
+                    )
                     success = self.move_to_robot_tf(
                         obj['x'], obj['y'], obj['z'] + action['z_offset'],
-                        yaw=obj['yaw'], speed=action['speed'],
-                        label=f"{task['task_id']} object"
+                        speed=action['speed'], label=f"{task['task_id']} object",
+                        **attitude,
                     )
                 elif api == 'move_to_place':
                     success = self.execute_place_action(task, action, placement_state)
