@@ -268,16 +268,18 @@ center_z = (red0.z_mm + red1.z_mm) / 2
 빵에는 다음 시험 설정을 적용했습니다.
 
 ```python
-"place_roll_offset_deg": 0.0,
-"place_pitch_offset_deg": 30.0,
-"place_tilt_speed": 20.0,
+"place_roll_offset_deg": 30.0,
+"place_pitch_offset_deg": 0.0,
+"place_tilt_speed": 75.0,
 ```
 
 workspace 기준 수직 자세 `roll=180°, pitch=0°`에 offset을 더합니다.
 회전은 `Rz(yaw) @ Ry(pitch) @ Rx(roll)` 규약이며, 전체 자세를 각 robot base로
 TF 변환한 뒤 SDK에 degree로 전달합니다. 따라서 두 Agent의 base 방향이 달라도
-같은 workspace 방향으로 기울입니다. 반대 방향은 pitch offset을 -30°로,
-다른 축은 pitch offset을 0°로 두고 roll offset을 조절하면 됩니다.
+같은 workspace 방향으로 기울입니다. 반대 방향은 roll offset을 -30°로,
+다른 축은 roll offset을 0°로 두고 pitch offset을 조절하면 됩니다.
+기울임이 적용되는 배치 구간의 속도는 action 속도와 `place_tilt_speed` 중 작은 값입니다.
+기본 배치 action 속도는 90~100이므로 현재 설정에서는 75로 실행됩니다.
 
 실행 순서:
 
