@@ -98,18 +98,35 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
         api = str(raw.get('api', '')).strip()
 
         if api == API_CONTROL_GRIPPER:
-            position = float(raw.get('position'))
-            if not 0.0 <= position <= 850.0:
-                raise ValueError('그리퍼 위치는 0~850이어야 합니다.')
-            if phase == 'START' and position >= 700:
-                phase = 'OPEN'
-            elif phase == 'AT_PICK' and position <= 450:
-                phase = 'GRASPED'
-            elif phase == 'AT_PLACE' and position >= 700:
-                phase = 'RELEASED'
-            else:
+            mode = raw.get('mode')
+            position = None
+            if 'position' in raw:
+                position = float(raw['position'])
+                if not 0.0 <= position <= 850.0:
+                    raise ValueError('그리퍼 위치는 0~850이어야 합니다.')
+            expected = {
+                'START': ('open', 'OPEN'),
+                'AT_PICK': ('grasp', 'GRASPED'),
+                'AT_PLACE': ('release', 'RELEASED'),
+            }.get(phase)
+            if expected is None:
                 raise ValueError(f'actions[{index}] 그리퍼 순서가 올바르지 않습니다.')
-            actions.append({'api': api, 'position': position})
+            if mode is None:
+                # 기존 숫자형 명령도 상태에 맞는 mode를 부여한다.
+                if position is None or (
+                    expected[0] == 'grasp' and position > 450
+                ) or (expected[0] != 'grasp' and position < 700):
+                    raise ValueError(f'actions[{index}] 그리퍼 위치/순서가 올바르지 않습니다.')
+                mode = expected[0]
+            if mode != expected[0]:
+                raise ValueError(f'actions[{index}] 그리퍼 mode/순서가 올바르지 않습니다.')
+            if mode != 'grasp' and position is not None and position < 700:
+                raise ValueError('열기/해제 position은 700 이상이어야 합니다.')
+            phase = expected[1]
+            action = {'api': api, 'mode': mode}
+            if position is not None:
+                action['position'] = position
+            actions.append(action)
             continue
 
         if api in (API_MOVE_TO_OBJECT, API_MOVE_TO_PLACE):

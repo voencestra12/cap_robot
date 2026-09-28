@@ -19,6 +19,7 @@ from std_msgs.msg import String
 
 from cap_robot.llm_api import get_capability_catalog, validate_cooperative_actions
 from cap_robot.ollama_stream import consume_ollama_stream
+from cap_robot.material_handling import validate_assembly_tasks
 
 class WorkstationLLM(Node):
     """중앙 LLM 계획, Agent 검토 수집, 최대 1회 재계획을 담당합니다."""
@@ -329,6 +330,7 @@ class WorkstationLLM(Node):
         if not isinstance(tasks, list) or not tasks:
             raise RuntimeError('tasks는 비어 있지 않은 배열이어야 합니다.')
         self._validate_dependencies(tasks)
+        validate_assembly_tasks(tasks)
         world_state = self._world_snapshot()
         cooperative_count = 0
         for index, task in enumerate(tasks):

@@ -25,6 +25,11 @@ try:
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from .llm_api import validate_cooperative_actions
     from .llm_api import validate_actions as validate_llm_actions
+    from .material_handling import (
+        assembly_move_pose, assembly_placement, bind_gripper_actions,
+        validate_assembly_tasks, basket_center_from_perception, placement_tilt,
+    )
+    from .utils import rpy_to_matrix, matrix_to_rpy
     from .ollama_stream import consume_ollama_stream
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
@@ -32,6 +37,11 @@ except ImportError:
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from llm_api import validate_cooperative_actions
     from llm_api import validate_actions as validate_llm_actions
+    from material_handling import (
+        assembly_move_pose, assembly_placement, bind_gripper_actions,
+        validate_assembly_tasks, basket_center_from_perception, placement_tilt,
+    )
+    from utils import rpy_to_matrix, matrix_to_rpy
     from ollama_stream import consume_ollama_stream
     from shared_zone import classify_shared_zone_entry, expand_aabb
 
@@ -499,6 +509,7 @@ class RobotAgentNode(Node):
                 ).strip()
                 task_map[task_id] = normalized_task
 
+            validate_assembly_tasks(list(task_map.values()))
             known_task_ids = set(task_map)
             for task_id, task in task_map.items():
                 unknown_dependencies = [
@@ -593,9 +604,11 @@ class RobotAgentNode(Node):
                 continue
             dependencies = task.get('depends_on', [])
             
-            # [수정] SUCCEEDED 뿐만 아니라 EXECUTING 상태여도 선행 조건 통과로 인정
+            # 적층은 아래층 배치/후퇴까지 성공한 뒤 시작한다.
+            # 기존 비적층 작업의 동시 실행 정책은 유지한다.
+            allowed = ('SUCCEEDED',) if 'assembly' in task else ('SUCCEEDED', 'EXECUTING')
             ready = all(
-                self.guidebook_task_status.get(dep) in ('SUCCEEDED', 'EXECUTING')
+                self.guidebook_task_status.get(dep) in allowed
                 for dep in dependencies
             )
             self.guidebook_task_status[task_id] = 'READY' if ready else 'BLOCKED'
@@ -706,17 +719,20 @@ class RobotAgentNode(Node):
             f'➡️ [{self.agent_id}] /agent_task 발행: {task_id} / target={dispatch["target"]}'
         )
 
-    def publish_task_status(self, task_id, status):
-        """Guidebook Task 상태를 로컬에 먼저 반영하고 다른 Agent에도 공유합니다."""
+    def publish_task_status(self, task_id, status, mission_id=None, plan_revision=None):
+        """실행을 시작한 미션/revision의 상태만 공유합니다."""
         with self.guidebook_lock:
-            mission_id = self.current_mission_id
+            if mission_id is None:
+                mission_id = self.current_mission_id
+            if plan_revision is None:
+                plan_revision = self.current_plan_revision
         if not mission_id:
             return
 
         payload = {
             'scope': 'task',
             'mission_id': mission_id,
-            'plan_revision': self.current_plan_revision,
+            'plan_revision': plan_revision,
             'task_id': task_id,
             'agent_id': self.agent_id,
             'status': status,
@@ -942,6 +958,11 @@ class RobotAgentNode(Node):
             if mission_id != self.current_mission_id:
                 return
             if task_id not in self.guidebook_tasks:
+                return
+            revision = payload.get('plan_revision')
+            if revision is None and 'assembly' in self.guidebook_tasks[task_id]:
+                return
+            if revision is not None and int(revision) != self.current_plan_revision:
                 return
 
             current = self.guidebook_task_status.get(task_id)
@@ -1208,6 +1229,15 @@ class RobotAgentNode(Node):
         direction_robot = rotation_robot_workspace @ direction_workspace
         return float(math.atan2(direction_robot[1], direction_robot[0]))
 
+    def workspace_rpy_to_robot(self, roll, pitch, yaw, agent_id=None):
+        """workspace 기준 TCP 자세 전체를 robot base로 변환. 입력/출력 radians."""
+        rotation = self.lookup_workspace_transform(agent_id).transform.rotation
+        robot_from_workspace = self.quaternion_to_rotation_matrix(
+            rotation.x, rotation.y, rotation.z, rotation.w
+        )
+        result = matrix_to_rpy(robot_from_workspace @ rpy_to_matrix(roll, pitch, yaw))
+        return dict(zip(('roll', 'pitch', 'yaw'), result))
+
     def workspace_place_to_robot_place(self, place_pose, agent_id=None):
         """배치 좌표를 workspace 기준에서 agent별 xArm base 기준으로 변환합니다.
 
@@ -1303,22 +1333,28 @@ class RobotAgentNode(Node):
                 f'z=[{self.sdk_z_min:.1f},{self.sdk_z_max:.1f}]'
             )
 
-    def move_to_sdk(self, x, y, z, yaw=0.0, speed=100.0, label=''):
+    def move_to_sdk(self, x, y, z, yaw=0.0, speed=100.0, label='',
+                    roll_deg=180.0, pitch_deg=0.0):
         """이미 xArm SDK command 좌표인 pose를 set_position으로 보낸다."""
         x, y, z = float(x), float(y), float(z)
         yaw = self.normalize_angle_rad(yaw)
+        roll_deg, pitch_deg = float(roll_deg), float(pitch_deg)
+        if not all(math.isfinite(value) for value in (roll_deg, pitch_deg, yaw)):
+            raise ValueError('TCP 자세에는 유한한 숫자가 필요합니다.')
         self.check_sdk_pose_or_raise(x, y, z, label=label)
 
         if self.dry_run:
             self.get_logger().warn(
                 f'🧪 DRY_RUN move_to_sdk{f"[{label}]" if label else ""}: '
-                f'x={x:.1f}, y={y:.1f}, z={z:.1f}, yaw={np.degrees(yaw):.1f}deg, speed={float(speed):.1f}'
+                f'x={x:.1f}, y={y:.1f}, z={z:.1f}, '
+                f'roll={roll_deg:.1f}, pitch={pitch_deg:.1f}, '
+                f'yaw={np.degrees(yaw):.1f}deg, speed={float(speed):.1f}'
             )
             return True
 
         ret = self.arm.set_position(
-            x=x, y=y, z=z, roll=180.0, pitch=0.0,
-            yaw=float(np.degrees(yaw)), speed=float(speed), wait=True
+            x=x, y=y, z=z, roll=roll_deg, pitch=pitch_deg,
+            yaw=float(np.degrees(yaw)), speed=float(speed), wait=True, is_radian=False
         )
         if ret == 0:
             time.sleep(0.5)
@@ -1344,7 +1380,8 @@ class RobotAgentNode(Node):
         )
         return False
 
-    def move_to_robot_tf(self, x, y, z, yaw=0.0, speed=100.0, label=''):
+    def move_to_robot_tf(self, x, y, z, yaw=0.0, speed=100.0, label='',
+                         roll_deg=180.0, pitch_deg=0.0):
         """robot_N_base TF 좌표를 xArm SDK command 좌표로 변환한 뒤 이동한다."""
         
         # [수정된 부분] agent2일 경우에만 Z축을 40mm(4cm) 더 내리도록 보정합니다.
@@ -1358,7 +1395,10 @@ class RobotAgentNode(Node):
             f'-> sdk=({cmd["x"]:.1f}, {cmd["y"]:.1f}, {cmd["z"]:.1f}, '
             f'yaw={np.degrees(cmd["yaw"]):.1f}deg), mode={cmd["mode"]}'
         )
-        return self.move_to_sdk(cmd['x'], cmd['y'], cmd['z'], yaw=cmd['yaw'], speed=speed, label=label)
+        return self.move_to_sdk(
+            cmd['x'], cmd['y'], cmd['z'], yaw=cmd['yaw'], speed=speed, label=label,
+            roll_deg=roll_deg, pitch_deg=pitch_deg,
+        )
     
     def return_to_home_joint_pose(self):
         """첨부 이미지의 기본 joint 자세로 복귀합니다."""
@@ -1590,9 +1630,65 @@ class RobotAgentNode(Node):
             )
         return requested
 
-    def validate_actions(self, raw_actions):
-        """llm_api.py에 정의된 정책 검증 함수를 사용합니다."""
-        return validate_llm_actions(raw_actions, self.PICK_PLACE_Z_OFFSET_MM)
+    def validate_actions(self, raw_actions, target=None):
+        """동작 순서 검증 후 등록된 재료의 파지값을 적용합니다."""
+        actions = validate_llm_actions(raw_actions, self.PICK_PLACE_Z_OFFSET_MM)
+        if target is not None:
+            actions = bind_gripper_actions(actions, target, self.agent_id)
+        return actions
+
+    def get_basket_center_workspace(self):
+        return basket_center_from_perception(
+            self.get_extra_perception_snapshot(), self.workspace_frame,
+            self.extra_perception_max_age_sec, self.now_sec(),
+        )
+
+    def resolve_task_assembly(self, task, basket_center=None):
+        """전달받은 적층 메타데이터를 현재 계획과 대조하고 위치를 계산합니다."""
+        task_id = task.get('guidebook_task_id')
+        with self.guidebook_lock:
+            plan_task = self.guidebook_tasks.get(task_id)
+            if task_id:
+                if task.get('mission_id') != self.current_mission_id:
+                    raise ValueError('이전 미션의 실행 Task입니다.')
+                if task.get('plan_revision') != self.current_plan_revision:
+                    raise ValueError('이전 revision의 실행 Task입니다.')
+                if plan_task is None:
+                    raise ValueError('현재 Guidebook에 없는 Task입니다.')
+            expected = plan_task.get('assembly') if plan_task else None
+            if task.get('assembly') != expected:
+                raise ValueError('실행 Task의 assembly가 Guidebook과 다릅니다.')
+            if expected is None:
+                return None
+            if task['target'] != expected['material']:
+                raise ValueError('파지 대상과 적층 재료가 다릅니다.')
+            if self.guidebook_task_status.get(task_id) in ('SUCCEEDED', 'FAILED'):
+                raise ValueError('이미 종료된 적층 Task입니다.')
+            if not all(
+                self.guidebook_task_status.get(dep) == 'SUCCEEDED'
+                for dep in plan_task.get('depends_on', [])
+            ):
+                raise ValueError('앞 층의 배치가 아직 성공하지 않았습니다.')
+            tasks = list(self.guidebook_tasks.values())
+        if basket_center is None:
+            basket_center = self.get_basket_center_workspace()
+        return assembly_placement(
+            plan_task, tasks, self.agent_id, basket_center=basket_center,
+        )
+
+    def refresh_execution_assembly(self, task):
+        placement = self.resolve_task_assembly(task)
+        if placement is None:
+            return
+        task.update(placement)
+        pose = placement['reference_place_pose']
+        task['destination_type'] = 'workspace'
+        task['destination'] = '바구니 적층'
+        task['destination_spec'] = {
+            'type': 'workspace', 'x_mm': pose['x'], 'y_mm': pose['y'],
+            'z_mm': pose['z'], 'yaw_deg': math.degrees(pose['yaw']),
+        }
+        task['place_pose'] = self.convert_place_pose(pose, self.agent_id)
 
     @staticmethod
     def resolve_prompt_path(prompt_file):
@@ -1976,6 +2072,21 @@ class RobotAgentNode(Node):
             )
 
         destination = result.get('destination')
+        if 'assembly' in task:
+            if target != task['assembly']['material']:
+                raise ValueError('LLM target과 assembly.material이 다릅니다.')
+            with self.guidebook_lock:
+                plan_tasks = list(self.guidebook_tasks.values())
+            placement = assembly_placement(
+                task, plan_tasks, self.agent_id,
+                basket_center=self.get_basket_center_workspace(),
+            )
+            pose = placement['reference_place_pose']
+            # 조립점은 두 빨간 점의 평균, 높이는 실측 설정으로 계산한다.
+            destination = {
+                'type': 'workspace', 'x_mm': pose['x'], 'y_mm': pose['y'],
+                'z_mm': pose['z'], 'yaw_deg': math.degrees(pose['yaw']),
+            }
         if not isinstance(destination, dict):
             raise ValueError('destination은 JSON 객체여야 합니다.')
 
@@ -2042,7 +2153,7 @@ class RobotAgentNode(Node):
                     'workspace x_mm/y_mm 및 선택적 z_mm/yaw_deg에는 숫자가 필요합니다.'
                 ) from error
 
-        actions = self.validate_actions(result.get('actions'))
+        actions = self.validate_actions(result.get('actions'), target)
 
         policy = {
             'generated_policy': [
@@ -2054,6 +2165,8 @@ class RobotAgentNode(Node):
                 }
             ]
         }
+        if 'assembly' in task:
+            policy['generated_policy'][0]['assembly'] = dict(task['assembly'])
         return policy, ''
 
     def poll_ready_guidebook_tasks(self):
@@ -2137,6 +2250,7 @@ class RobotAgentNode(Node):
                 guidebook = dict(self.current_guidebook)
                 task = dict(self.guidebook_tasks[task_id])
                 mission_id = self.current_mission_id
+                plan_revision = self.current_plan_revision
 
             with self.perception_lock:
                 poses_dict = dict(self.latest_poses)
@@ -2170,6 +2284,15 @@ class RobotAgentNode(Node):
 
             # 핵심: 새 Guidebook 정책을 기존 build_tasks()에 맞춰 변환합니다.
             # TF / zone 계산 / actions 검증 / 기존 task 구조를 그대로 재사용합니다.
+            with self.guidebook_lock:
+                if (mission_id != self.current_mission_id
+                        or plan_revision != self.current_plan_revision):
+                    return
+            normal_policy['generated_policy'][0].update({
+                'mission_id': mission_id,
+                'plan_revision': plan_revision,
+                'guidebook_task_id': task_id,
+            })
             built = self.build_tasks(normal_policy, poses_dict)
             if len(built) != 1:
                 raise ValueError(
@@ -2183,7 +2306,8 @@ class RobotAgentNode(Node):
 
             # LLM 응답을 기다리는 동안 다른 Agent가 먼저 Task를 가져갔을 수 있습니다.
             with self.guidebook_lock:
-                if mission_id != self.current_mission_id:
+                if (mission_id != self.current_mission_id
+                        or plan_revision != self.current_plan_revision):
                     return
                 if self.guidebook_task_status.get(task_id) != 'READY':
                     self.get_logger().info(
@@ -2247,6 +2371,14 @@ class RobotAgentNode(Node):
                     f'정책 작업 #{order}: destination_spec JSON 객체가 필요합니다.'
                 )
 
+            placement = self.resolve_task_assembly(dict(raw, target=target))
+            if placement is not None:
+                pose = placement['reference_place_pose']
+                destination_spec = {
+                    'type': 'workspace', 'x_mm': pose['x'], 'y_mm': pose['y'],
+                    'z_mm': pose['z'], 'yaw_deg': math.degrees(pose['yaw']),
+                }
+
             resolved = self.resolve_target_destination(
                 destination_spec,
                 poses_dict,
@@ -2255,7 +2387,7 @@ class RobotAgentNode(Node):
             )
 
             raw_actions = raw.get('actions', self.DEFAULT_PNP_ACTIONS)
-            actions = self.validate_actions(raw_actions)
+            actions = self.validate_actions(raw_actions, target)
             rx, ry, rz, yaw = poses_dict[target]
 
             ref_object = {
@@ -2291,6 +2423,12 @@ class RobotAgentNode(Node):
                 'place_pose': robot_place,
                 'actions': actions,
             }
+            for key in ('mission_id', 'plan_revision', 'guidebook_task_id'):
+                if key in raw:
+                    task_data[key] = raw[key]
+            if placement is not None:
+                task_data.update(placement)
+                task_data['destination'] = '바구니 적층'
             if resolved['type'] == 'zone':
                 task_data['place_u'] = float(resolved['place_u'])
                 task_data['place_v'] = float(resolved['place_v'])
@@ -2355,6 +2493,7 @@ class RobotAgentNode(Node):
         if str(task['assignee_id']) != self.agent_id:
             return False
 
+        self.refresh_execution_assembly(task)
         destination_type = str(task.get('destination_type', 'zone')).strip().lower()
         if destination_type == 'zone':
             zone = self.normalize_zone(task['destination'])
@@ -2369,7 +2508,7 @@ class RobotAgentNode(Node):
             float(task['place_pose'][key])
         if 'z' in task['place_pose']:
             float(task['place_pose']['z'])
-        task['actions'] = self.validate_actions(task['actions'])
+        task['actions'] = self.validate_actions(task['actions'], task['target'])
         return True
 
     def task_callback(self, msg):
@@ -2402,7 +2541,10 @@ class RobotAgentNode(Node):
             cooperative = task.get('execution_mode') == 'cooperative'
             coordinator = str(task.get('coordinator_id', '')) == self.agent_id
             if guidebook_task_id and (not cooperative or coordinator):
-                self.publish_task_status(guidebook_task_id, 'EXECUTING')
+                self.publish_task_status(
+                    guidebook_task_id, 'EXECUTING', task.get('mission_id'),
+                    task.get('plan_revision'),
+                )
 
             success = (
                 self.execute_cooperative_task(task)
@@ -2413,7 +2555,8 @@ class RobotAgentNode(Node):
             if guidebook_task_id and (not cooperative or coordinator or not success):
                 self.publish_task_status(
                     guidebook_task_id,
-                    'SUCCEEDED' if success else 'FAILED'
+                    'SUCCEEDED' if success else 'FAILED',
+                    task.get('mission_id'), task.get('plan_revision'),
                 )
 
             if not success:
@@ -2556,7 +2699,73 @@ class RobotAgentNode(Node):
         if self._zone_token_held:
             self._publish_zone_request('acquire', request_id='hb')
 
+    def execute_place_action(self, task, action, state):
+        """높은 위치에서 기울임 → 하강/해제 → 기울임 유지 후퇴 → 높은 위치에서 복원."""
+        place = task['place_pose']
+        if 'assembly' in task:
+            workspace_pose = assembly_move_pose(
+                task['reference_place_pose'], action['z_offset'],
+                self.PICK_PLACE_Z_OFFSET_MM,
+            )
+            target_pose = self.convert_place_pose(workspace_pose, self.agent_id)
+        else:
+            target_pose = dict(
+                place, z=float(place.get('z', task['object_pose']['z'])) + action['z_offset']
+            )
+        label = f"{task['task_id']} place"
+        tilt = placement_tilt(task['target'], self.agent_id)
+        if tilt is None:
+            return self.move_to_robot_tf(
+                target_pose['x'], target_pose['y'], target_pose['z'],
+                yaw=target_pose['yaw'], speed=action['speed'], label=label,
+            )
+
+        # 두 로봇 모두 workspace에 대해 같은 방향으로 기울인다.
+        yaw_workspace = task['reference_place_pose'].get('yaw', 0.0)
+        nominal = self.workspace_rpy_to_robot(math.pi, 0.0, yaw_workspace)
+        tilted = self.workspace_rpy_to_robot(
+            math.radians(180.0 + tilt['place_roll_offset_deg']),
+            math.radians(tilt['place_pitch_offset_deg']), yaw_workspace,
+        )
+        speed = min(action['speed'], tilt['place_tilt_speed'])
+
+        def move(attitude, suffix):
+            return self.move_to_robot_tf(
+                target_pose['x'], target_pose['y'], target_pose['z'],
+                yaw=attitude['yaw'], roll_deg=math.degrees(attitude['roll']),
+                pitch_deg=math.degrees(attitude['pitch']), speed=speed,
+                label=f'{label} {suffix}',
+            )
+
+        if not state['started']:
+            if action['z_offset'] < 150:
+                raise ValueError('기울임은 높은 배치 접근 위치에서 시작해야 합니다.')
+            if not move(nominal, 'approach'):
+                return False
+            if not move(tilted, 'tilt'):
+                return False
+            state['started'] = True
+            return True
+
+        if state['released'] and action['z_offset'] < 150:
+            raise ValueError('해제 후 자세 복원은 높은 후퇴 위치에서만 가능합니다.')
+        if not move(tilted, 'retreat' if state['released'] else 'lower'):
+            return False
+        if state['released']:
+            return move(nominal, 'restore')
+        return True
+
     def execute_task(self, task):
+        # 큐에서 기다리는 동안 미션/설정/선행 상태가 달라졌을 수 있다.
+        # 미설정 재료는 clean_error/set_state를 포함한 SDK 호출 전에 거부한다.
+        try:
+            if not self.validate_received_task(task):
+                return False
+        except Exception as error:
+            self.get_logger().error(f'작업 실행 전 검증 실패: {error}')
+            return False
+        basket_center = task.get('basket_center_workspace')
+        placement_state = {'started': False, 'released': False}
         obj = task['object_pose']
         place = task['place_pose']
         # 기존 zone Task에는 place.z가 없으므로 obj.z를 그대로 사용합니다.
@@ -2609,10 +2818,16 @@ class RobotAgentNode(Node):
                     )
                     return False
 
+                if 'assembly' in task:
+                    # 실행 시작 때 갱신한 중심을 유지한다. 팔의 가림/노이즈를 따라 움직이지 않는다.
+                    self.resolve_task_assembly(task, basket_center=basket_center)
+
                 self.get_logger().info(f"💻 [{task['task_id']}] Action {index}: {action}")
 
                 if api == 'control_gripper':
                     success = self.control_gripper(action['position'])
+                    if success and action.get('mode') == 'release':
+                        placement_state['released'] = True
                 elif api == 'move_to_object':
                     success = self.move_to_robot_tf(
                         obj['x'], obj['y'], obj['z'] + action['z_offset'],
@@ -2620,11 +2835,7 @@ class RobotAgentNode(Node):
                         label=f"{task['task_id']} object"
                     )
                 elif api == 'move_to_place':
-                    success = self.move_to_robot_tf(
-                        place['x'], place['y'], place_base_z + action['z_offset'],
-                        yaw=place['yaw'], speed=action['speed'],
-                        label=f"{task['task_id']} place"
-                    )
+                    success = self.execute_place_action(task, action, placement_state)
                 elif api == 'wait':
                     time.sleep(action['seconds'])
                     success = True

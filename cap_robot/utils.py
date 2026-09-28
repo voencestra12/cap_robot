@@ -78,3 +78,29 @@ def matrix_to_transform_stamped(T: np.ndarray, parent: str, child: str, stamp) -
     msg.transform.rotation.z = float(qz)
     msg.transform.rotation.w = float(qw)
     return msg
+
+
+def rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Radians, R = Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ], dtype=float)
+
+
+def matrix_to_rpy(rotation: np.ndarray) -> tuple:
+    """Return radians in the same ZYX convention, including gimbal lock."""
+    r = np.asarray(rotation, dtype=float).reshape(3, 3)
+    horizontal = math.hypot(r[0, 0], r[1, 0])
+    pitch = math.atan2(-r[2, 0], horizontal)
+    if horizontal > 1e-9:
+        roll = math.atan2(r[2, 1], r[2, 2])
+        yaw = math.atan2(r[1, 0], r[0, 0])
+    else:
+        roll = 0.0
+        yaw = math.atan2(-r[0, 1], r[1, 1])
+    return roll, pitch, yaw

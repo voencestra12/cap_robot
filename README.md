@@ -200,3 +200,121 @@ ROS 2가 설치된 실제 환경에서는 `colcon test --packages-select cap_rob
 `dry_run` 분산 통합 시험을 별도로 수행하십시오. 토큰 동작은
 `ros2 topic echo /zone_token/state`로 두 로봇이 중앙 구역을 두고 순차 진입하는지,
 각자 구역만 쓰는 Task에서는 토큰 트래픽이 없는지 확인합니다.
+
+
+## 재료별 그리퍼 설정과 바구니 적층
+
+실험값은 `cap_robot/object_profiles.py`에서 관리합니다.
+
+| 재료 | 배치된 두께(mm) | 그리퍼 닫기 |
+| --- | ---: | ---: |
+| 빵 | 20 | 150 |
+| 양상추 | 0 | 400 |
+| 바나나 | 35 | 330 |
+
+양상추처럼 두께가 무시할 만큼 작으면 0 mm를 허용합니다. 등록된 재료는 일반
+이동에서도 해당 그리퍼 값을 사용하고, `assembly` Task에만 적층 높이를 적용합니다.
+
+### 좌표계와 바구니 중심
+
+`config/calibration.yaml`에서 마커 0의 배치 오프셋은 `[0, 0, 0]`입니다.
+따라서 `workspace_0`의 원점은 마커 0 중심이며, `aruco_calib.py`는 보이는 여러
+마커의 알려진 배치와 코너를 함께 solvePnP하여 workspace 자세를 추정합니다.
+마커 0의 개별 TF를 그대로 복사하는 방식은 아닙니다.
+
+바구니 중심은 `/perception/yolo_extra`의 `basket_handle_0`, `basket_handle_1`
+(빨간 점 두 개, workspace 기준 mm) 좌표를 평균하여 계산합니다.
+
+```text
+center_x = (red0.x_mm + red1.x_mm) / 2
+center_y = (red0.y_mm + red1.y_mm) / 2
+center_z = (red0.z_mm + red1.z_mm) / 2
+```
+
+조립 X/Y에 center_x/y를 사용합니다. center_z는 빨간 점 높이이며 바구니 내부
+바닥 높이가 아닙니다. 내부 바닥은 `BASKET_FLOOR_Z_MM`으로 별도 입력합니다.
+마커 평면 Z=0과 바구니 내부 바닥도 같다고 가정하지 않습니다.
+고정 `BASKET_CENTER_XY_MM` 설정은 사용하지 않습니다.
+
+두 점 누락, 인식 valid=false, 다른 좌표계, 비정상 좌표, 오래된 수신/센서 시각은
+실행 전에 거부합니다. 후보 생성/수신 때뿐 아니라 실제 실행 시작 직전에도 최신
+중심을 다시 구합니다. 한 Task의 동작 중에는 그 좌표를 유지하여 팔의 가림이나
+인식 노이즈를 따라가지 않습니다. 동작 중 바구니를 움직이지 않는 조건입니다.
+
+### 추가로 입력할 실측값
+
+| 설정 | 입력할 값 |
+| --- | --- |
+| `place_tcp_offset_mm` | 해당 배치 자세로 빈 바구니에 내려놓는 TCP의 workspace Z − 내부 바닥 Z |
+| `BASKET_FLOOR_Z_MM` | workspace_0 기준 바구니 내부 바닥 Z |
+| `BASKET_YAW_DEG` | workspace 기준 배치 방향, 기본 0° |
+
+바닥 높이와 각 재료의 TCP 보정은 아직 `None`입니다. 해당 적층 작업은 값을
+입력하기 전 이동을 거부하며, LLM이나 빨간 점 높이로 추측하지 않습니다.
+
+최종 배치 TCP 높이는 다음과 같습니다.
+
+```text
+내부 바닥 Z + 앞 층들의 thickness_mm 합 + 현재 재료의 place_tcp_offset_mm
+```
+
+빵→양상추→바나나 순서의 적층 오프셋은 각각 **0, 20, 20 mm**입니다.
+바나나 두께 35 mm는 그 위에 다음 재료를 놓을 때 추가됩니다.
+기존 `z_offset=40`은 계산된 최종 배치 높이이고, `z_offset=200`은 그보다
+160 mm 위입니다. 40 mm를 중복해서 더하지 않습니다. 파지 높이는 기존 값을 유지합니다.
+
+### 빵 배치 기울임
+
+빵에는 다음 시험 설정을 적용했습니다.
+
+```python
+"place_roll_offset_deg": 0.0,
+"place_pitch_offset_deg": 30.0,
+"place_tilt_speed": 20.0,
+```
+
+workspace 기준 수직 자세 `roll=180°, pitch=0°`에 offset을 더합니다.
+회전은 `Rz(yaw) @ Ry(pitch) @ Rx(roll)` 규약이며, 전체 자세를 각 robot base로
+TF 변환한 뒤 SDK에 degree로 전달합니다. 따라서 두 Agent의 base 방향이 달라도
+같은 workspace 방향으로 기울입니다. 반대 방향은 pitch offset을 -30°로,
+다른 축은 pitch offset을 0°로 두고 roll offset을 조절하면 됩니다.
+
+실행 순서:
+
+1. 재료를 집고 기존 자세로 들어 올립니다.
+2. 바구니 위의 높은 위치로 이동합니다.
+3. 같은 TCP 위치에서 빵을 30° 기울입니다.
+4. 기울인 자세로 내려가 해제합니다.
+5. 기울임을 유지하며 높은 위치로 후퇴합니다.
+6. 높은 위치에서 원래 배치 자세로 복원한 뒤 홈으로 복귀합니다.
+
+기울임 동작은 LLM actions에 추가할 필요 없이 실행기가 처리하며, 일반 빵 PnP에도
+적용됩니다. 양상추/바나나는 별도 기울임 설정이 없으면 기존 배치 자세를 사용합니다.
+30°는 시험값이며 충돌을 자동으로 해결한다는 보장은 없습니다. 회전은 TCP 기준이므로
+빵의 바닥/중심은 같이 이동합니다. 빵의 `place_tcp_offset_mm`은 **기울인 자세에서**
+맞춰야 합니다. 물체 형상과 손가락을 포함한 충돌 검사는 구현하지 않았습니다.
+SDK RPY 정의: https://github.com/xArm-Developer/xArm-Python-SDK/blob/master/xarm/wrapper/xarm_api.py
+
+장착 차이는 `AGENT_PROFILE_OVERRIDES`로 파지값, TCP 보정, 기울임 항목을
+Agent별로 덮어쓸 수 있습니다. 두께/바닥 Z는 공통입니다. 기존 Agent2의 SDK Z
+보정(-50 mm)은 그대로 유지되어 있으므로 실제 TCP 보정을 맞출 때 이 경로도 고려합니다.
+
+각 적층 Task는 `assembly`에 id, container=basket, layer_index, material을 갖고
+직전 층 Task에 의존합니다. 앞 층이 SUCCEEDED가 되어야 다음 층을 시작합니다.
+이는 동작 시퀀스/홈 복귀 성공이며 카메라로 적층 성공을 확인하는 기능은 아닙니다.
+실패 후 새 미션을 시작할 때 실제 적층 상태를 먼저 정리해야 합니다.
+
+설정 수정 후 빌드하고 Workstation과 두 Agent를 재시작하세요.
+
+```bash
+cd ~/colcon_ws
+colcon build --packages-select cap_robot --symlink-install
+source install/setup.bash
+```
+
+로봇 없이 검증:
+
+```bash
+cd ~/colcon_ws/src/cap_robot
+python3 -m unittest discover -s test -p 'test_*.py'
+```

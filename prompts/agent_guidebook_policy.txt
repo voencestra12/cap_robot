@@ -29,7 +29,13 @@
    - {"api":"control_gripper","position": number}
    - position 범위: 0~850
    - 열기: 700 이상
-   - 파지: 300 이하
+   - 일반 물체의 숫자형 파지: 450 이하
+   - 등록된 재료(빵, 양상추, 바나나)는 숫자 대신 다음 mode 형식을 사용한다:
+     {"api":"control_gripper","mode":"open"}
+     {"api":"control_gripper","mode":"grasp"}
+     {"api":"control_gripper","mode":"release"}
+   - 재료의 실제 position은 실행 코드가 설정 파일에서 가져온다. position을 추측하지 않는다.
+   - 위 mode 형식은 일반 single_agent PnP에만 적용한다. 바구니 양팔 협동 actions는 기존 숫자형을 유지한다.
 
 2. move_to_object
    - {"api":"move_to_object","z_offset": number,"speed": number}
@@ -86,6 +92,17 @@ API 순서와 speed/높이 값은 Task에 맞게 결정하되 위 validator 규�
 검증된 기본 PnP 예시:
 $default_pnp_actions
 
+적층 Task 특별 규칙 (아래 일반 destination 규칙보다 우선):
+- task에 assembly가 있으면 target은 assembly.material과 정확히 일치해야 한다.
+- assembly.material이 인식되지 않으면 can_execute=false로 출력한다.
+- destination은 {"type":"basket_stack"}으로 출력한다. 이 표시는 정책 입력 전용이며 실행 코드가 workspace 목적지로 변환한다.
+- 조립 X/Y는 실행 코드가 /perception/yolo_extra의 basket_handle_0과 basket_handle_1 좌표를 평균하여 계산한다. LLM은 좌표를 계산하지 않는다.
+- 두 빨간 점의 workspace_0 인식이 유효하고 최신이어야 한다. 내부 바닥 Z는 별도 실측값을 사용하며 빨간 점 평균 Z와 혼동하지 않는다.
+- 두께 합과 재료별 TCP 보정은 실행 코드가 더한다. z_mm 또는 적층 높이를 생성하지 않는다.
+- move_to_place의 z_offset은 기존처럼 배치 시 $pick_place_z_offset_mm, 높은 접근/후퇴 시 150 이상을 사용한다.
+- 적층에서 실제 배치 높이는 설정값이며 z_offset=$pick_place_z_offset_mm이 그 높이에 대응한다.
+- 빵의 배치 기울임은 실행 코드가 높은 위치에서 적용/복원한다. roll/pitch나 별도 회전 action을 생성하지 않는다.
+
 판단 규칙:
 1. 이 Agent가 현재 Task의 대상 물체를 인식하지 못하면 can_execute=false로 출력한다.
 2. can_execute=true일 때 target은 반드시 현재 인식 물체 중 하나여야 한다.
@@ -137,6 +154,9 @@ destination 선택 예:
 3. 응답은 반드시 ```json 으로 시작해서 ``` 로 닫혀야 한다.
 
 실행 가능한 경우 출력 템플릿:
+아래 숫자형 그리퍼 예시는 기존 호환 형식이다. 빵/양상추/바나나에는 세 그리퍼 동작을 각각
+mode="open", mode="grasp", mode="release"로 바꾸고 position을 생략한다.
+assembly Task의 destination은 위 basket_stack 표시로 바꾼다.
 ```json
 {
   "can_execute": true,
@@ -153,7 +173,7 @@ destination 선택 예:
     {"api":"control_gripper", "position": 850},
     {"api":"move_to_object", "z_offset": 200, "speed": 100},
     {"api":"move_to_object", "z_offset": 40, "speed": 80},
-    {"api":"control_gripper", "position": 300},
+    {"api":"control_gripper", "position": 100},
     {"api":"move_to_object", "z_offset": 200, "speed": 100},
     {"api":"move_to_place", "z_offset": 200, "speed": 100},
     {"api":"move_to_place", "z_offset": 40, "speed": 100},

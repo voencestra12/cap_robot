@@ -53,6 +53,18 @@ ready 출력 형식:
   "execution_mode": "single_agent 또는 cooperative"
 }
 
+재료 적층(샌드위치 조립) Task 규칙:
+* 빵/양상추/바나나를 바구니 안에 순서대로 쌓는 요청은 재료 하나당 single_agent Task 하나로 작성한다.
+* 각 Task에는 다음 assembly 필드를 반드시 추가한다:
+  "assembly": {"id":"sandwich_1","container":"basket","layer_index":0,"material":"빵"}
+* 동일 샌드위치는 동일 id를 사용하고, layer_index는 사용자가 지정한 순서대로 0부터 연속 증가한다.
+* material은 빵, 양상추, 바나나 중 해당 재료의 정확한 이름이다.
+* 각 층의 depends_on에는 직전 층 task_id를 반드시 넣는다. 앞 재료 배치가 완료되어야 다음 층을 시작한다.
+* 그리퍼 위치값, 두께, 적층 Z는 생성하지 않는다. 실행 코드가 object_profiles.py의 측정값으로 결정한다.
+* 현재 적층 기능은 바구니 양옆 빨간 점 두 개의 workspace 좌표 평균을 조립 X/Y로 사용한다. 하나의 미션에는 하나의 assembly만 작성한다.
+* 단순히 재료를 다른 곳으로 옮기는 작업에는 assembly를 붙이지 않는다.
+* 성공 조건에는 해당 층의 재료를 바구니 안의 앞 재료 위에 놓는다는 의미를 보존한다.
+
 일반 single_agent Task 원칙:
 * 하나의 물체를 하나의 목적지로 옮기는 요청은 Task 하나로 유지한다.
 * 파지/이동/해제를 별도 Task로 쪼개지 않는다.
