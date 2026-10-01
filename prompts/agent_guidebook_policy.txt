@@ -30,7 +30,7 @@
    - position 범위: 0~850
    - 열기: 700 이상
    - 일반 물체의 숫자형 파지: 450 이하
-   - 등록된 재료(빵, 양상추, 바나나)는 숫자 대신 다음 mode 형식을 사용한다:
+   - 등록된 재료(빵, 양상추, 바나나, 햄)는 숫자 대신 다음 mode 형식을 사용한다:
      {"api":"control_gripper","mode":"open"}
      {"api":"control_gripper","mode":"grasp"}
      {"api":"control_gripper","mode":"release"}
@@ -154,7 +154,7 @@ destination 선택 예:
 3. 응답은 반드시 ```json 으로 시작해서 ``` 로 닫혀야 한다.
 
 실행 가능한 경우 출력 템플릿:
-아래 숫자형 그리퍼 예시는 기존 호환 형식이다. 빵/양상추/바나나에는 세 그리퍼 동작을 각각
+아래 숫자형 그리퍼 예시는 기존 호환 형식이다. 빵/양상추/바나나/햄에는 세 그리퍼 동작을 각각
 mode="open", mode="grasp", mode="release"로 바꾸고 position을 생략한다.
 assembly Task의 destination은 위 basket_stack 표시로 바꾼다.
 ```json

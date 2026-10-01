@@ -22,6 +22,11 @@ OBJECT_PROFILES = {
         "thickness_mm": 0.0,
         "place_tcp_offset_mm": 0.0,
     },
+    "햄": {
+        "grip_position": 30.0,
+        "thickness_mm": 5.0,
+        "place_tcp_offset_mm": 0.0,
+    },
     "바나나": {
         "grip_position": 330.0,
         "thickness_mm": 35.0,
