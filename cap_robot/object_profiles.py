@@ -46,7 +46,10 @@ BASKET_YAW_DEG = 0.0
 AGENT_PROFILE_OVERRIDES = {
     "agent2": {  # UFactory 사진의 robot IP: 192.168.1.198
         "빵": {
+            # 사진 1: 집기/들어올리기/바구니 위 접근/후퇴 후 복원 자세.
             "pick_rpy_robot_deg": [179.4, 0.0, -0.1],
+            # 사진 2: 높은 위치에서 전환 후 하강/해제/후퇴 동안 유지하는 자세.
+            # Roll은 파지 자세에서 37.9° 감소. 관절 J4/J5/J6 각도가 아니다.
             "place_rpy_robot_deg": [141.5, -0.1, -0.1],
         },
     },

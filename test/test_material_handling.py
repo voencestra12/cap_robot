@@ -137,6 +137,32 @@ class MaterialHandlingTest(ConfiguredTest):
         self.assertEqual(second['reference_place_pose']['z'], 80)
         self.assertEqual(material_profile('바나나', 'agent2')['grip_position'], 450)
 
+    def test_taught_attitudes_require_two_finite_rpy_triplets(self):
+        pick = [179.4, 0.0, -0.1]
+        place_rpy = [141.5, -0.1, -0.1]
+        for key in ('pick_rpy_robot_deg', 'place_rpy_robot_deg'):
+            for invalid in (None, [], [1, 2], [1, 2, 3, 4], '141.5,0,0',
+                            [True, 0, 0], [float('nan'), 0, 0], [0, float('inf'), 0]):
+                with self.subTest(key=key, invalid=invalid):
+                    profile = dict(pick_rpy_robot_deg=pick, place_rpy_robot_deg=place_rpy)
+                    profile[key] = invalid
+                    settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': profile}
+                    with self.assertRaises(ValueError):
+                        material_profile('빵', 'agent2')
+            settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {key: pick}}
+            with self.assertRaises(ValueError):
+                material_profile('빵', 'agent2')
+
+    def test_taught_attitudes_are_agent_specific_with_zero_offsets(self):
+        settings.OBJECT_PROFILES['빵'].update(place_roll_offset_deg=0, place_pitch_offset_deg=0)
+        settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {
+            'pick_rpy_robot_deg': [179.4, 0.0, -0.1],
+            'place_rpy_robot_deg': [141.5, -0.1, -0.1],
+        }}
+        self.assertIsNone(placement_tilt('빵', 'agent1'))
+        self.assertIsNotNone(placement_tilt('빵', 'agent2'))
+        self.assertIsNone(placement_tilt('바나나', 'agent2'))
+
     def test_bad_layer_order_dependency_or_material_is_rejected(self):
         for field, value in [('layer_index', 0), ('layer_index', 3),
                              ('layer_index', True), ('material', '사과'),
@@ -372,6 +398,79 @@ class AgentAssemblyTest(ConfiguredTest):
         self.assertTrue(events[release - 1][2]['label'].endswith('lower'))
         self.assertTrue(events[release + 1][2]['label'].endswith('retreat'))
         self.assertTrue(events[release + 2][2]['label'].endswith('restore'))
+
+    def taught_bread_task(self):
+        settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {
+            'pick_rpy_robot_deg': [179.4, 0.0, -0.1],
+            'place_rpy_robot_deg': [141.5, -0.1, -0.1],
+            'place_roll_offset_deg': 0, 'place_pitch_offset_deg': 0,
+            'place_tilt_speed': 75,
+        }}
+        self.node.agent_id = 'agent2'
+        self.node.workspace_rpy_to_robot = Mock(
+            side_effect=AssertionError('Base 자세에는 workspace TF를 적용하면 안 된다.'))
+        task = self.bread_task()
+        task['assignee_id'] = 'agent2'
+        return task
+
+    def test_taught_bread_attitudes_reach_sdk_at_changing_positions(self):
+        node = self.node
+        node.dry_run = False
+        node.check_sdk_pose_or_raise = Mock()
+        # 실제 move_to_robot_tf/move_to_sdk를 사용하고 하드웨어만 mock한다.
+        node.move_to_robot_tf = lambda *a, **kw: type(node).move_to_robot_tf(node, *a, **kw)
+        expected_rpy = [[179.4, 0, -0.1]] * 4 + [[141.5, -0.1, -0.1]] * 3 + [[179.4, 0, -0.1]]
+        for assembly in (True, False):
+            for pick_x in (10, 120):
+                with self.subTest(assembly=assembly, pick_x=pick_x):
+                    task = self.taught_bread_task()
+                    task['object_pose'].update(x=pick_x, yaw=1.2)
+                    if not assembly:
+                        for key in ('assembly', 'guidebook_task_id', 'mission_id', 'plan_revision'):
+                            task.pop(key)
+                        task['reference_place_pose']['yaw'] = -0.9
+                        task['place_pose'] = dict(x=401, y=202, z=150, yaw=-0.9)
+                    events = []
+                    def sdk_move(**kwargs):
+                        events.append(('move', kwargs))
+                        return 0
+                    node.arm.set_position.side_effect = sdk_move
+                    node.control_gripper.side_effect = lambda pos: events.append(('grip', pos)) or True
+                    with patch.object(time, 'sleep'):
+                        self.assertTrue(node.execute_task(task))
+                    moves = [value for kind, value in events if kind == 'move']
+                    np.testing.assert_allclose(
+                        [[m['roll'], m['pitch'], m['yaw']] for m in moves], expected_rpy,
+                        atol=1e-10)
+                    self.assertTrue(all(m['is_radian'] is False for m in moves))
+                    self.assertEqual([m['x'] for m in moves[:3]], [pick_x] * 3)
+                    self.assertEqual([m['speed'] for m in moves[3:]], [75] * 5)
+                    # 접근 후 제자리 회전, 해제 후 후퇴하고 높은 위치에서만 자세 복원.
+                    xyz = [[m[k] for k in ('x', 'y', 'z')] for m in moves]
+                    self.assertEqual(xyz[3], xyz[4])
+                    self.assertEqual(xyz[6], xyz[7])
+                    self.assertNotEqual(xyz[5], xyz[6])
+                    if not assembly:
+                        self.assertEqual(xyz[5], [401, 202, 140])  # 150 + 40 - agent2 보정 50
+                    release = max(i for i, event in enumerate(events) if event == ('grip', 850))
+                    self.assertEqual(events[release - 1][1], moves[5])
+                    self.assertEqual(events[release + 1][1], moves[6])
+                    node.workspace_rpy_to_robot.assert_not_called()
+
+    def test_failed_taught_rotation_stops_before_lowering_and_release(self):
+        task = self.taught_bread_task()
+        self.node.move_to_robot_tf.side_effect = [True, True, True, True, False]
+        self.assertFalse(self.node.execute_task(task))
+        self.assertEqual(self.node.move_to_robot_tf.call_count, 5)
+        self.assertEqual([c.args[0] for c in self.node.control_gripper.call_args_list], [850, 620])
+        self.node.return_to_home_joint_pose.assert_not_called()
+
+    def test_incomplete_taught_pose_is_rejected_before_sdk(self):
+        task = self.taught_bread_task()
+        settings.AGENT_PROFILE_OVERRIDES['agent2']['빵'].pop('place_rpy_robot_deg')
+        self.assertFalse(self.node.execute_task(task))
+        self.assertEqual(self.node.arm.mock_calls, [])
+        self.node.move_to_robot_tf.assert_not_called()
 
     def test_failed_tilt_never_descends_or_releases(self):
         task = self.bread_task()

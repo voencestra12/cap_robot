@@ -2762,14 +2762,20 @@ class RobotAgentNode(Node):
         try:
             if not self.validate_received_task(task):
                 return False
+            placement_profile = placement_tilt(task['target'], self.agent_id)
+            pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
+                        if placement_profile is not None else None)
         except Exception as error:
             self.get_logger().error(f'작업 실행 전 검증 실패: {error}')
             return False
         basket_center = task.get('basket_center_workspace')
         placement_state = {'started': False, 'released': False}
-        placement_profile = placement_tilt(task['target'], self.agent_id)
-        pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
-                    if placement_profile is not None else None)
+        if pick_rpy is not None:
+            self.get_logger().info(
+                f"🧭 [{task['task_id']}] Base 절대 자세 RPY(deg): "
+                f"pick={pick_rpy} → place={placement_profile['place_rpy_robot_deg']}, "
+                f"배치 속도 상한={placement_profile['place_tilt_speed']:.1f}"
+            )
         obj = task['object_pose']
         place = task['place_pose']
         # 기존 zone Task에는 place.z가 없으므로 obj.z를 그대로 사용합니다.
