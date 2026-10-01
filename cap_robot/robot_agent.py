@@ -125,7 +125,7 @@ class RobotAgentNode(Node):
         self.declare_parameter('guidebook_policy_retry_sec', 5.0)
         self.declare_parameter(
             'yolo_model_paths',
-            ['models/yolo11m-seg.pt', 'models/yolo-bread-lettuce.pt'],
+            ['models/yolo11m-seg.pt', 'models/yolo-bread-lettuce-ham.pt'],
         )
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_claim_topic', '/mission/task_claim')
@@ -3116,7 +3116,7 @@ class RobotAgentNode(Node):
     def run_perception(self):
         name_map_ko = {
             'banana': '바나나', 'apple': '사과', 'orange': '오렌지',
-            'mouse': '마우스', 'bread': '빵', 'lettuce': '양상추',
+            'mouse': '마우스', 'bread': '빵', 'lettuce': '양상추', 'ham': '햄',
         }
         try:
             while rclpy.ok():

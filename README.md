@@ -116,11 +116,12 @@ ros2 param set /workstation_llm llm_think true
 ros2 param set /workstation_llm llm_think false
 ```
 
-## 빵·양상추 모델 통합
+## 빵·양상추·햄 모델 통합
 
-두 Agent는 `models/yolo11m-seg.pt`와 `models/yolo-bread-lettuce.pt`를 함께
-로드합니다. 추가 모델은 segmentation 모델이며 클래스는 `0: bread`, `1: lettuce`입니다.
-인식 결과는 각각 **빵**, **양상추**로 기존 Agent perception에 들어갑니다.
+두 Agent는 `models/yolo11m-seg.pt`와 `models/yolo-bread-lettuce-ham.pt`를 함께
+로드합니다. 추가 모델은 segmentation 모델이며 클래스는 `0: bread`, `1: lettuce`,
+`2: ham`입니다. 인식 결과는 각각 **빵**, **양상추**, **햄**으로 기존 Agent
+perception에 들어갑니다.
 마스크와 정렬 depth로 구한 위치·yaw를 `workspace_0` 좌표로 변환하고,
 기존 `latest_poses`와 `current_detected_items`를 통해 Agent LLM의 target 및
 relative_object reference 선택에 사용합니다. 각 모델에는 시각화 전 원본 영상을 입력합니다.
