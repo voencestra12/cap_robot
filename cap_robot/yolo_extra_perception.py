@@ -102,6 +102,8 @@ class YoloExtraPerception(Node):
             deque(maxlen=smoothing_window),
         ]
         self._last_positions = None
+        self._last_valid_red_points = None
+        self._last_valid_red_points_stamp = None
         self._last_depth = None
         self._last_depth_stamp_sec = 0.0
         self._intrinsics = None
@@ -425,12 +427,38 @@ class YoloExtraPerception(Node):
             candidates, mask = self._detect_candidates(color, camera_frame, msg.header.stamp)
             handles = self._stabilize(candidates)
             if handles is None:
-                self._publish_invalid(
-                    msg.header.stamp,
-                    f'유효한 빨간 손잡이 2개 필요: detected={len(candidates)}',
+                red_target_age = (
+                    self.get_clock().now().nanoseconds * 1e-9
+                    - self._stamp_sec(self._last_valid_red_points_stamp)
+                    if self._last_valid_red_points_stamp is not None else None
                 )
+                if (
+                    self._last_valid_red_points is not None
+                    and red_target_age is not None
+                ):
+                    self._publish_valid(
+                        self._last_valid_red_points, self._last_valid_red_points_stamp
+                    )
+                    self._warn_throttled(
+                        'red_point_fallback',
+                        f'red point fallback: using last valid workspace target, age={red_target_age:.3f}s',
+                    )
+                else:
+                    self._publish_invalid(
+                        msg.header.stamp,
+                        f'유효한 빨간 손잡이 2개 필요: detected={len(candidates)}',
+                    )
             else:
                 self._publish_valid(handles, msg.header.stamp)
+                self._last_valid_red_points = [
+                    {
+                        'position': item['position'].copy(),
+                        'area_px': item['area_px'],
+                        'depth_m': item['depth_m'],
+                    }
+                    for item in handles
+                ]
+                self._last_valid_red_points_stamp = msg.header.stamp
                 for index, item in enumerate(handles):
                     cv2.circle(color, item['pixel'], 6, (0, 255, 0), -1)
                     cv2.putText(

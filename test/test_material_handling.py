@@ -74,7 +74,6 @@ class ConfiguredTest(unittest.TestCase):
         config = patch.multiple(
             settings, OBJECT_PROFILES=profiles, BASKET_FLOOR_Z_MM=10,
             BASKET_YAW_DEG=0,
-            AGENT_PROFILE_OVERRIDES={},
         )
         config.start()
         self.addCleanup(config.stop)
@@ -127,15 +126,12 @@ class MaterialHandlingTest(ConfiguredTest):
         self.assertEqual(assembly_move_pose(pose, 200, 40)['z'], 235)
         self.assertEqual(pose['z'], 75)
 
-    def test_agent_override_does_not_change_common_stack_height(self):
-        settings.AGENT_PROFILE_OVERRIDES['agent2'] = {
-            '바나나': {'grip_position': 450, 'place_tcp_offset_mm': 50},
-        }
-        first = place(recipe()[2], recipe(), 'agent1')
-        second = place(recipe()[2], recipe(), 'agent2')
-        self.assertEqual(first['stack_offset_mm'], second['stack_offset_mm'])
-        self.assertEqual(second['reference_place_pose']['z'], 80)
-        self.assertEqual(material_profile('바나나', 'agent2')['grip_position'], 450)
+    def test_material_profile_is_shared_between_agents(self):
+        first = material_profile('바나나', 'agent1')
+        second = material_profile('바나나', 'agent2')
+        self.assertEqual(first, second)
+        self.assertEqual(place(recipe()[2], recipe(), 'agent1'),
+                         place(recipe()[2], recipe(), 'agent2'))
 
     def test_taught_attitudes_require_two_finite_rpy_triplets(self):
         pick = [179.4, 0.0, -0.1]
@@ -146,22 +142,15 @@ class MaterialHandlingTest(ConfiguredTest):
                 with self.subTest(key=key, invalid=invalid):
                     profile = dict(pick_rpy_robot_deg=pick, place_rpy_robot_deg=place_rpy)
                     profile[key] = invalid
-                    settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': profile}
+                    settings.OBJECT_PROFILES['빵'].update(profile)
                     with self.assertRaises(ValueError):
-                        material_profile('빵', 'agent2')
-            settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {key: pick}}
+                        material_profile('빵')
+            settings.OBJECT_PROFILES['빵'].pop('pick_rpy_robot_deg', None)
+            settings.OBJECT_PROFILES['빵'].pop('place_rpy_robot_deg', None)
+            settings.OBJECT_PROFILES['빵'][key] = pick
             with self.assertRaises(ValueError):
-                material_profile('빵', 'agent2')
-
-    def test_taught_attitudes_are_agent_specific_with_zero_offsets(self):
-        settings.OBJECT_PROFILES['빵'].update(place_roll_offset_deg=0, place_pitch_offset_deg=0)
-        settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {
-            'pick_rpy_robot_deg': [179.4, 0.0, -0.1],
-            'place_rpy_robot_deg': [141.5, -0.1, -0.1],
-        }}
-        self.assertIsNone(placement_tilt('빵', 'agent1'))
-        self.assertIsNotNone(placement_tilt('빵', 'agent2'))
-        self.assertIsNone(placement_tilt('바나나', 'agent2'))
+                material_profile('빵')
+            settings.OBJECT_PROFILES['빵'].pop(key)
 
     def test_bad_layer_order_dependency_or_material_is_rejected(self):
         for field, value in [('layer_index', 0), ('layer_index', 3),
@@ -400,12 +389,12 @@ class AgentAssemblyTest(ConfiguredTest):
         self.assertTrue(events[release + 2][2]['label'].endswith('restore'))
 
     def taught_bread_task(self):
-        settings.AGENT_PROFILE_OVERRIDES['agent2'] = {'빵': {
+        settings.OBJECT_PROFILES['빵'].update({
             'pick_rpy_robot_deg': [179.4, 0.0, -0.1],
             'place_rpy_robot_deg': [141.5, -0.1, -0.1],
             'place_roll_offset_deg': 0, 'place_pitch_offset_deg': 0,
             'place_tilt_speed': 75,
-        }}
+        })
         self.node.agent_id = 'agent2'
         self.node.workspace_rpy_to_robot = Mock(
             side_effect=AssertionError('Base 자세에는 workspace TF를 적용하면 안 된다.'))
@@ -467,7 +456,7 @@ class AgentAssemblyTest(ConfiguredTest):
 
     def test_incomplete_taught_pose_is_rejected_before_sdk(self):
         task = self.taught_bread_task()
-        settings.AGENT_PROFILE_OVERRIDES['agent2']['빵'].pop('place_rpy_robot_deg')
+        settings.OBJECT_PROFILES['빵'].pop('place_rpy_robot_deg')
         self.assertFalse(self.node.execute_task(task))
         self.assertEqual(self.node.arm.mock_calls, [])
         self.node.move_to_robot_tf.assert_not_called()

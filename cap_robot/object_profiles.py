@@ -43,7 +43,3 @@ BASKET_FLOOR_Z_MM = 0.0
 # 조립 X/Y는 /perception/yolo_extra의 두 basket_handle 좌표 평균을 사용합니다.
 BASKET_YAW_DEG = 0.0
 
-# offset 방식은 workspace의 기본 roll=180°, pitch=0°에 더하는 시험 설정입니다.
-# 빵의 공통 offset은 0으로 해제합니다. 실측 Base 자세는 해당 Agent에만 적용합니다.
-# *_rpy_robot_deg는 UFactory Base 기준 [Roll, Pitch, Yaw] 절대각(degree)입니다.
-# 두 자세를 함께 지정하면 offset 방식보다 우선하며 workspace 자세 TF를 적용하지 않습니다.

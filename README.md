@@ -267,41 +267,9 @@ center_z = (red0.z_mm + red1.z_mm) / 2
 
 ### 빵 배치 기울임
 
-agent2 (`192.168.1.198`)는 사용자가 제공한 UFactory Base 화면의 절대 자세를 사용합니다.
-`cap_robot/object_profiles.py`의 `AGENT_PROFILE_OVERRIDES["agent2"]["빵"]`에 저장합니다.
-
-| 설정 | Roll (°) | Pitch (°) | Yaw (°) |
-| --- | ---: | ---: | ---: |
-| `pick_rpy_robot_deg` | 179.4 | 0.0 | -0.1 |
-| `place_rpy_robot_deg` | 141.5 | -0.1 | -0.1 |
-
-두 설정은 함께 지정해야 하며 순서는 `[Roll, Pitch, Yaw]`, 단위는 degree입니다.
-이미 robot Base 기준이므로 workspace 자세 TF를 다시 적용하지 않습니다.
-파지 방향이 일정하다는 조건에서 빵의 위치가 달라도 같은 파지/배치 자세를 사용합니다.
-XYZ는 기존 인식/적층 계산으로 결정하고, 사진의 XYZ와 관절각 J1~J6는 복사하지 않습니다.
-agent1은 실측 자세가 없으므로 빵의 시험 기울임을 해제한 기본 PnP 자세를 사용합니다.
-
-실행 순서:
-
-1. 실측 파지 자세로 접근하고 집어 올립니다.
-2. 파지 자세를 유지하며 바구니 위 높은 위치로 이동합니다.
-3. 같은 TCP 위치에서 실측 배치 자세로 전환합니다.
-4. 배치 자세를 유지하며 하강하고 해제합니다.
-5. 배치 자세로 높은 위치까지 후퇴합니다.
-6. 높은 위치에서 파지 자세로 복원한 뒤 홈으로 복귀합니다.
-
-기울임 구간의 속도는 action 속도와 `place_tilt_speed=75` 중 작은 값입니다.
-기본 배치 action 속도는 90~100이므로 현재 설정에서는 75로 실행됩니다.
-일반 빵 PnP와 적층 작업에 모두 적용되며, 양상추/바나나는 기존 자세를 사용합니다.
-Base 자세가 지정되지 않은 프로필은 기존 workspace roll/pitch offset 방식을 지원합니다.
-
-화면은 두 끝 자세의 기록이며, 바뀐 XYZ에서의 도달 가능성이나 전환 경로의 관절 범위를
-검증한 것은 아닙니다. 빵의 TCP 높이 보정은 이 배치 자세에서 확인해야 합니다.
-현재 바닥 Z와 TCP 보정 0.0은 기존 설정이며 사진의 Base Z로 대체하지 않습니다.
-
-장착 차이는 `AGENT_PROFILE_OVERRIDES`로 파지값, TCP 보정, 기울임 항목을
-Agent별로 덮어쓸 수 있습니다. 두께/바닥 Z는 공통입니다. 기존 Agent2의 SDK Z
-보정(-50 mm)은 그대로 유지되어 있으므로 실제 TCP 보정을 맞출 때 이 경로도 고려합니다.
+재료별 공통 파지값, TCP 높이와 배치 기울임은 `cap_robot/object_profiles.py`의
+`OBJECT_PROFILES`에서 설정합니다. 현재 빵의 roll/pitch offset은 0°이며,
+Agent별 프로필 덮어쓰기는 사용하지 않습니다. 두께와 바구니 바닥 Z도 공통 설정입니다.
 
 각 적층 Task는 `assembly`에 id, container=basket, layer_index, material을 갖고
 직전 층 Task에 의존합니다. 앞 층이 SUCCEEDED가 되어야 다음 층을 시작합니다.

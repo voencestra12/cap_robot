@@ -27,16 +27,7 @@ def number(value, label, minimum=None, maximum=None):
 def material_profile(material, agent_id=None, for_assembly=False):
     if material not in settings.OBJECT_PROFILES:
         raise ValueError(f'등록되지 않은 재료: {material}')
-    common = settings.OBJECT_PROFILES[material]
-    profile = dict(common)
-    overrides = settings.AGENT_PROFILE_OVERRIDES.get(agent_id, {}).get(material, {})
-    if set(overrides) - {
-        'grip_position', 'place_tcp_offset_mm', 'place_roll_offset_deg',
-        'place_pitch_offset_deg', 'place_tilt_speed',
-        'pick_rpy_robot_deg', 'place_rpy_robot_deg',
-    }:
-        raise ValueError('Agent별 설정은 파지/TCP 보정/배치 기울임 항목만 지원합니다.')
-    profile.update(overrides)
+    profile = dict(settings.OBJECT_PROFILES[material])
     profile['grip_position'] = number(
         profile.get('grip_position'), f'{material}.grip_position', 0, 850
     )

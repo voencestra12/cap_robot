@@ -54,6 +54,8 @@ class ArucoCalibNode(Node):
         self.show_window = bool(self.get_parameter('show_window').value)
         self._last_warn_time = {}
         self._last_detected_ids_log_time = 0.0
+        self._workspace_rvec = None
+        self._workspace_tvec = None
 
         self.dist = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
         self.mtx = np.array([
@@ -235,6 +237,15 @@ class ArucoCalibNode(Node):
         if parent_frame:
             self.camera_frame = parent_frame
 
+        if self._workspace_rvec is not None:
+            self.broadcast_tf(
+                self.camera_frame,
+                'workspace_0',
+                self._workspace_tvec.flatten(),
+                self._workspace_rvec.flatten(),
+                msg.header.stamp,
+            )
+
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY))
 
         if ids is not None:
@@ -279,7 +290,11 @@ class ArucoCalibNode(Node):
                 object_points = np.empty((0, 3), dtype=np.float32)
                 image_points = np.empty((0, 2), dtype=np.float32)
 
-            if len(object_points) >= 4:
+            if (
+                len(object_points) >= 4
+                and self._workspace_rvec is None
+                and len(set(detected_ids).intersection(self.MARKER_OFFSETS_MM)) >= 4
+            ):
                 success, rvec, tvec = cv2.solvePnP(
                     object_points,
                     image_points,
@@ -287,6 +302,11 @@ class ArucoCalibNode(Node):
                     self.dist,
                 )
                 if success:
+                    self._workspace_rvec = rvec.copy()
+                    self._workspace_tvec = tvec.copy()
+                    self.get_logger().info(
+                        f'workspace_0 locked: marker_ids={sorted(set(detected_ids).intersection(self.MARKER_OFFSETS_MM))}'
+                    )
                     self.broadcast_tf(
                         self.camera_frame,
                         'workspace_0',
@@ -294,7 +314,7 @@ class ArucoCalibNode(Node):
                         rvec.flatten(),
                         msg.header.stamp,
                     )
-            else:
+            elif len(object_points) < 4:
                 self.warn_throttled(
                     'workspace_markers',
                     f'workspace_0 계산용 대응점 부족: matched_marker_count={len(matched_pts)}, '
