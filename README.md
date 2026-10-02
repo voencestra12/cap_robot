@@ -224,6 +224,46 @@ ROS 2가 설치된 실제 환경에서는 `colcon test --packages-select cap_rob
 마커의 알려진 배치와 코너를 함께 solvePnP하여 workspace 자세를 추정합니다.
 마커 0의 개별 TF를 그대로 복사하는 방식은 아닙니다.
 
+고정 카메라·작업대·로봇 base·로봇 마커 조건에서 `camera → workspace_0`,
+`camera → marker_1`, `camera → marker_12`는 여러 프레임을 모아 `/tf_static`으로
+한 번 확정합니다. 유효한 CameraInfo, 양의 카메라 깊이, 재투영 RMS 오차 2 px 이하를
+검사하며, 각 변환은 최소 30개 관측과 1초 이상의 관측 구간이 필요합니다.
+최근 5초 이내 최대 90개 관측에서 80% 이상이 위치 10 mm·회전 3도 이내로
+일치해야 합니다. 위치는 inlier 평균, 회전은 quaternion 기반 SO(3) 평균을 사용합니다.
+작업대는 프레임마다 작업대 마커 4개 이상이 필요합니다. 임계값은
+`config/calibration.yaml`의 `calibration_*` 파라미터로 조정합니다.
+
+세 변환이 모두 준비되면 기존 `marker_1 → robot_1_base`,
+`marker_12 → robot_2_base`와 함께 총 5개 static TF를 발행합니다.
+따라서 늦게 접속한 listener도 전체 체인을 받습니다. 해당 세 카메라 변환은
+`/tf`로 발행하지 않으며, 나머지 마커와 로봇 관절 TF는 기존 동작을 유지합니다.
+
+재캘리브레이션은 기존 `aruco_calib` 프로세스를 종료하고 동일 설정으로 재시작합니다.
+서비스나 키 입력은 없습니다. 새 관측이 충분해지면 동일 부모·자식의 static TF를
+교체하고, 에이전트의 기존 TF 조회/캐시 타이머(기본 0.2초)가 새 값을 반영합니다.
+재수집 중에는 이미 실행 중인 listener에 이전 static TF와 캐시가 남을 수 있습니다.
+새 노드의 `static TF 확정` 로그와 변환 갱신을 확인한 뒤 작업을 재개합니다.
+
+현장 확인(현재 설정의 카메라 frame 기준):
+
+```bash
+# 확정 후 늦게 구독해도 위 5개 변환이 모두 보이는지 확인
+ros2 topic echo /tf_static tf2_msgs/msg/TFMessage --qos-durability transient_local --once
+ros2 run tf2_ros tf2_echo fixed_camera/camera_color_optical_frame workspace_0
+ros2 run tf2_ros tf2_echo fixed_camera/camera_color_optical_frame marker_1
+ros2 run tf2_ros tf2_echo fixed_camera/camera_color_optical_frame marker_12
+ros2 run tf2_ros tf2_echo robot_1_base workspace_0
+ros2 run tf2_ros tf2_echo robot_2_base workspace_0
+# 출력에 workspace_0/marker_1/marker_12가 없고 관절 TF는 계속 나오는지 확인
+ros2 topic echo /tf tf2_msgs/msg/TFMessage --field transforms
+```
+
+`/tf_static`에는 다른 노드의 메시지도 있으므로 `--once`가 다른 발행자의 메시지만
+보여주면 해당 옵션 없이 확인합니다. 재시작 전후 `tf2_echo`를 계속 실행하여 새 값
+반영을 확인하고, 마커를 가린 뒤에도 확정된 체인을 조회할 수 있는지 확인합니다.
+dynamic에서 static으로 최초 전환할 때는 기존 `aruco_calib`를 종료하고 TF 소비 노드도
+재시작하여 이전 dynamic 이력과 새 static TF가 섞이지 않게 합니다.
+
 바구니 중심은 `/perception/yolo_extra`의 `basket_handle_0`, `basket_handle_1`
 (빨간 점 두 개, workspace 기준 mm) 좌표를 평균하여 계산합니다.
 
