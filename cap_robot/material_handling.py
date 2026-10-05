@@ -4,8 +4,10 @@ import math
 
 try:
     from . import object_profiles as settings
+    from .object_memory import object_class
 except ImportError:
     import object_profiles as settings
+    from object_memory import object_class
 
 
 def number(value, label, minimum=None, maximum=None):
@@ -25,6 +27,7 @@ def number(value, label, minimum=None, maximum=None):
 
 
 def material_profile(material, agent_id=None, for_assembly=False):
+    material = object_class(material)
     if material not in settings.OBJECT_PROFILES:
         raise ValueError(f'등록되지 않은 재료: {material}')
     profile = dict(settings.OBJECT_PROFILES[material])
@@ -65,6 +68,7 @@ def thickness(material):
 
 def bind_gripper_actions(actions, target, agent_id=None):
     """검증기가 붙인 mode를 이용하여 숫자형 구버전 명령도 재료 설정으로 치환."""
+    target = object_class(target)
     profile = (
         material_profile(target, agent_id)
         if target in settings.OBJECT_PROFILES else None
@@ -186,6 +190,7 @@ def basket_center_from_perception(state, workspace_frame, max_age_sec, now_sec):
 
 
 def placement_tilt(target, agent_id=None):
+    target = object_class(target)
     if target not in settings.OBJECT_PROFILES:
         return None
     profile = material_profile(target, agent_id)
