@@ -31,6 +31,7 @@ try:
     )
     from .utils import rpy_to_matrix, matrix_to_rpy
     from .ollama_stream import consume_ollama_stream
+    from .object_memory import ObjectMemory, object_class, resolve_object_target
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
@@ -43,6 +44,7 @@ except ImportError:
     )
     from utils import rpy_to_matrix, matrix_to_rpy
     from ollama_stream import consume_ollama_stream
+    from object_memory import ObjectMemory, object_class, resolve_object_target
     from shared_zone import classify_shared_zone_entry, expand_aabb
 
 try:
@@ -83,6 +85,8 @@ class RobotAgentNode(Node):
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
         self.declare_parameter('enable_perception', True)
+        self.declare_parameter('object_match_distance_mm', 60.0)
+        self.declare_parameter('object_memory_retention_sec', 3.0)
         # 예: ['agent1:A|B'] 또는 ['agent1:A', 'agent2:B']
         # 이번 TF 테스트는 robot_1_base 하나로 A/B구역을 모두 검증할 수 있게 기본값을 agent1:A|B로 둡니다.
         self.declare_parameter('agent_specs', ['agent1:A|B'])
@@ -383,6 +387,10 @@ class RobotAgentNode(Node):
         # ==============================================================
 
         self.latest_poses = {}
+        self.object_memory = ObjectMemory(
+            match_distance_mm=float(self.get_parameter('object_match_distance_mm').value),
+            retention_sec=float(self.get_parameter('object_memory_retention_sec').value),
+        )
         self.current_detected_items = []
         self.is_moving = False
         self.task_queue = []
@@ -1458,12 +1466,7 @@ class RobotAgentNode(Node):
 
     @staticmethod
     def find_detected_target(raw_target, poses_dict):
-        target = str(raw_target).strip()
-        if not target:
-            return None
-        if target in poses_dict:
-            return target
-        return next((key for key in poses_dict if target in key or key in target), None)
+        return resolve_object_target(raw_target, poses_dict)
 
     def convert_object_pose(self, reference_pose, assignee_id):
         return self.workspace_object_to_robot_object(
@@ -1654,7 +1657,7 @@ class RobotAgentNode(Node):
                 raise ValueError('실행 Task의 assembly가 Guidebook과 다릅니다.')
             if expected is None:
                 return None
-            if task['target'] != expected['material']:
+            if object_class(task['target']) != expected['material']:
                 raise ValueError('파지 대상과 적층 재료가 다릅니다.')
             if self.guidebook_task_status.get(task_id) in ('SUCCEEDED', 'FAILED'):
                 raise ValueError('이미 종료된 적층 Task입니다.')
@@ -1969,6 +1972,7 @@ class RobotAgentNode(Node):
             if not isinstance(pose, (list, tuple)) or len(pose) < 4:
                 continue
             result[str(name)] = {
+                'class_name': object_class(name),
                 'x_mm': round(float(pose[0]), 1),
                 'y_mm': round(float(pose[1]), 1),
                 'z_mm': round(float(pose[2]), 1),
@@ -2067,7 +2071,7 @@ class RobotAgentNode(Node):
 
         destination = result.get('destination')
         if 'assembly' in task:
-            if target != task['assembly']['material']:
+            if object_class(target) != task['assembly']['material']:
                 raise ValueError('LLM target과 assembly.material이 다릅니다.')
             with self.guidebook_lock:
                 plan_tasks = list(self.guidebook_tasks.values())
@@ -3142,7 +3146,8 @@ class RobotAgentNode(Node):
                 img, depth_img, intrinsics = frames
                 # 앞 모델의 시각화가 다음 모델의 추론 입력에 섞이지 않게 합니다.
                 inference_image = img.copy()
-                current_poses, current_items = {}, []
+                detections, annotations = [], []
+                collect_detections = not self.is_moving
 
                 for model_filename, model in self.models:
                     wanted_class_ids = [
@@ -3156,7 +3161,7 @@ class RobotAgentNode(Node):
                         verbose=False,
                     )
                     for result in results:
-                        if self.is_moving or result.boxes is None:
+                        if not collect_detections or self.is_moving or result.boxes is None:
                             continue
                         masks = result.masks.xy if result.masks is not None else None
                         for index, detected_box in enumerate(result.boxes):
@@ -3177,8 +3182,6 @@ class RobotAgentNode(Node):
                             model_class_name = str(model.names[class_id]).lower()
                             name_ko = name_map_ko.get(model_class_name, model_class_name)
                             name_en = model_class_name.title()
-                            if name_ko not in current_items:
-                                current_items.append(name_ko)
 
                             moments = cv2.moments(mask_np)
                             if moments['m00'] == 0:
@@ -3210,7 +3213,11 @@ class RobotAgentNode(Node):
                             except Exception:
                                 continue
                             yaw = np.arctan2(wy_front - wy, wx_front - wx)
-                            current_poses[name_ko] = (wx, wy, wz, yaw)
+                            pose = (wx, wy, wz, yaw)
+                            if not all(math.isfinite(value) for value in pose):
+                                continue
+                            detections.append((name_ko, pose))
+                            annotations.append((name_en, cx, cy, yaw))
 
                             cv2.drawContours(img, [box], 0, (255, 0, 0), 2)
                             cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
@@ -3218,15 +3225,18 @@ class RobotAgentNode(Node):
                                 img, (cx, cy), (int(front_pt[0]), int(front_pt[1])),
                                 (0, 255, 0), 3, tipLength=0.3
                             )
-                            cv2.putText(
-                                img, f'[{name_en}] WS Yaw:{int(np.degrees(yaw))}',
-                                (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6, (0, 255, 255), 2
-                            )
-
-                if not self.is_moving:
-                    self.latest_poses = current_poses
-                    self.current_detected_items = current_items
+                if collect_detections and not self.is_moving:
+                    current_poses = self.object_memory.update(detections)
+                    with self.perception_lock:
+                        self.latest_poses = current_poses
+                        self.current_detected_items = list(current_poses)
+                    for instance_id, (name_en, cx, cy, yaw) in zip(current_poses, annotations):
+                        number = instance_id.rsplit('_', 1)[1]
+                        cv2.putText(
+                            img, f'[{name_en}_{number}] WS Yaw:{int(np.degrees(yaw))}',
+                            (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 255, 255), 2,
+                        )
                 cv2.imshow(f'{self.agent_id} Pick & Place', img)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break

@@ -3,6 +3,8 @@
     agent_id: agent1
     robot_ip: 192.168.1.218
     enable_perception: true
+    object_match_distance_mm: 60.0   # 같은 종류의 이전 위치와 매칭할 최대 거리(mm)
+    object_memory_retention_sec: 3.0 # 미검출 후 ID를 유지할 시간(초)
 
     # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
     agent_specs: ["agent1:A", "agent2:B"]

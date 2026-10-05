@@ -20,6 +20,7 @@ from cap_robot.material_handling import (
 )
 
 from cap_robot.utils import rpy_to_matrix, matrix_to_rpy, quaternion_xyzw_to_matrix
+from cap_robot.object_memory import object_class, resolve_object_target
 
 
 def perception():
@@ -237,6 +238,7 @@ def load_agent_methods():
     module = ast.fix_missing_locations(ast.Module(body=[original], type_ignores=[]))
     namespace = {
         'math': math, 'time': time,
+        'object_class': object_class, 'resolve_object_target': resolve_object_target,
         'np': np, 'rpy_to_matrix': rpy_to_matrix, 'matrix_to_rpy': matrix_to_rpy,
         'basket_center_from_perception': basket_center_from_perception,
         'placement_tilt': placement_tilt,
@@ -313,6 +315,41 @@ class AgentAssemblyTest(ConfiguredTest):
         # place approach/release/retreat: TF 변환 전에 160/0/160 mm를 더한다.
         self.assertEqual([moves[i].args[0] for i in (3, 4, 5)], [235, 75, 235])
         self.assertEqual([moves[i].args[2] for i in (3, 4, 5)], [-300, -300, -300])
+
+    def test_instance_id_survives_assembly_build_and_execution(self):
+        self.poses = {'바나나_2': (10, 20, 30, 0)}
+        task = json.loads(json.dumps(self.build(), ensure_ascii=False))
+        self.assertEqual(task['target'], '바나나_2')
+        self.assertTrue(self.node.validate_received_task(task))
+        self.assertTrue(self.node.execute_task(task))
+        self.assertEqual([c.args[0] for c in self.node.control_gripper.call_args_list],
+                         [850, 400, 850])
+
+    def test_multiple_instances_require_explicit_candidate_id(self):
+        self.poses = {'바나나_1': (10, 20, 30, 0), '바나나_2': (50, 20, 30, 0)}
+        with self.assertRaises(ValueError):
+            self.build()  # 구버전 target='바나나'는 이제 모호합니다.
+        plan_task = self.node.guidebook_tasks['layer_2']
+        result = dict(can_execute=True, target='바나나_2',
+                      destination={'type': 'basket_stack'}, actions=mode_actions())
+        policy, _ = self.node.validate_guidebook_policy_candidate(result, plan_task, self.poses)
+        policy['generated_policy'][0].update({
+            'mission_id': self.node.current_mission_id,
+            'plan_revision': self.node.current_plan_revision,
+            'guidebook_task_id': 'layer_2',
+        })
+        task = self.node.build_tasks(policy, self.poses)[0]
+        self.assertEqual(task['target'], '바나나_2')
+        self.assertEqual(task['reference_object_pose']['x'], 50)
+
+    def test_instance_uses_material_grip_and_tilt(self):
+        task = self.bread_task()
+        task['target'] = '빵_2'
+        self.assertEqual(material_profile('빵_2'), material_profile('빵'))
+        self.assertEqual(placement_tilt('빵_2'), placement_tilt('빵'))
+        self.assertTrue(self.node.execute_task(task))
+        self.assertEqual(self.node.control_gripper.call_args_list[1].args[0],
+                         settings.OBJECT_PROFILES['빵']['grip_position'])
 
     def test_executing_predecessor_does_not_make_stack_ready(self):
         self.node.guidebook_task_status.update(layer_1='EXECUTING', layer_2='BLOCKED')
