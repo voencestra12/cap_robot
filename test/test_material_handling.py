@@ -231,13 +231,14 @@ def load_agent_methods():
         'workspace_rpy_to_robot', 'move_to_sdk', 'move_to_robot_tf',
         'normalize_angle_rad', 'tf_pose_to_sdk_pose',
         'refresh_guidebook_task_states_locked', 'apply_task_status',
+        'wait_for_assembly_predecessors',
         'find_detected_target', 'normalize_zone', 'resolve_target_destination',
     }
     original.bases = []
     original.body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]
     module = ast.fix_missing_locations(ast.Module(body=[original], type_ignores=[]))
     namespace = {
-        'math': math, 'time': time,
+        'math': math, 'time': time, 'rclpy': SimpleNamespace(ok=lambda: True),
         'object_class': object_class, 'resolve_object_target': resolve_object_target,
         'np': np, 'rpy_to_matrix': rpy_to_matrix, 'matrix_to_rpy': matrix_to_rpy,
         'basket_center_from_perception': basket_center_from_perception,
@@ -265,6 +266,7 @@ class AgentAssemblyTest(ConfiguredTest):
         node.PICK_PLACE_Z_OFFSET_MM = 40
         node.DEFAULT_PNP_ACTIONS = DEFAULT_PNP_ACTIONS
         node.guidebook_lock = threading.Lock()
+        node.step_sync_condition = threading.Condition()
         node.placed_points_lock = threading.Lock()
         node.placed_points = {'A': [], 'B': []}
         node.current_mission_id = 'test_mission'
@@ -351,15 +353,95 @@ class AgentAssemblyTest(ConfiguredTest):
         self.assertEqual(self.node.control_gripper.call_args_list[1].args[0],
                          settings.OBJECT_PROFILES['빵']['grip_position'])
 
-    def test_executing_predecessor_does_not_make_stack_ready(self):
-        self.node.guidebook_task_status.update(layer_1='EXECUTING', layer_2='BLOCKED')
+    def test_executing_predecessor_makes_each_next_stack_ready(self):
+        self.node.guidebook_task_status.update(
+            layer_0='EXECUTING', layer_1='BLOCKED', layer_2='BLOCKED')
         self.node.refresh_guidebook_task_states_locked()
+        self.assertEqual(self.node.guidebook_task_status['layer_1'], 'READY')
         self.assertEqual(self.node.guidebook_task_status['layer_2'], 'BLOCKED')
-        with self.assertRaisesRegex(ValueError, '앞 층'):
-            self.build()
-        self.node.guidebook_task_status['layer_1'] = 'SUCCEEDED'
+        self.node.guidebook_task_status['layer_1'] = 'EXECUTING'
         self.node.refresh_guidebook_task_states_locked()
         self.assertEqual(self.node.guidebook_task_status['layer_2'], 'READY')
+        self.assertTrue(self.node.validate_received_task(self.build()))
+
+    def run_waiting_assembly(self, status, *, replace_revision=False):
+        node = self.node
+        node.guidebook_task_status['layer_1'] = 'EXECUTING'
+        task = self.build()
+        node.task_shared_zone_plan.return_value = {
+            'needed': True, 'reason': 'test', 'acquire_before_api': 'move_to_place',
+        }
+        node._zone_token_held = True
+        node.acquire_zone_token = Mock(return_value=True)
+        node.release_zone_token = Mock()
+        # 실제 Condition.wait 진입 시점을 확인하여 임의 sleep 없이 대기를 검증한다.
+        waiting = threading.Event()
+        original_wait = node.step_sync_condition.wait
+        def observe_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+        node.step_sync_condition.wait = observe_wait
+        results = []
+        worker = threading.Thread(target=lambda: results.append(node.execute_task(task)), daemon=True)
+        with patch.object(time, 'sleep'):
+            worker.start()
+            try:
+                self.assertTrue(waiting.wait(2), 'Pick 이후 Place 대기에 도달하지 못함')
+                self.assertEqual(node.move_to_robot_tf.call_count, 3)
+                self.assertEqual(node.move_to_robot_tf.call_args.args[2], 230)
+                self.assertEqual([c.args[0] for c in node.control_gripper.call_args_list],
+                                 [850, 400])
+                node.acquire_zone_token.assert_not_called()
+                node.return_to_home_joint_pose.assert_not_called()
+                # 이전 revision의 성공과 단순 wakeup으로는 Place가 허용되지 않는다.
+                node.apply_task_status({
+                    'mission_id': 'test_mission', 'plan_revision': 0,
+                    'task_id': 'layer_1', 'status': 'SUCCEEDED', 'agent_id': 'agent2',
+                })
+                with node.step_sync_condition:
+                    waiting.clear()
+                    node.step_sync_condition.notify_all()
+                self.assertTrue(waiting.wait(2))
+                node.acquire_zone_token.assert_not_called()
+                self.assertEqual(node.move_to_robot_tf.call_count, 3)
+                if replace_revision:
+                    with node.guidebook_lock:
+                        node.current_plan_revision += 1
+                    with node.step_sync_condition:
+                        node.step_sync_condition.notify_all()
+                else:
+                    node.apply_task_status({
+                        'mission_id': 'test_mission', 'plan_revision': 1,
+                        'task_id': 'layer_1', 'status': status, 'agent_id': 'agent2',
+                    })
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            finally:
+                with node.guidebook_lock:
+                    node.guidebook_task_status['layer_1'] = 'FAILED'
+                with node.step_sync_condition:
+                    node.step_sync_condition.notify_all()
+                worker.join(2)
+        return results
+
+    def test_pick_lifts_then_waits_before_token_and_place(self):
+        self.assertEqual(self.run_waiting_assembly('SUCCEEDED'), [True])
+        self.node.acquire_zone_token.assert_called_once()
+        self.node.release_zone_token.assert_called_once()
+        self.assertEqual(self.node.move_to_robot_tf.call_count, 6)
+        self.node.return_to_home_joint_pose.assert_called_once()
+
+    def test_failed_predecessor_stops_without_place_release_or_home(self):
+        self.assertEqual(self.run_waiting_assembly('FAILED'), [False])
+        self.assertEqual(self.node.move_to_robot_tf.call_count, 3)
+        self.assertEqual(self.node.control_gripper.call_count, 2)
+        self.node.acquire_zone_token.assert_not_called()
+        self.node.return_to_home_joint_pose.assert_not_called()
+
+    def test_revision_change_cancels_place_wait(self):
+        self.assertEqual(self.run_waiting_assembly('SUCCEEDED', replace_revision=True), [False])
+        self.assertEqual(self.node.move_to_robot_tf.call_count, 3)
+        self.node.acquire_zone_token.assert_not_called()
 
     def test_stale_or_altered_assembly_is_rejected_before_sdk(self):
         for alteration in ('revision', 'assembly', 'target', 'predecessor'):

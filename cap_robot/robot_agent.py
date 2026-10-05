@@ -612,9 +612,8 @@ class RobotAgentNode(Node):
                 continue
             dependencies = task.get('depends_on', [])
             
-            # 적층은 아래층 배치/후퇴까지 성공한 뒤 시작한다.
-            # 기존 비적층 작업의 동시 실행 정책은 유지한다.
-            allowed = ('SUCCEEDED',) if 'assembly' in task else ('SUCCEEDED', 'EXECUTING')
+            # 적층 Pick은 선행 작업 실행 중 허용하고 Place 직전에 완료를 기다린다.
+            allowed = ('SUCCEEDED', 'EXECUTING')
             ready = all(
                 self.guidebook_task_status.get(dep) in allowed
                 for dep in dependencies
@@ -985,6 +984,9 @@ class RobotAgentNode(Node):
             before = dict(self.guidebook_task_status)
             self.refresh_guidebook_task_states_locked()
             after = dict(self.guidebook_task_status)
+
+        with self.step_sync_condition:
+            self.step_sync_condition.notify_all()
 
         self.get_logger().info(
             f'📡 [{self.agent_id}] {task_id} status={status} by {agent_id}'
@@ -1662,16 +1664,53 @@ class RobotAgentNode(Node):
             if self.guidebook_task_status.get(task_id) in ('SUCCEEDED', 'FAILED'):
                 raise ValueError('이미 종료된 적층 Task입니다.')
             if not all(
-                self.guidebook_task_status.get(dep) == 'SUCCEEDED'
+                self.guidebook_task_status.get(dep) in ('SUCCEEDED', 'EXECUTING')
                 for dep in plan_task.get('depends_on', [])
             ):
-                raise ValueError('앞 층의 배치가 아직 성공하지 않았습니다.')
+                raise ValueError('선행 Task가 실행 중이거나 성공한 상태가 아닙니다.')
             tasks = list(self.guidebook_tasks.values())
         if basket_center is None:
             basket_center = self.get_basket_center_workspace()
         return assembly_placement(
             plan_task, tasks, self.agent_id, basket_center=basket_center,
         )
+
+    def wait_for_assembly_predecessors(self, task):
+        """Pick 상승 후 첫 Place 전에 선행 Task 성공을 상태 알림으로 기다립니다."""
+        task_id = task['guidebook_task_id']
+        waiting = False
+        with self.step_sync_condition:
+            while rclpy.ok():
+                with self.guidebook_lock:
+                    if (task.get('mission_id') != self.current_mission_id
+                            or task.get('plan_revision') != self.current_plan_revision):
+                        raise ValueError('적층 대기 중 미션/revision이 변경되었습니다.')
+                    plan_task = self.guidebook_tasks.get(task_id)
+                    if plan_task is None or self.guidebook_task_status.get(task_id) in (
+                        'SUCCEEDED', 'FAILED',
+                    ):
+                        raise ValueError('적층 대기 중 Task가 종료되거나 삭제되었습니다.')
+                    predecessors = {
+                        dep: self.guidebook_task_status.get(dep)
+                        for dep in plan_task.get('depends_on', [])
+                    }
+                if any(status == 'FAILED' for status in predecessors.values()):
+                    raise RuntimeError(f'선행 Task 실패로 Place 중단: {predecessors}')
+                if all(status == 'SUCCEEDED' for status in predecessors.values()):
+                    if waiting:
+                        self.get_logger().info(
+                            f'[{self.agent_id}] {task_id} predecessor 완료 확인'
+                        )
+                    return
+                if not waiting:
+                    self.get_logger().info(
+                        f'[{self.agent_id}] {task_id} Pick 완료 및 상승; '
+                        f'predecessor 완료 대기: {predecessors}'
+                    )
+                    waiting = True
+                # 상태 알림으로 즉시 깨어나고 timeout은 ROS 종료 확인에만 사용한다.
+                self.step_sync_condition.wait(timeout=0.5)
+        raise RuntimeError('적층 대기 중 ROS가 종료되었습니다.')
 
     def refresh_execution_assembly(self, task):
         placement = self.resolve_task_assembly(task)
@@ -2803,11 +2842,16 @@ class RobotAgentNode(Node):
             )
         )
         acquired_here = False
+        assembly_place_ready = False
         try:
             self.arm.clean_error()
             self.arm.set_state(0)
             for index, action in enumerate(task['actions'], start=1):
                 api = action['api']
+
+                if 'assembly' in task and api == 'move_to_place' and not assembly_place_ready:
+                    self.wait_for_assembly_predecessors(task)
+                    assembly_place_ready = True
 
                 # 공용 구역에 처음 들어가는 모션 직전에 토큰을 확보합니다.
                 if (
