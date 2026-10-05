@@ -14,6 +14,31 @@ class LlmApiValidationTest(unittest.TestCase):
         actions = validate_actions(DEFAULT_PNP_ACTIONS, 40.0)
         self.assertEqual(len(actions), len(DEFAULT_PNP_ACTIONS))
 
+    def test_legacy_numeric_pnp_still_infers_modes(self):
+        raw = [{k: v for k, v in action.items() if k != 'mode'}
+               for action in DEFAULT_PNP_ACTIONS]
+        actions = validate_actions(raw, 40.0)
+        self.assertEqual(
+            [a['mode'] for a in actions if a['api'] == 'control_gripper'],
+            ['open', 'grasp', 'release'],
+        )
+
+    def test_wrong_gripper_modes_report_phase_expected_and_actual(self):
+        for index, mode, phase, expected in (
+            (3, 'close', 'AT_PICK', 'grasp'),
+            (7, 'open', 'AT_PLACE', 'release'),
+        ):
+            with self.subTest(index=index, mode=mode):
+                actions = [dict(a) for a in DEFAULT_PNP_ACTIONS]
+                actions[index]['mode'] = mode
+                with self.assertRaises(ValueError) as caught:
+                    validate_actions(actions, 40.0)
+                message = str(caught.exception)
+                self.assertIn(f'actions[{index}]', message)
+                self.assertIn(f'phase={phase}', message)
+                self.assertIn(f'expected_mode={expected!r}', message)
+                self.assertIn(f'actual_mode={mode!r}', message)
+
     def test_default_cooperative_plan_is_valid(self):
         actions = validate_cooperative_actions(DEFAULT_COOPERATIVE_ACTIONS)
         self.assertEqual(len(actions), len(DEFAULT_COOPERATIVE_ACTIONS))

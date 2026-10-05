@@ -53,6 +53,8 @@
      {"api":"control_gripper","mode":"open"}
      {"api":"control_gripper","mode":"grasp"}
      {"api":"control_gripper","mode":"release"}
+   - mode는 위 소문자 문자열만 허용한다. 시작 시 열기는 "open", 물체 잡기는 "grasp", 배치 위치에서 놓기는 "release"다.
+   - "close"는 허용하지 않는다. 놓기도 손가락을 여는 동작이지만 mode="open"이 아니라 반드시 mode="release"를 사용한다.
    - 재료의 실제 position은 실행 코드가 설정 파일에서 가져온다. position을 추측하지 않는다.
    - 위 mode 형식은 일반 single_agent PnP에만 적용한다. 바구니 양팔 협동 actions는 기존 숫자형을 유지한다.
 
@@ -80,14 +82,14 @@
    - speed 범위: 10~80
 
 현재 validator가 허용하는 Pick-and-Place 상태 순서:
-1. gripper open
+1. control_gripper: mode="open" (시작 시 열기)
 2. move_to_object: 높은 접근 위치(z_offset 150 이상)
 3. move_to_object: 실제 pick 위치(z_offset 정확히 $pick_place_z_offset_mm)
-4. gripper close
+4. control_gripper: mode="grasp" (물체 잡기)
 5. move_to_object: lift(z_offset 150 이상)
 6. move_to_place: 높은 접근 위치(z_offset 150 이상)
 7. move_to_place: 실제 place 위치(z_offset 정확히 $pick_place_z_offset_mm)
-8. gripper open
+8. control_gripper: mode="release" (배치 위치에서 놓기)
 9. move_to_place: retreat(z_offset 150 이상)
 
 현재 validator가 허용하는 협동(Cooperative) 작업 상태 순서 (대상 물체가 '바구니' 등 양팔 파지일 경우):
@@ -109,6 +111,7 @@ wait는 필요한 위치에 0~2초 범위에서 추가할 수 있다.
 API 순서와 speed/높이 값은 Task에 맞게 결정하되 위 validator 규칙을 반드시 만족해야 한다.
 
 검증된 기본 PnP 예시:
+아래 기본값은 일반 물체용 position을 포함한다. 등록된 재료는 mode를 유지하고 position을 생략한다.
 $default_pnp_actions
 
 적층 Task 특별 규칙 (아래 일반 destination 규칙보다 우선):
@@ -177,8 +180,9 @@ destination 선택 예:
 {"can_execute": false, "reason": "실행할 수 없는 이유와 필요한 정보"}
 
 실행 가능한 경우 출력 템플릿:
-아래 숫자형 그리퍼 예시는 기존 호환 형식이다. 빵/양상추/바나나/햄에는 세 그리퍼 동작을 각각
-mode="open", mode="grasp", mode="release"로 바꾸고 position을 생략한다.
+아래는 등록된 재료용 mode 형식의 예시다. 세 그리퍼 동작은 반드시
+mode="open", mode="grasp", mode="release" 순서이며 position을 생략한다.
+일반 물체의 숫자형 명령은 앞서 정의한 position 규칙을 따른다.
 assembly Task의 destination은 위 basket_stack 표시로 바꾼다.
 ```json
 {
@@ -193,14 +197,14 @@ assembly Task의 destination은 위 basket_stack 표시로 바꾼다.
     "yaw_deg": 0.0
   },
   "actions": [
-    {"api":"control_gripper", "position": 850},
+    {"api":"control_gripper", "mode": "open"},
     {"api":"move_to_object", "z_offset": 200, "speed": 100},
     {"api":"move_to_object", "z_offset": 40, "speed": 80},
-    {"api":"control_gripper", "position": 100},
+    {"api":"control_gripper", "mode": "grasp"},
     {"api":"move_to_object", "z_offset": 200, "speed": 100},
     {"api":"move_to_place", "z_offset": 200, "speed": 100},
     {"api":"move_to_place", "z_offset": 40, "speed": 100},
-    {"api":"control_gripper", "position": 850},
+    {"api":"control_gripper", "mode": "release"},
     {"api":"move_to_place", "z_offset": 200, "speed": 100}
   ]
 }

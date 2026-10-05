@@ -12,7 +12,7 @@ OBJECT_PROFILES = {
         "grip_position": 150.0,
         "thickness_mm": 20.0,
         # 기울인 배치 자세에서 실측할 TCP 높이 보정값.
-        "place_tcp_offset_mm": 100.0,
+        "place_tcp_offset_mm": 90.0,
         "place_roll_offset_deg": -30.0,
         "place_pitch_offset_deg": 0.0,
         "place_tilt_speed": 75.0,

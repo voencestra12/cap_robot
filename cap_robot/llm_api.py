@@ -67,14 +67,14 @@ DEFAULT_COOPERATIVE_ACTIONS = [
 ]
 
 DEFAULT_PNP_ACTIONS = [
-    {"api": API_CONTROL_GRIPPER, "position": 850},
+    {"api": API_CONTROL_GRIPPER, "mode": "open", "position": 850},
     {"api": API_MOVE_TO_OBJECT, "z_offset": 200, "speed": 100},
     {"api": API_MOVE_TO_OBJECT, "z_offset": 40, "speed": 80},
-    {"api": API_CONTROL_GRIPPER, "position": 300},
+    {"api": API_CONTROL_GRIPPER, "mode": "grasp", "position": 300},
     {"api": API_MOVE_TO_OBJECT, "z_offset": 200, "speed": 100},
     {"api": API_MOVE_TO_PLACE, "z_offset": 200, "speed": 100},
     {"api": API_MOVE_TO_PLACE, "z_offset": 40, "speed": 90},
-    {"api": API_CONTROL_GRIPPER, "position": 850},
+    {"api": API_CONTROL_GRIPPER, "mode": "release", "position": 850},
     {"api": API_MOVE_TO_PLACE, "z_offset": 200, "speed": 100},
 ]
 
@@ -110,7 +110,10 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
                 'AT_PLACE': ('release', 'RELEASED'),
             }.get(phase)
             if expected is None:
-                raise ValueError(f'actions[{index}] 그리퍼 순서가 올바르지 않습니다.')
+                raise ValueError(
+                    f'actions[{index}] 그리퍼 순서가 올바르지 않습니다: '
+                    f'phase={phase}, expected=그리퍼 동작 불가, actual_mode={mode!r}'
+                )
             if mode is None:
                 # 기존 숫자형 명령도 상태에 맞는 mode를 부여한다.
                 if position is None or (
@@ -119,7 +122,10 @@ def validate_actions(raw_actions, pick_place_z_offset_mm):
                     raise ValueError(f'actions[{index}] 그리퍼 위치/순서가 올바르지 않습니다.')
                 mode = expected[0]
             if mode != expected[0]:
-                raise ValueError(f'actions[{index}] 그리퍼 mode/순서가 올바르지 않습니다.')
+                raise ValueError(
+                    f'actions[{index}] 그리퍼 mode/순서가 올바르지 않습니다: '
+                    f'phase={phase}, expected_mode={expected[0]!r}, actual_mode={mode!r}'
+                )
             if mode != 'grasp' and position is not None and position < 700:
                 raise ValueError('열기/해제 position은 700 이상이어야 합니다.')
             phase = expected[1]
