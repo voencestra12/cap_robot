@@ -1,4 +1,3 @@
-from collections import deque
 import time
 
 import cv2
@@ -14,76 +13,7 @@ from scipy.spatial.transform import Rotation as R
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 
-class StaticPoseEstimator:
-    def __init__(self, min_samples=30, min_duration_sec=1.0,
-                 translation_tolerance_m=0.01, rotation_tolerance_deg=3.0,
-                 max_age_sec=5.0):
-        values = [min_duration_sec, translation_tolerance_m,
-                  rotation_tolerance_deg, max_age_sec]
-        if (min_samples < 3 or not np.all(np.isfinite(values))
-                or min(values) <= 0 or max_age_sec < min_duration_sec
-                or rotation_tolerance_deg >= 180):
-            raise ValueError('Invalid static calibration sample limits')
-        self.min_samples = int(min_samples)
-        self.min_duration_ns = int(min_duration_sec * 1e9)
-        self.translation_tolerance_m = translation_tolerance_m
-        self.rotation_tolerance_rad = np.deg2rad(rotation_tolerance_deg)
-        self.max_age_ns = int(max_age_sec * 1e9)
-        self.samples = deque(maxlen=3 * self.min_samples)
-        self.last_stamp_ns = None
-
-    def add(self, stamp_ns, translation, rotvec):
-        """Return (translation, xyzw quaternion) only with sufficient consensus.
-
-        Duplicate/out-of-order images cannot inflate the sample count. A bounded
-        time window lets a bad early observation expire instead of poisoning a
-        calibration forever. Rotation distances and means are on SO(3).
-        """
-        translation = np.asarray(translation, dtype=float).reshape(3)
-        rotvec = np.asarray(rotvec, dtype=float).reshape(3)
-        if not np.all(np.isfinite(np.r_[translation, rotvec])):
-            return None
-        if self.last_stamp_ns is not None and stamp_ns <= self.last_stamp_ns:
-            return None
-        self.last_stamp_ns = stamp_ns
-        self.samples.append((stamp_ns, translation.copy(), R.from_rotvec(rotvec)))
-        while self.samples and stamp_ns - self.samples[0][0] > self.max_age_ns:
-            self.samples.popleft()
-        if len(self.samples) < self.min_samples:
-            return None
-
-        stamps, translations, rotations = zip(*self.samples)
-        translations = np.asarray(translations)
-        quaternions = np.asarray([r.as_quat() for r in rotations])
-        # Quaternion sign is immaterial: q and -q describe the same rotation.
-        angles = 2 * np.arccos(np.clip(np.abs(quaternions @ quaternions.T), 0, 1))
-        distances = np.linalg.norm(translations[:, None] - translations[None, :], axis=2)
-        neighbors = ((distances <= self.translation_tolerance_m)
-                     & (angles <= self.rotation_tolerance_rad))
-        inliers = neighbors[np.argmax(neighbors.sum(axis=1))]
-        required = max(self.min_samples, int(np.ceil(0.8 * len(self.samples))))
-        if np.count_nonzero(inliers) < required:
-            return None
-
-        center = translations[inliers].mean(axis=0)
-        rotation = R.from_quat(quaternions[inliers]).mean()
-        # Check support around the final mean, not only around the chosen sample.
-        inliers &= (np.linalg.norm(translations - center, axis=1)
-                    <= self.translation_tolerance_m)
-        inliers &= ((rotation.inv() * R.from_quat(quaternions)).magnitude()
-                    <= self.rotation_tolerance_rad)
-        if np.count_nonzero(inliers) < required:
-            return None
-        accepted_stamps = np.asarray(stamps)[inliers]
-        if accepted_stamps[-1] - accepted_stamps[0] < self.min_duration_ns:
-            return None
-        return (translations[inliers].mean(axis=0),
-                R.from_quat(quaternions[inliers]).mean().as_quat())
-
-
 class ArucoCalibNode(Node):
-    STATIC_CAMERA_CHILDREN = ('workspace_0', 'marker_1', 'marker_12')
-
     def __init__(self):
         super().__init__('aruco_calib')
 
@@ -93,12 +23,6 @@ class ArucoCalibNode(Node):
         self.declare_parameter('marker_size_m', 0.05)
         self.declare_parameter('target_debug_log_period_sec', 2.0)
         self.declare_parameter('show_window', False)
-        self.declare_parameter('calibration_min_samples', 30)
-        self.declare_parameter('calibration_min_duration_sec', 1.0)
-        self.declare_parameter('calibration_max_age_sec', 5.0)
-        self.declare_parameter('calibration_translation_tolerance_m', 0.01)
-        self.declare_parameter('calibration_rotation_tolerance_deg', 3.0)
-        self.declare_parameter('calibration_max_reprojection_error_px', 2.0)
         self.declare_parameter(
             'offset_1',
             [-0.195949, 0.004359, 0.026819, 0.020803, 0.005481, 0.696245, 0.717482],
@@ -130,24 +54,8 @@ class ArucoCalibNode(Node):
         self.show_window = bool(self.get_parameter('show_window').value)
         self._last_warn_time = {}
         self._last_detected_ids_log_time = 0.0
-        self._calibration_frame = None
-        self._static_camera_poses = {}
-        self._static_camera_published = False
-        self._pose_estimators = {
-            child: StaticPoseEstimator(
-                min_samples=int(self.get_parameter('calibration_min_samples').value),
-                min_duration_sec=float(self.get_parameter('calibration_min_duration_sec').value),
-                max_age_sec=float(self.get_parameter('calibration_max_age_sec').value),
-                translation_tolerance_m=float(
-                    self.get_parameter('calibration_translation_tolerance_m').value),
-                rotation_tolerance_deg=float(
-                    self.get_parameter('calibration_rotation_tolerance_deg').value),
-            ) for child in self.STATIC_CAMERA_CHILDREN
-        }
-        self.max_reprojection_error_px = float(
-            self.get_parameter('calibration_max_reprojection_error_px').value)
-        if not np.isfinite(self.max_reprojection_error_px) or self.max_reprojection_error_px <= 0:
-            raise ValueError('calibration_max_reprojection_error_px must be positive and finite')
+        self._workspace_rvec = None
+        self._workspace_tvec = None
 
         self.dist = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
         self.mtx = np.array([
@@ -177,8 +85,9 @@ class ArucoCalibNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
-        # marker -> robot_base는 시작 시 송신하고, 카메라 TF 확정 시 함께 재송신한다.
-        # camera -> marker도 관측 누적 후 static으로 연결한다. 부모 관계는 유지한다.
+        # marker -> robot_base는 고정 캘리브레이션이므로 /tf_static으로 1회 송신한다.
+        # camera -> marker는 매 프레임 동적으로 송신하므로, 이 static transform과 연결되어
+        # camera -> marker_1 -> robot_1_base 체인이 만들어진다.
         self.publish_static_robot_base_offsets()
 
         self.detector = aruco.ArucoDetector(
@@ -297,34 +206,14 @@ class ArucoCalibNode(Node):
             self.make_robot_base_transform('marker_1', 'robot_1_base', self.OFFSET_1, stamp),
             self.make_robot_base_transform('marker_12', 'robot_2_base', self.OFFSET_2, stamp),
         ]
-        # Humble의 broadcaster는 마지막 메시지만 유지한다. 매번 전체 static
-        # 묶음을 보내 늦게 접속한 listener도 marker -> base를 받을 수 있게 한다.
-        for child, (translation, quaternion) in self._static_camera_poses.items():
-            transforms.append(self.make_transform(
-                self._calibration_frame, child, translation, None, stamp, quaternion))
         self.static_tf_broadcaster.sendTransform(transforms)
         self.get_logger().info(
             '📌 static TF 송신 완료: marker_1 -> robot_1_base, marker_12 -> robot_2_base'
         )
 
     def camera_info_callback(self, msg):
-        mtx = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-        dist = np.array(msg.d, dtype=np.float64)
-        if (not np.all(np.isfinite(mtx)) or not np.all(np.isfinite(dist))
-                or mtx[0, 0] <= 0 or mtx[1, 1] <= 0):
-            self.camera_info_received = False
-            self.warn_throttled('camera_info', '유효한 CameraInfo 대기 중')
-            return
-        if self._calibration_frame is not None and (
-            (msg.header.frame_id and msg.header.frame_id != self._calibration_frame)
-            or not np.array_equal(mtx, self.mtx)
-            or not np.array_equal(dist if dist.size else np.zeros(5), self.dist)
-        ):
-            self.camera_info_received = False
-            self.warn_throttled('camera_changed', 'CameraInfo 변경: aruco_calib 재시작 필요')
-            return
-        self.mtx = mtx
-        self.dist = dist
+        self.mtx = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        self.dist = np.array(msg.d, dtype=np.float64)
         if self.dist.size == 0:
             self.dist = np.zeros(5, dtype=np.float64)
         if msg.header.frame_id:
@@ -338,20 +227,24 @@ class ArucoCalibNode(Node):
         self.camera_info_received = True
 
     def image_callback(self, msg):
-        if not self.camera_info_received:
-            self.warn_throttled('camera_info', '캘리브레이션용 CameraInfo 수신 대기 중')
-            return
-        parent_frame = msg.header.frame_id or self.camera_frame
-        if parent_frame != self.camera_frame:
-            self.warn_throttled('image_frame', 'Image와 CameraInfo의 frame_id 불일치')
-            return
-        if self._calibration_frame is None:
-            self._calibration_frame = parent_frame
         try:
             color_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as error:
             self.get_logger().error(f'이미지 변환 실패: {error}')
             return
+
+        parent_frame = msg.header.frame_id or self.camera_frame
+        if parent_frame:
+            self.camera_frame = parent_frame
+
+        if self._workspace_rvec is not None:
+            self.broadcast_tf(
+                self.camera_frame,
+                'workspace_0',
+                self._workspace_tvec.flatten(),
+                self._workspace_rvec.flatten(),
+                msg.header.stamp,
+            )
 
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY))
 
@@ -366,18 +259,7 @@ class ArucoCalibNode(Node):
             rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
                 corners, self.marker_size_m, self.mtx, self.dist
             )
-            half = self.marker_size_m / 2
-            marker_points = np.array([
-                [-half, half, 0], [half, half, 0],
-                [half, -half, 0], [-half, -half, 0],
-            ], dtype=np.float32)
             for i, m_id in enumerate(ids.flatten()):
-                child = f'marker_{int(m_id)}'
-                if child in self.STATIC_CAMERA_CHILDREN:
-                    self.observe_static_pose(
-                        child, marker_points, corners[i][0],
-                        tvecs[i].reshape(3), rvecs[i].reshape(3), msg.header.stamp)
-                    continue
                 self.broadcast_tf(
                     self.camera_frame,
                     f'marker_{int(m_id)}',
@@ -410,7 +292,7 @@ class ArucoCalibNode(Node):
 
             if (
                 len(object_points) >= 4
-                and 'workspace_0' not in self._static_camera_poses
+                and self._workspace_rvec is None
                 and len(set(detected_ids).intersection(self.MARKER_OFFSETS_MM)) >= 4
             ):
                 success, rvec, tvec = cv2.solvePnP(
@@ -420,53 +302,30 @@ class ArucoCalibNode(Node):
                     self.dist,
                 )
                 if success:
-                    self.observe_static_pose(
-                        'workspace_0', object_points, image_points,
-                        tvec.flatten(), rvec.flatten(), msg.header.stamp)
-            elif len(matched_pts) < 4 and 'workspace_0' not in self._static_camera_poses:
+                    self._workspace_rvec = rvec.copy()
+                    self._workspace_tvec = tvec.copy()
+                    self.get_logger().info(
+                        f'workspace_0 locked: marker_ids={sorted(set(detected_ids).intersection(self.MARKER_OFFSETS_MM))}'
+                    )
+                    self.broadcast_tf(
+                        self.camera_frame,
+                        'workspace_0',
+                        tvec.flatten(),
+                        rvec.flatten(),
+                        msg.header.stamp,
+                    )
+            elif len(object_points) < 4:
                 self.warn_throttled(
                     'workspace_markers',
                     f'workspace_0 계산용 대응점 부족: matched_marker_count={len(matched_pts)}, '
-                    f'corner_count={len(object_points)} (필요: 작업대 마커 4개 이상, 현재 ids={detected_ids})'
+                    f'corner_count={len(object_points)} (필요: 4개 이상 corner, 현재 ids={detected_ids})'
                 )
-
-        if not self._static_camera_published:
-            pending = [child for child in self.STATIC_CAMERA_CHILDREN
-                       if child not in self._static_camera_poses]
-            self.warn_throttled('calibration_pending', f'static TF 관측 수집 중: {pending}')
 
         if self.show_window:
             cv2.imshow('ArUco calibration', color_image)
             cv2.waitKey(1)
 
-    def observe_static_pose(self, child, object_points, image_points, tvec, rvec, stamp):
-        if child in self._static_camera_poses:
-            return
-        if not np.all(np.isfinite(np.r_[tvec, rvec])):
-            return
-        # Reject poses behind the camera and poor fits before temporal consensus.
-        camera_points = R.from_rotvec(rvec).apply(object_points) + tvec
-        if np.any(camera_points[:, 2] <= 0):
-            return
-        projected, _ = cv2.projectPoints(object_points, rvec, tvec, self.mtx, self.dist)
-        residuals = projected.reshape(-1, 2) - np.asarray(image_points).reshape(-1, 2)
-        error_px = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
-        if not np.isfinite(error_px) or error_px > self.max_reprojection_error_px:
-            return
-        pose = self._pose_estimators[child].add(
-            int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec), tvec, rvec)
-        if pose is None:
-            return
-        self._static_camera_poses[child] = pose
-        self.get_logger().info(f'{child}: 안정적인 다중 프레임 추정 완료')
-        if len(self._static_camera_poses) == len(self.STATIC_CAMERA_CHILDREN):
-            self.publish_static_robot_base_offsets()
-            self._static_camera_published = True
-            self.get_logger().info(
-                'static TF 확정: camera -> workspace_0, marker_1, marker_12 '
-                '(재캘리브레이션: aruco_calib 노드 재시작)')
-
-    def make_transform(self, parent, child, tvec, rvec, stamp, quat=None):
+    def broadcast_tf(self, parent, child, tvec, rvec, stamp, quat=None):
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = parent
@@ -485,14 +344,7 @@ class ArucoCalibNode(Node):
         t.transform.rotation.y = float(q[1])
         t.transform.rotation.z = float(q[2])
         t.transform.rotation.w = float(q[3])
-        return t
-
-    def broadcast_tf(self, parent, child, tvec, rvec, stamp, quat=None):
-        if child in self.STATIC_CAMERA_CHILDREN:
-            raise ValueError(f'{child} must only be published on /tf_static')
-        self.tf_broadcaster.sendTransform(
-            self.make_transform(parent, child, tvec, rvec, stamp, quat))
-
+        self.tf_broadcaster.sendTransform(t)
 
 def main(args=None):
     rclpy.init(args=args)
