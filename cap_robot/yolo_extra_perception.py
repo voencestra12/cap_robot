@@ -13,6 +13,7 @@ import time
 from collections import deque
 
 import cv2
+import message_filters
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -55,6 +56,8 @@ class YoloExtraPerception(Node):
         self.declare_parameter('depth_window_radius_px', 2)
         self.declare_parameter('smoothing_window', 5)
         self.declare_parameter('maximum_frame_age_sec', 0.5)
+        self.declare_parameter('sync_queue_size', 10)
+        self.declare_parameter('sync_slop_sec', 0.05)
         self.declare_parameter('tf_lookup_timeout_sec', 0.3)
         self.declare_parameter('show_window', False)
         self.declare_parameter('sdk_x_min', 50.0)
@@ -74,6 +77,8 @@ class YoloExtraPerception(Node):
         self.maximum_frame_age_sec = float(
             self.get_parameter('maximum_frame_age_sec').value
         )
+        self.sync_queue_size = int(self.get_parameter('sync_queue_size').value)
+        self.sync_slop_sec = float(self.get_parameter('sync_slop_sec').value)
         self.tf_timeout = Duration(
             seconds=float(self.get_parameter('tf_lookup_timeout_sec').value)
         )
@@ -104,8 +109,8 @@ class YoloExtraPerception(Node):
         self._last_positions = None
         self._last_valid_red_points = None
         self._last_valid_red_points_stamp = None
+        # 기존 depth median 로직에는 현재 동기화 pair의 Depth만 전달한다.
         self._last_depth = None
-        self._last_depth_stamp_sec = 0.0
         self._intrinsics = None
         self._bridge = CvBridge()
         self._tf_buffer = Buffer(cache_time=Duration(seconds=30.0))
@@ -117,8 +122,18 @@ class YoloExtraPerception(Node):
             depth=5,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
-        self.create_subscription(Image, self.color_topic, self._color_callback, sensor_qos)
-        self.create_subscription(Image, self.depth_topic, self._depth_callback, sensor_qos)
+        self._color_sub = message_filters.Subscriber(
+            self, Image, self.color_topic, qos_profile=sensor_qos,
+        )
+        self._depth_sub = message_filters.Subscriber(
+            self, Image, self.depth_topic, qos_profile=sensor_qos,
+        )
+        self._image_sync = message_filters.ApproximateTimeSynchronizer(
+            [self._color_sub, self._depth_sub],
+            queue_size=self.sync_queue_size,
+            slop=self.sync_slop_sec,
+        )
+        self._image_sync.registerCallback(self._synchronized_callback)
         self.create_subscription(
             CameraInfo,
             self.camera_info_topic,
@@ -176,16 +191,6 @@ class YoloExtraPerception(Node):
             'cy': float(msg.k[5]),
             'frame_id': msg.header.frame_id,
         }
-
-    def _depth_callback(self, msg):
-        try:
-            self._last_depth = self._bridge.imgmsg_to_cv2(
-                msg,
-                desired_encoding='passthrough',
-            ).copy()
-            self._last_depth_stamp_sec = self._stamp_sec(msg.header.stamp)
-        except Exception as error:
-            self._warn_throttled('depth_decode', f'Depth 이미지 변환 실패: {error}')
 
     def _median_depth_m(self, u, v):
         if self._last_depth is None:
@@ -413,16 +418,28 @@ class YoloExtraPerception(Node):
         msg.data = json.dumps(payload, ensure_ascii=False)
         self._state_pub.publish(msg)
 
-    def _color_callback(self, msg):
-        if self._last_depth is None or self._intrinsics is None:
-            self._publish_invalid(msg.header.stamp, 'depth 또는 CameraInfo 대기 중')
-            return
-        color_stamp = self._stamp_sec(msg.header.stamp)
-        if abs(color_stamp - self._last_depth_stamp_sec) > self.maximum_frame_age_sec:
-            self._publish_invalid(msg.header.stamp, 'color/depth 시간 차 초과')
+    def _synchronized_callback(self, msg, depth_msg):
+        try:
+            self._last_depth = self._bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding='passthrough',
+            ).copy()
+        except Exception as error:
+            self._last_depth = None
+            self._warn_throttled('depth_decode', f'Depth 이미지 변환 실패: {error}')
+            self._publish_invalid(msg.header.stamp, str(error))
             return
         try:
             color = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            color_stamp = self._stamp_sec(msg.header.stamp)
+            depth_stamp = self._stamp_sec(depth_msg.header.stamp)
+            if abs(color_stamp - depth_stamp) > min(
+                self.sync_slop_sec, self.maximum_frame_age_sec,
+            ):
+                self._publish_invalid(msg.header.stamp, 'color/depth 시간 차 초과')
+                return
+            if self._intrinsics is None:
+                self._publish_invalid(msg.header.stamp, 'depth 또는 CameraInfo 대기 중')
+                return
             camera_frame = msg.header.frame_id or self._intrinsics['frame_id']
             candidates, mask = self._detect_candidates(color, camera_frame, msg.header.stamp)
             handles = self._stabilize(candidates)
