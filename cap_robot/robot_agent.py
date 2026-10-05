@@ -1386,8 +1386,8 @@ class RobotAgentNode(Node):
         """robot_N_base TF 좌표를 xArm SDK command 좌표로 변환한 뒤 이동한다."""
         
         # [수정된 부분] agent2일 경우에만 Z축을 40mm(4cm) 더 내리도록 보정합니다.
-        if self.agent_id == 'agent2':
-            z = float(z) - 50.0
+        #if self.agent_id == 'agent2':
+            #z = float(z) - 50.0
 
         cmd = self.tf_pose_to_sdk_pose(x, y, z, yaw=yaw, agent_id=self.agent_id)
         self.get_logger().info(

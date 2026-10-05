@@ -50,7 +50,7 @@
     task_claim_topic: /mission/task_claim
     task_status_topic: /mission/task_status
     extra_perception_topic: /perception/yolo_extra
-    extra_perception_max_age_sec: 2.0
+    extra_perception_max_age_sec: 5.0
     cooperative_review_timeout_sec: 60.0
     step_sync_timeout_sec: 30.0
     step_start_delay_sec: 0.25
