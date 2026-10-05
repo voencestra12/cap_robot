@@ -20,7 +20,7 @@ OBJECT_PROFILES = {
     "양상추": {
         "grip_position": 400.0,
         "thickness_mm": 0.0,
-        "place_tcp_offset_mm": 0.0,
+        "place_tcp_offset_mm": 50.0,
     },
     "햄": {
         "grip_position": 30.0,
