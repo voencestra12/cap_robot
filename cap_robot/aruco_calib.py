@@ -43,6 +43,16 @@ class ArucoCalibNode(Node):
                 0.0, 350.0, 0.0,
             ],
         )
+        # 노드 실행 중에는 카메라가 고정이라는 전제로, 아래 프레임들은 시작 시 N프레임을 모아
+        # robust 평균을 낸 뒤 lock하고 /tf_static으로만 송신한다. (위치를 바꾸면 노드 재시작)
+        self.declare_parameter('lock_marker_ids', [1, 12])
+        self.declare_parameter('lock_sample_count', 30)
+        self.declare_parameter('lock_outlier_translation_m', 0.01)
+        self.declare_parameter('lock_outlier_rotation_deg', 5.0)
+        # lock 이후 실시간 추정이 lock 값과 계속 다르면 카메라 이동을 의심해 경고만 한다.
+        self.declare_parameter('drift_warn_translation_m', 0.01)
+        self.declare_parameter('drift_warn_rotation_deg', 2.0)
+        self.declare_parameter('drift_warn_frames', 15)
 
         self.image_topic = str(self.get_parameter('image_topic').value).strip()
         self.camera_info_topic = str(self.get_parameter('camera_info_topic').value).strip()
@@ -54,8 +64,29 @@ class ArucoCalibNode(Node):
         self.show_window = bool(self.get_parameter('show_window').value)
         self._last_warn_time = {}
         self._last_detected_ids_log_time = 0.0
-        self._workspace_rvec = None
-        self._workspace_tvec = None
+
+        self.lock_marker_ids = {int(value) for value in self.get_parameter('lock_marker_ids').value}
+        self.lock_sample_count = max(5, int(self.get_parameter('lock_sample_count').value))
+        self.lock_outlier_translation_m = float(
+            self.get_parameter('lock_outlier_translation_m').value
+        )
+        self.lock_outlier_rotation_rad = np.deg2rad(
+            float(self.get_parameter('lock_outlier_rotation_deg').value)
+        )
+        self.drift_warn_translation_m = float(self.get_parameter('drift_warn_translation_m').value)
+        self.drift_warn_rotation_rad = np.deg2rad(
+            float(self.get_parameter('drift_warn_rotation_deg').value)
+        )
+        self.drift_warn_frames = max(1, int(self.get_parameter('drift_warn_frames').value))
+        self.lock_frames = {f'marker_{marker_id}' for marker_id in self.lock_marker_ids}
+        self.lock_frames.add('workspace_0')
+        self._lock_samples = {frame: [] for frame in self.lock_frames}
+        # frame -> (tvec, quat_xyzw)
+        self._locked_poses = {}
+        self._drift_counts = {frame: 0 for frame in self.lock_frames}
+        # child_frame -> TransformStamped. /tf_static은 depth=1 latched라서
+        # 마지막 메시지만 늦게 뜬 노드에 전달되므로, 항상 전체 목록을 한 번에 보낸다.
+        self._static_transforms = {}
 
         self.dist = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
         self.mtx = np.array([
@@ -85,9 +116,11 @@ class ArucoCalibNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
-        # marker -> robot_base는 고정 캘리브레이션이므로 /tf_static으로 1회 송신한다.
-        # camera -> marker는 매 프레임 동적으로 송신하므로, 이 static transform과 연결되어
-        # camera -> marker_1 -> robot_1_base 체인이 만들어진다.
+        # marker -> robot_base는 고정 캘리브레이션이므로 /tf_static으로 송신한다.
+        # camera -> marker_1/marker_12/workspace_0도 lock 후 /tf_static으로만 송신해
+        # camera -> marker_1 -> robot_1_base 체인 전체가 static이 된다.
+        # 주의: lock 대상 프레임을 /tf(동적)로 한 번이라도 보내면 수신 측 tf2 버퍼가 그 프레임을
+        # 동적 캐시로 잡아버려, 이후 static 값이 cache_time(10s) 뒤 만료되며 체인이 끊긴다.
         self.publish_static_robot_base_offsets()
 
         self.detector = aruco.ArucoDetector(
@@ -202,14 +235,19 @@ class ArucoCalibNode(Node):
 
     def publish_static_robot_base_offsets(self):
         stamp = self.get_clock().now().to_msg()
-        transforms = [
+        for transform in (
             self.make_robot_base_transform('marker_1', 'robot_1_base', self.OFFSET_1, stamp),
             self.make_robot_base_transform('marker_12', 'robot_2_base', self.OFFSET_2, stamp),
-        ]
-        self.static_tf_broadcaster.sendTransform(transforms)
+        ):
+            self._static_transforms[transform.child_frame_id] = transform
+        self.send_static_transforms()
         self.get_logger().info(
             '📌 static TF 송신 완료: marker_1 -> robot_1_base, marker_12 -> robot_2_base'
         )
+
+    def send_static_transforms(self):
+        # 이전에 보낸 static TF까지 항상 함께 보내야 late subscriber가 전체 트리를 받는다.
+        self.static_tf_broadcaster.sendTransform(list(self._static_transforms.values()))
 
     def camera_info_callback(self, msg):
         self.mtx = np.array(msg.k, dtype=np.float64).reshape(3, 3)
@@ -237,15 +275,6 @@ class ArucoCalibNode(Node):
         if parent_frame:
             self.camera_frame = parent_frame
 
-        if self._workspace_rvec is not None:
-            self.broadcast_tf(
-                self.camera_frame,
-                'workspace_0',
-                self._workspace_tvec.flatten(),
-                self._workspace_rvec.flatten(),
-                msg.header.stamp,
-            )
-
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY))
 
         if ids is not None:
@@ -260,9 +289,14 @@ class ArucoCalibNode(Node):
                 corners, self.marker_size_m, self.mtx, self.dist
             )
             for i, m_id in enumerate(ids.flatten()):
+                marker_frame = f'marker_{int(m_id)}'
+                if marker_frame in self.lock_frames:
+                    # lock 대상은 절대 /tf로 보내지 않는다 (static과 섞이면 체인이 끊김).
+                    self.handle_lock_sample(marker_frame, tvecs[i].reshape(3), rvecs[i].reshape(3))
+                    continue
                 self.broadcast_tf(
                     self.camera_frame,
-                    f'marker_{int(m_id)}',
+                    marker_frame,
                     tvecs[i].reshape(3),
                     rvecs[i].reshape(3),
                     msg.header.stamp,
@@ -292,7 +326,6 @@ class ArucoCalibNode(Node):
 
             if (
                 len(object_points) >= 4
-                and self._workspace_rvec is None
                 and len(set(detected_ids).intersection(self.MARKER_OFFSETS_MM)) >= 4
             ):
                 success, rvec, tvec = cv2.solvePnP(
@@ -302,19 +335,8 @@ class ArucoCalibNode(Node):
                     self.dist,
                 )
                 if success:
-                    self._workspace_rvec = rvec.copy()
-                    self._workspace_tvec = tvec.copy()
-                    self.get_logger().info(
-                        f'workspace_0 locked: marker_ids={sorted(set(detected_ids).intersection(self.MARKER_OFFSETS_MM))}'
-                    )
-                    self.broadcast_tf(
-                        self.camera_frame,
-                        'workspace_0',
-                        tvec.flatten(),
-                        rvec.flatten(),
-                        msg.header.stamp,
-                    )
-            elif len(object_points) < 4:
+                    self.handle_lock_sample('workspace_0', tvec.reshape(3), rvec.reshape(3))
+            elif len(object_points) < 4 and 'workspace_0' not in self._locked_poses:
                 self.warn_throttled(
                     'workspace_markers',
                     f'workspace_0 계산용 대응점 부족: matched_marker_count={len(matched_pts)}, '
@@ -324,6 +346,112 @@ class ArucoCalibNode(Node):
         if self.show_window:
             cv2.imshow('ArUco calibration', color_image)
             cv2.waitKey(1)
+
+    @staticmethod
+    def quaternion_angle(q1, q2):
+        # q와 -q는 같은 회전이므로 |dot|을 사용한다.
+        dot = min(1.0, abs(float(np.dot(q1, q2))))
+        return 2.0 * np.arccos(dot)
+
+    @staticmethod
+    def quaternion_mean(quats):
+        # Markley 평균: sum(q q^T)의 최대 고유벡터. 부호(q/-q)에 무관하다.
+        quats = np.asarray(quats, dtype=float)
+        _, vectors = np.linalg.eigh(quats.T @ quats)
+        q = vectors[:, -1]
+        return q / np.linalg.norm(q)
+
+    def robust_average_pose(self, samples):
+        """(tvec, quat) 샘플에서 일부 가림/pose flip으로 튄 값을 버리고 평균을 낸다."""
+        tvecs = np.array([sample[0] for sample in samples], dtype=float)
+        quats = np.array([sample[1] for sample in samples], dtype=float)
+        t_ref = np.median(tvecs, axis=0)
+        # 회전 기준은 다른 샘플들과의 각도 합이 최소인 샘플(medoid)로 잡아 flip 영향을 줄인다.
+        angle_matrix = np.array([[self.quaternion_angle(a, b) for b in quats] for a in quats])
+        q_ref = quats[int(np.argmin(angle_matrix.sum(axis=1)))]
+        inliers = [
+            index for index in range(len(samples))
+            if np.linalg.norm(tvecs[index] - t_ref) <= self.lock_outlier_translation_m
+            and self.quaternion_angle(quats[index], q_ref) <= self.lock_outlier_rotation_rad
+        ]
+        if len(inliers) < max(3, len(samples) // 2):
+            return None, len(inliers)
+        return (
+            (tvecs[inliers].mean(axis=0), self.quaternion_mean(quats[inliers])),
+            len(inliers),
+        )
+
+    def handle_lock_sample(self, frame, tvec, rvec):
+        quat = R.from_rotvec(np.asarray(rvec, dtype=float)).as_quat()
+        tvec = np.asarray(tvec, dtype=float)
+
+        if frame in self._locked_poses:
+            self.check_drift(frame, tvec, quat)
+            return
+
+        samples = self._lock_samples[frame]
+        samples.append((tvec, quat))
+        if len(samples) < self.lock_sample_count:
+            return
+
+        pose, inlier_count = self.robust_average_pose(samples)
+        samples.clear()
+        if pose is None:
+            self.get_logger().warn(
+                f'⚠️ {frame} lock 실패: inlier {inlier_count}/{self.lock_sample_count}. '
+                '마커가 가려지거나 흔들리는지 확인하세요. 다시 수집합니다.'
+            )
+            return
+
+        self._locked_poses[frame] = pose
+        self._static_transforms[frame] = self.make_transform(
+            self.camera_frame, frame, pose[0], pose[1], self.get_clock().now().to_msg()
+        )
+        self.send_static_transforms()
+        self.get_logger().info(
+            f'🔒 {frame} lock 완료 (inlier {inlier_count}/{self.lock_sample_count}): '
+            f't=({pose[0][0]:.4f}, {pose[0][1]:.4f}, {pose[0][2]:.4f}) '
+            f'q=({pose[1][0]:.4f}, {pose[1][1]:.4f}, {pose[1][2]:.4f}, {pose[1][3]:.4f})'
+        )
+        pending = sorted(self.lock_frames - set(self._locked_poses))
+        if pending:
+            self.get_logger().info(f'⏳ lock 대기 중: {pending}')
+        else:
+            self.get_logger().info('✅ 모든 기준 프레임 lock 완료 (/tf_static)')
+
+    def check_drift(self, frame, tvec, quat):
+        locked_t, locked_q = self._locked_poses[frame]
+        translation_error = float(np.linalg.norm(tvec - locked_t))
+        rotation_error = self.quaternion_angle(quat, locked_q)
+        if (
+            translation_error <= self.drift_warn_translation_m
+            and rotation_error <= self.drift_warn_rotation_rad
+        ):
+            self._drift_counts[frame] = 0
+            return
+        self._drift_counts[frame] += 1
+        if self._drift_counts[frame] >= self.drift_warn_frames:
+            self.warn_throttled(
+                f'drift_{frame}',
+                f'⚠️ {frame}가 lock 값과 계속 다릅니다 '
+                f'(Δt={translation_error * 1000:.1f}mm, Δθ={np.rad2deg(rotation_error):.1f}°). '
+                '카메라/마커가 움직였다면 aruco_calib을 재시작하세요.'
+            )
+
+    def make_transform(self, parent, child, tvec, quat, stamp):
+        t = TransformStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = parent
+        t.child_frame_id = child
+        t.transform.translation.x = float(tvec[0])
+        t.transform.translation.y = float(tvec[1])
+        t.transform.translation.z = float(tvec[2])
+        q, _ = self.normalize_quaternion_xyzw(quat, child)
+        t.transform.rotation.x = float(q[0])
+        t.transform.rotation.y = float(q[1])
+        t.transform.rotation.z = float(q[2])
+        t.transform.rotation.w = float(q[3])
+        return t
 
     def broadcast_tf(self, parent, child, tvec, rvec, stamp, quat=None):
         t = TransformStamped()
