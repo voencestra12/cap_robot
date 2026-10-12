@@ -53,6 +53,10 @@ class ArucoCalibNode(Node):
         self.declare_parameter('drift_warn_translation_m', 0.01)
         self.declare_parameter('drift_warn_rotation_deg', 2.0)
         self.declare_parameter('drift_warn_frames', 15)
+        # 작은/먼 단일 마커는 IPPE 두 해(planar ambiguity) 사이에서 뒤집힌다.
+        # lock 마커는 작업대 평면에 놓여 있으므로 법선이 workspace_0 z축과 가까운 해를 고르고,
+        # 그래도 이 각도보다 기울어 있으면 샘플을 버린다.
+        self.declare_parameter('lock_marker_max_tilt_deg', 20.0)
 
         self.image_topic = str(self.get_parameter('image_topic').value).strip()
         self.camera_info_topic = str(self.get_parameter('camera_info_topic').value).strip()
@@ -78,6 +82,9 @@ class ArucoCalibNode(Node):
             float(self.get_parameter('drift_warn_rotation_deg').value)
         )
         self.drift_warn_frames = max(1, int(self.get_parameter('drift_warn_frames').value))
+        self.lock_marker_min_normal_dot = float(np.cos(np.deg2rad(
+            float(self.get_parameter('lock_marker_max_tilt_deg').value)
+        )))
         self.lock_frames = {f'marker_{marker_id}' for marker_id in self.lock_marker_ids}
         self.lock_frames.add('workspace_0')
         self._lock_samples = {frame: [] for frame in self.lock_frames}
@@ -285,23 +292,9 @@ class ArucoCalibNode(Node):
                 self.get_logger().info(f'🔎 detected marker ids={detected_ids}')
 
             aruco.drawDetectedMarkers(color_image, corners, ids)
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                corners, self.marker_size_m, self.mtx, self.dist
-            )
-            for i, m_id in enumerate(ids.flatten()):
-                marker_frame = f'marker_{int(m_id)}'
-                if marker_frame in self.lock_frames:
-                    # lock 대상은 절대 /tf로 보내지 않는다 (static과 섞이면 체인이 끊김).
-                    self.handle_lock_sample(marker_frame, tvecs[i].reshape(3), rvecs[i].reshape(3))
-                    continue
-                self.broadcast_tf(
-                    self.camera_frame,
-                    marker_frame,
-                    tvecs[i].reshape(3),
-                    rvecs[i].reshape(3),
-                    msg.header.stamp,
-                )
 
+            # workspace_0를 먼저 풀어, 같은 프레임의 작업대 법선으로 lock 마커의 pose flip을 판별한다.
+            workspace_rotation = None
             matched_pts = [
                 (
                     np.array([
@@ -335,6 +328,7 @@ class ArucoCalibNode(Node):
                     self.dist,
                 )
                 if success:
+                    workspace_rotation = R.from_rotvec(rvec.reshape(3)).as_matrix()
                     self.handle_lock_sample('workspace_0', tvec.reshape(3), rvec.reshape(3))
             elif len(object_points) < 4 and 'workspace_0' not in self._locked_poses:
                 self.warn_throttled(
@@ -342,10 +336,74 @@ class ArucoCalibNode(Node):
                     f'workspace_0 계산용 대응점 부족: matched_marker_count={len(matched_pts)}, '
                     f'corner_count={len(object_points)} (필요: 4개 이상 corner, 현재 ids={detected_ids})'
                 )
+            if workspace_rotation is None and 'workspace_0' in self._locked_poses:
+                workspace_rotation = R.from_quat(self._locked_poses['workspace_0'][1]).as_matrix()
+
+            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
+                corners, self.marker_size_m, self.mtx, self.dist
+            )
+            for i, m_id in enumerate(ids.flatten()):
+                marker_frame = f'marker_{int(m_id)}'
+                if marker_frame in self.lock_frames:
+                    # lock 대상은 절대 /tf로 보내지 않는다 (static과 섞이면 체인이 끊김).
+                    pose = self.solve_planar_marker_pose(
+                        marker_frame, corners[i][0], workspace_rotation
+                    )
+                    if pose is not None:
+                        self.handle_lock_sample(marker_frame, pose[0], pose[1])
+                    continue
+                self.broadcast_tf(
+                    self.camera_frame,
+                    marker_frame,
+                    tvecs[i].reshape(3),
+                    rvecs[i].reshape(3),
+                    msg.header.stamp,
+                )
 
         if self.show_window:
             cv2.imshow('ArUco calibration', color_image)
             cv2.waitKey(1)
+
+    def solve_planar_marker_pose(self, marker_frame, marker_corners, workspace_rotation):
+        """IPPE 두 해 중 마커 법선(z)이 workspace_0 z축과 가장 가까운 해를 (tvec, rvec)로 반환한다."""
+        if workspace_rotation is None:
+            # 기준 평면 없이는 flip을 판별할 수 없으므로 샘플을 쓰지 않는다.
+            return None
+        half = self.marker_size_m / 2.0
+        object_points = np.array([
+            [-half,  half, 0.0],
+            [ half,  half, 0.0],
+            [ half, -half, 0.0],
+            [-half, -half, 0.0],
+        ], dtype=np.float32)
+        count, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+            object_points,
+            np.asarray(marker_corners, dtype=np.float32),
+            self.mtx,
+            self.dist,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
+        )
+        if not count:
+            return None
+        workspace_normal = workspace_rotation[:, 2]
+        candidates = [
+            (
+                float(np.dot(R.from_rotvec(rvec.reshape(3)).as_matrix()[:, 2], workspace_normal)),
+                tvec.reshape(3),
+                rvec.reshape(3),
+            )
+            for rvec, tvec in zip(rvecs, tvecs)
+        ]
+        normal_dot, tvec, rvec = max(candidates, key=lambda candidate: candidate[0])
+        if normal_dot < self.lock_marker_min_normal_dot:
+            self.warn_throttled(
+                f'tilt_{marker_frame}',
+                f'⚠️ {marker_frame} 법선이 작업대 평면과 맞지 않아 샘플을 버립니다 '
+                f'(기울기={np.rad2deg(np.arccos(np.clip(normal_dot, -1.0, 1.0))):.1f}°). '
+                '마커가 작업대에 평평하게 붙어 있는지 확인하세요.'
+            )
+            return None
+        return tvec, rvec
 
     @staticmethod
     def quaternion_angle(q1, q2):
@@ -483,7 +541,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

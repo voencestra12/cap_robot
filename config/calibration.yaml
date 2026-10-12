@@ -23,6 +23,8 @@
     drift_warn_translation_m: 0.01
     drift_warn_rotation_deg: 2.0
     drift_warn_frames: 15
+    # lock 마커(1, 12)의 IPPE pose flip 판별: 법선이 workspace_0 z축에서 이 각도 이상 벗어나면 샘플 폐기
+    lock_marker_max_tilt_deg: 20.0
 
     # workspace_0 원점 = 마커 0 중심. 아래 배치로 보이는 마커들의 코너를 함께 solvePnP한다.
     workspace_marker_ids: [0, 2, 4, 11, 13, 15]

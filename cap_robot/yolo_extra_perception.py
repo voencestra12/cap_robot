@@ -507,7 +507,8 @@ def main(args=None):
         if node.show_window:
             cv2.destroyAllWindows()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
