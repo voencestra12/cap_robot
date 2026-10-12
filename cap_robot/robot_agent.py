@@ -31,7 +31,10 @@ try:
     )
     from .utils import rpy_to_matrix, matrix_to_rpy
     from .ollama_stream import consume_ollama_stream
-    from .object_memory import ObjectMemory, object_class, resolve_object_target
+    from .object_memory import (
+        ObjectMemory, nearest_instance, object_class, resolve_object_target,
+        without_nearby,
+    )
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
@@ -44,7 +47,10 @@ except ImportError:
     )
     from utils import rpy_to_matrix, matrix_to_rpy
     from ollama_stream import consume_ollama_stream
-    from object_memory import ObjectMemory, object_class, resolve_object_target
+    from object_memory import (
+        ObjectMemory, nearest_instance, object_class, resolve_object_target,
+        without_nearby,
+    )
     from shared_zone import classify_shared_zone_entry, expand_aabb
 
 try:
@@ -87,6 +93,13 @@ class RobotAgentNode(Node):
         self.declare_parameter('enable_perception', True)
         self.declare_parameter('object_match_distance_mm', 60.0)
         self.declare_parameter('object_memory_retention_sec', 3.0)
+        # 정지 후 이 시간이 지나 촬영된 프레임만 계획/재확인에 사용합니다.
+        self.declare_parameter('perception_settle_sec', 0.5)
+        # 실행 직전 재확인: 계획 위치에서 이 XY 반경 안에 같은 재료가 있어야 집습니다.
+        self.declare_parameter('pick_verify_radius_mm', 40.0)
+        self.declare_parameter('pick_verify_timeout_sec', 3.0)
+        # 적층 Task에서 바구니 중심 XY 반경 안의 재료는 이미 쌓인 것으로 보고 제외합니다.
+        self.declare_parameter('basket_exclusion_radius_mm', 100.0)
         # 예: ['agent1:A|B'] 또는 ['agent1:A', 'agent2:B']
         # 이번 TF 테스트는 robot_1_base 하나로 A/B구역을 모두 검증할 수 있게 기본값을 agent1:A|B로 둡니다.
         self.declare_parameter('agent_specs', ['agent1:A|B'])
@@ -155,6 +168,14 @@ class RobotAgentNode(Node):
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
+        self.perception_settle_sec = float(self.get_parameter('perception_settle_sec').value)
+        self.pick_verify_radius_mm = float(self.get_parameter('pick_verify_radius_mm').value)
+        self.pick_verify_timeout_sec = float(
+            self.get_parameter('pick_verify_timeout_sec').value
+        )
+        self.basket_exclusion_radius_mm = float(
+            self.get_parameter('basket_exclusion_radius_mm').value
+        )
         self.agent_specs = self.parse_agent_specs(self.get_parameter('agent_specs').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value).strip()
         self.workspace_frame = str(self.get_parameter('workspace_frame').value).strip()
@@ -308,6 +329,9 @@ class RobotAgentNode(Node):
         self.guidebook_policy_candidates = {}
         self.guidebook_policy_inflight = set()
         self.guidebook_policy_last_attempt = {}
+        # 실행 불가 판정 당시의 world_version. Task 종료/자기 이동 후에만 다시 묻습니다.
+        self.guidebook_policy_rejected_version = {}
+        self.world_version = 0
         self.guidebook_policy_lock = threading.Lock()
         
         # 일반 Task의 claim 후보와 결정된 winner를 저장합니다.
@@ -387,6 +411,9 @@ class RobotAgentNode(Node):
         # ==============================================================
 
         self.latest_poses = {}
+        # latest_poses를 만든 프레임의 획득 시각과 마지막 이동 종료 시각(time.monotonic).
+        self.latest_poses_stamp = 0.0
+        self.motion_end_stamp = 0.0
         self.object_memory = ObjectMemory(
             match_distance_mm=float(self.get_parameter('object_match_distance_mm').value),
             retention_sec=float(self.get_parameter('object_memory_retention_sec').value),
@@ -554,6 +581,7 @@ class RobotAgentNode(Node):
                 self.guidebook_policy_candidates.clear()
                 self.guidebook_policy_inflight.clear()
                 self.guidebook_policy_last_attempt.clear()
+                self.guidebook_policy_rejected_version.clear()
 
             with self.guidebook_claim_lock:
                 self.guidebook_claims.clear()
@@ -981,6 +1009,8 @@ class RobotAgentNode(Node):
                 return
 
             self.guidebook_task_status[task_id] = status
+            if status in ('SUCCEEDED', 'FAILED'):
+                self.world_version += 1
             before = dict(self.guidebook_task_status)
             self.refresh_guidebook_task_states_locked()
             after = dict(self.guidebook_task_status)
@@ -2249,7 +2279,7 @@ class RobotAgentNode(Node):
             ):
                 self.dispatch_ready_cooperative_task(task_id)
 
-        if not self.latest_poses:
+        if self.fresh_pose_snapshot() is None:
             return
 
         now = time.time()
@@ -2259,7 +2289,11 @@ class RobotAgentNode(Node):
                 with self.guidebook_lock:
                     if self.is_cooperative_task(self.guidebook_tasks[task_id]):
                         continue
-                if task_id in self.guidebook_policy_candidates:
+                    world_version = self.world_version
+                if task_id in self.guidebook_policy_candidates and (
+                    self.guidebook_policy_candidates[task_id] is not None
+                    or self.guidebook_policy_rejected_version.get(task_id) == world_version
+                ):
                     continue
                 if task_id in self.guidebook_policy_inflight:
                     continue
@@ -2278,6 +2312,22 @@ class RobotAgentNode(Node):
                 daemon=True,
             ).start()
 
+    def fresh_pose_snapshot(self):
+        """정지 후 촬영된 관측의 복사본을 반환하고, 아니면 None.
+
+        이동 중에는 latest_poses가 이동 전 값으로 멈춰 있으므로, 이것으로 다음
+        Task를 계획하면 이미 옮긴 물체의 옛 좌표를 집으러 갑니다.
+        """
+        if self.task_worker_running or self.is_moving:
+            return None
+        with self.perception_lock:
+            if not self.latest_poses or (
+                self.latest_poses_stamp
+                < self.motion_end_stamp + self.perception_settle_sec
+            ):
+                return None
+            return dict(self.latest_poses)
+
     def plan_one_guidebook_task(self, task_id):
         """READY Guidebook Task 하나를 기존 task 형식의 실행 후보까지 변환합니다."""
         try:
@@ -2288,13 +2338,26 @@ class RobotAgentNode(Node):
                 task = dict(self.guidebook_tasks[task_id])
                 mission_id = self.current_mission_id
                 plan_revision = self.current_plan_revision
+                world_version = self.world_version
 
-            with self.perception_lock:
-                poses_dict = dict(self.latest_poses)
-                detected_items = list(self.current_detected_items)
+            poses_dict = self.fresh_pose_snapshot()
+            if poses_dict is None:
+                return
 
+            if 'assembly' in task:
+                # 바구니 안 재료는 이미 쌓인 층이므로 다음 층 후보와 프롬프트에서 뺍니다.
+                basket_center = self.get_basket_center_workspace()
+                excluded = sorted(set(poses_dict) - set(without_nearby(
+                    poses_dict, basket_center, self.basket_exclusion_radius_mm,
+                )))
+                if excluded:
+                    self.get_logger().info(
+                        f'🧺 [{self.agent_id}] {task_id} 바구니 안 개체 제외: {excluded}'
+                    )
+                    poses_dict = {k: v for k, v in poses_dict.items() if k not in excluded}
             if not poses_dict:
                 return
+            detected_items = list(poses_dict)
 
             result = self.ask_llm_for_guidebook_policy(
                 guidebook,
@@ -2314,6 +2377,7 @@ class RobotAgentNode(Node):
                 # 동일 mission/task에서 실행 불가 판정을 매 poll마다 다시 LLM에 묻지 않습니다.
                 with self.guidebook_policy_lock:
                     self.guidebook_policy_candidates[task_id] = None
+                    self.guidebook_policy_rejected_version[task_id] = world_version
                 self.get_logger().info(
                     f'ℹ️ [{self.agent_id}] {task_id} 후보 제외: {reason}'
                 )
@@ -2569,6 +2633,7 @@ class RobotAgentNode(Node):
         while rclpy.ok():
             with self.task_queue_lock:
                 if not self.task_queue:
+                    self.mark_motion_end()
                     self.task_worker_running = False
                     self.is_moving = False
                     return
@@ -2808,6 +2873,8 @@ class RobotAgentNode(Node):
             placement_profile = placement_tilt(task['target'], self.agent_id)
             pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
                         if placement_profile is not None else None)
+            if not self.verify_pick_target(task):
+                return False
         except Exception as error:
             self.get_logger().error(f'작업 실행 전 검증 실패: {error}')
             return False
@@ -2941,6 +3008,65 @@ class RobotAgentNode(Node):
             # 성공/실패/예외 어느 경로로 끝나든 확보한 토큰은 반드시 반납합니다.
             if acquired_here:
                 self.release_zone_token(task['task_id'])
+
+    def verify_pick_target(self, task):
+        """홈 자세에서 새 프레임으로 target이 계획 위치에 남아 있는지 확인합니다.
+
+        ID는 이동/가림 뒤 바뀌므로 같은 재료가 계획 위치 근처에 있는지만 봅니다.
+        있으면 최신 좌표로 object_pose를 갱신하고, 없으면 로봇을 움직이지 않습니다.
+        """
+        if not self.enable_perception:
+            self.get_logger().warn(
+                f"⚠️ [{task['task_id']}] perception 비활성: 파지 대상 재확인 생략"
+            )
+            return True
+        # 큐 처리 중이라도 이 시점의 로봇은 정지(홈) 상태이므로 잠시 인식을 켭니다.
+        since = time.monotonic() + self.perception_settle_sec
+        deadline = since + self.pick_verify_timeout_sec
+        self.is_moving = False
+        try:
+            poses = None
+            while rclpy.ok() and time.monotonic() < deadline:
+                with self.perception_lock:
+                    if self.latest_poses_stamp >= since:
+                        poses = dict(self.latest_poses)
+                        break
+                time.sleep(0.05)
+        finally:
+            self.is_moving = True
+        if poses is None:
+            self.get_logger().error(
+                f"🚫 [{task['task_id']}] 파지 대상 재확인용 새 프레임을 받지 못했습니다."
+            )
+            return False
+        basket_center = task.get('basket_center_workspace')
+        if 'assembly' in task and basket_center is not None:
+            poses = without_nearby(poses, basket_center, self.basket_exclusion_radius_mm)
+        reference = task['reference_object_pose']
+        found = nearest_instance(
+            poses, object_class(task['target']), reference['x'], reference['y'],
+            self.pick_verify_radius_mm,
+        )
+        if found is None:
+            self.get_logger().error(
+                f"🚫 [{task['task_id']}] 계획 위치 ({reference['x']:.1f}, "
+                f"{reference['y']:.1f}) 반경 {self.pick_verify_radius_mm:.0f}mm에 "
+                f"{object_class(task['target'])}이(가) 없어 파지를 중단합니다. "
+                f"현재 인식: {sorted(poses)}"
+            )
+            return False
+        x, y, z, yaw = poses[found]
+        task['reference_object_pose'] = {
+            'x': float(x), 'y': float(y), 'z': float(z), 'yaw': float(yaw),
+        }
+        task['object_pose'] = self.convert_object_pose(
+            task['reference_object_pose'], self.agent_id
+        )
+        self.get_logger().info(
+            f"🔎 [{task['task_id']}] 파지 대상 재확인: {task['target']} → {found} "
+            f"({reference['x']:.1f}, {reference['y']:.1f}) → ({x:.1f}, {y:.1f})"
+        )
+        return True
 
     def wait_for_plan_approval(self, task):
         mission_id = str(task['mission_id'])
@@ -3084,11 +3210,19 @@ class RobotAgentNode(Node):
             if coop_token_held:
                 self.release_zone_token(task_id)
 
+    def mark_motion_end(self):
+        """이동 전 스냅샷과 실행 불가 판정을 무효화합니다."""
+        with self.perception_lock:
+            self.motion_end_stamp = time.monotonic()
+        with self.guidebook_lock:
+            self.world_version += 1
+
     def handle_task_failure(self, failed_task):
         """[MERGED] 실패 시 큐를 정지하고 자동 이동/재할당은 수행하지 않습니다."""
         self.get_logger().error(f"🚨 [{failed_task['task_id']}] 작업 실패")
         with self.task_queue_lock:
             self.task_queue.clear()
+            self.mark_motion_end()
             self.task_worker_running = False
         self.is_moving = False
         self.get_logger().warn(
@@ -3188,6 +3322,7 @@ class RobotAgentNode(Node):
                     continue
 
                 img, depth_img, intrinsics = frames
+                frame_stamp = time.monotonic()
                 # 앞 모델의 시각화가 다음 모델의 추론 입력에 섞이지 않게 합니다.
                 inference_image = img.copy()
                 detections, annotations = [], []
@@ -3273,6 +3408,7 @@ class RobotAgentNode(Node):
                     current_poses = self.object_memory.update(detections)
                     with self.perception_lock:
                         self.latest_poses = current_poses
+                        self.latest_poses_stamp = frame_stamp
                         self.current_detected_items = list(current_poses)
                     for instance_id, (name_en, cx, cy, yaw) in zip(current_poses, annotations):
                         number = instance_id.rsplit('_', 1)[1]

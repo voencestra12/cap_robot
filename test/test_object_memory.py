@@ -11,7 +11,9 @@ from unittest.mock import Mock
 import cv2
 import numpy as np
 
-from cap_robot.object_memory import ObjectMemory, object_class, resolve_object_target
+from cap_robot.object_memory import (
+    ObjectMemory, nearest_instance, object_class, resolve_object_target, without_nearby,
+)
 
 
 def detection(x, name='빵', y=0, z=30):
@@ -105,6 +107,21 @@ class TargetResolutionTest(unittest.TestCase):
         self.assertEqual(object_class('basket_handle_0'), 'basket_handle_0')
 
 
+class PositionFilterTest(unittest.TestCase):
+    def test_without_nearby_uses_xy_distance(self):
+        poses = {'빵_1': (0, 0, 30, 0), '빵_2': (300, 0, 30, 0), '햄_1': (50, 0, 200, 0)}
+        kept = without_nearby(poses, {'x': 0, 'y': 0, 'z': 70}, 100)
+        self.assertEqual(set(kept), {'빵_2'})
+
+    def test_nearest_instance_matches_class_and_radius_not_id(self):
+        # 이동 후 번호가 바뀌어도 같은 재료가 계획 위치 근처에 있으면 찾습니다.
+        poses = {'빵_7': (205, 10, 30, 0), '빵_8': (500, 0, 30, 0), '햄_3': (200, 0, 30, 0)}
+        self.assertEqual(nearest_instance(poses, '빵', 200, 0, 40), '빵_7')
+        # 이미 옮겨 계획 위치가 비었으면 다른 빵으로 바꾸지 않습니다.
+        self.assertIsNone(nearest_instance(poses, '빵', 0, 0, 40))
+        self.assertIsNone(nearest_instance({}, '빵', 0, 0, 40))
+
+
 class PerceptionIntegrationTest(unittest.TestCase):
     def test_yolo_loop_exposes_every_instance_to_prompt(self):
         # 실제 perception 메서드를 실행하되 카메라/YOLO/GUI/ROS만 대체합니다.
@@ -121,7 +138,7 @@ class PerceptionIntegrationTest(unittest.TestCase):
         drawing.waitKey = Mock(side_effect=[-1, ord('q')])
         drawing.destroyAllWindows = Mock()
         namespace = dict(np=np, math=math, cv2=drawing, rclpy=Mock(ok=lambda: True),
-                         object_class=object_class)
+                         object_class=object_class, time=Mock(monotonic=lambda: 42.0))
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node_class], type_ignores=[])),
                      str(path), 'exec'), namespace)
         node = namespace['RobotAgentNode']()
@@ -149,6 +166,7 @@ class PerceptionIntegrationTest(unittest.TestCase):
         node.models = [('test.pt', model)]
         node.run_perception()
         self.assertEqual(node.current_detected_items, ['빵_2', '빵_1'])
+        self.assertEqual(node.latest_poses_stamp, 42.0)
         self.assertEqual(node.latest_poses['빵_1'][0], 21)
         self.assertEqual(node.latest_poses['빵_2'][0], 81)
         prompt = node.poses_for_prompt(node.latest_poses)

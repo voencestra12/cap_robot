@@ -86,3 +86,23 @@ class ObjectMemory:
             self._tracks[key] = dict(class_name=name, pose=pose, last_seen=now)
             visible[key] = pose
         return visible
+
+
+def without_nearby(poses, center, radius_mm):
+    """center의 x/y에서 XY 거리 radius_mm 이내 개체를 뺀 새 dict를 반환합니다."""
+    cx, cy = float(center['x']), float(center['y'])
+    return {key: pose for key, pose in poses.items()
+            if math.hypot(pose[0] - cx, pose[1] - cy) > radius_mm}
+
+
+def nearest_instance(poses, class_name, x, y, radius_mm):
+    """같은 클래스 중 (x, y)에서 XY 거리 radius_mm 이내의 가장 가까운 개체 ID.
+
+    ID는 이동/가림 뒤 바뀌므로 실행 직전 재확인은 클래스와 위치만 비교합니다.
+    """
+    distance, key = min(
+        ((math.hypot(pose[0] - x, pose[1] - y), key)
+         for key, pose in poses.items() if object_class(key) == class_name),
+        default=(math.inf, None),
+    )
+    return key if distance <= radius_mm else None

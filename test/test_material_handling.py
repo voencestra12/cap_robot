@@ -20,7 +20,9 @@ from cap_robot.material_handling import (
 )
 
 from cap_robot.utils import rpy_to_matrix, matrix_to_rpy, quaternion_xyzw_to_matrix
-from cap_robot.object_memory import object_class, resolve_object_target
+from cap_robot.object_memory import (
+    nearest_instance, object_class, resolve_object_target, without_nearby,
+)
 
 
 def perception():
@@ -233,6 +235,7 @@ def load_agent_methods():
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
         'find_detected_target', 'normalize_zone', 'resolve_target_destination',
+        'verify_pick_target',
     }
     original.bases = []
     original.body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -240,6 +243,7 @@ def load_agent_methods():
     namespace = {
         'math': math, 'time': time, 'rclpy': SimpleNamespace(ok=lambda: True),
         'object_class': object_class, 'resolve_object_target': resolve_object_target,
+        'nearest_instance': nearest_instance, 'without_nearby': without_nearby,
         'np': np, 'rpy_to_matrix': rpy_to_matrix, 'matrix_to_rpy': matrix_to_rpy,
         'basket_center_from_perception': basket_center_from_perception,
         'placement_tilt': placement_tilt,
@@ -266,6 +270,7 @@ class AgentAssemblyTest(ConfiguredTest):
         node.PICK_PLACE_Z_OFFSET_MM = 40
         node.DEFAULT_PNP_ACTIONS = DEFAULT_PNP_ACTIONS
         node.guidebook_lock = threading.Lock()
+        node.world_version = 0
         node.step_sync_condition = threading.Condition()
         node.placed_points_lock = threading.Lock()
         node.placed_points = {'A': [], 'B': []}
@@ -289,6 +294,8 @@ class AgentAssemblyTest(ConfiguredTest):
         node.task_shared_zone_plan = Mock(return_value={
             'needed': False, 'reason': 'test', 'acquire_before_api': None,
         })
+        # 재확인 자체는 PickVerificationTest에서 검증합니다.
+        node.verify_pick_target = Mock(return_value=True)
         self.poses = {'바나나': (10, 20, 30, 0)}
 
     def build(self):
@@ -632,6 +639,64 @@ class AgentAssemblyTest(ConfiguredTest):
         self.assertEqual((sent['roll'], sent['pitch'], sent['yaw']), (180, 30, 90))
         self.assertFalse(sent['is_radian'])
 
+
+
+class PickVerificationTest(unittest.TestCase):
+    """이미 옮긴 재료의 옛 좌표로 계획된 Task는 로봇을 움직이지 않아야 한다."""
+
+    def setUp(self):
+        node = load_agent_methods()()
+        node.agent_id = 'agent1'
+        node.enable_perception = True
+        node.perception_settle_sec = 0.0
+        node.pick_verify_timeout_sec = 0.5
+        node.pick_verify_radius_mm = 40.0
+        node.basket_exclusion_radius_mm = 100.0
+        node.perception_lock = threading.Lock()
+        node.latest_poses_stamp = math.inf
+        node.is_moving = True
+        node.get_logger = Mock(return_value=Mock())
+        node.convert_object_pose = lambda pose, agent: dict(pose, robot=True)
+        self.node = node
+
+    def task(self, assembly=True):
+        task = {
+            'task_id': 't3', 'target': '빵_1',
+            'reference_object_pose': dict(x=500, y=0, z=30, yaw=0),
+            'object_pose': dict(x=500, y=0, z=30, yaw=0),
+        }
+        if assembly:
+            task['assembly'] = {'material': '빵'}
+            task['basket_center_workspace'] = {'x': 300, 'y': 200, 'z': 70}
+        return task
+
+    def test_moved_bread_in_basket_is_not_picked_again(self):
+        # 빵_1은 바구니로 옮겨져 새 ID를 받았고 계획 위치는 비어 있다.
+        self.node.latest_poses = {'빵_4': (305, 195, 50, 0), '빵_5': (100, -200, 30, 0)}
+        task = self.task()
+        self.assertFalse(self.node.verify_pick_target(task))
+        self.assertEqual(task['object_pose']['x'], 500)
+        self.assertTrue(self.node.is_moving)
+
+    def test_basket_bread_is_excluded_even_near_planned_point(self):
+        self.node.basket_exclusion_radius_mm = 250.0
+        self.node.latest_poses = {'빵_4': (480, 10, 50, 0)}
+        task = self.task()
+        task['basket_center_workspace'] = {'x': 480, 'y': 0, 'z': 70}
+        self.assertFalse(self.node.verify_pick_target(task))
+
+    def test_present_target_refreshes_pose_with_new_id(self):
+        self.node.latest_poses = {'빵_9': (510, 5, 31, 0.2), '햄_2': (500, 0, 30, 0)}
+        task = self.task(assembly=False)
+        self.assertTrue(self.node.verify_pick_target(task))
+        self.assertEqual(task['reference_object_pose'], dict(x=510, y=5, z=31, yaw=0.2))
+        self.assertTrue(task['object_pose']['robot'])
+
+    def test_no_fresh_frame_fails(self):
+        self.node.latest_poses = {'빵_9': (500, 0, 30, 0)}
+        self.node.latest_poses_stamp = 0.0
+        self.node.pick_verify_timeout_sec = 0.1
+        self.assertFalse(self.node.verify_pick_target(self.task(assembly=False)))
 
 
 if __name__ == '__main__':
