@@ -246,8 +246,8 @@ class YoloExtraPerception(Node):
 
     def _detect_candidates(self, color_image, camera_frame, stamp):
         hsv = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
-        lower_1, upper_1 = np.array([0, 120, 70]), np.array([10, 255, 255])
-        lower_2, upper_2 = np.array([170, 120, 70]), np.array([180, 255, 255])
+        lower_1, upper_1 = np.array([0, 150, 90]), np.array([6, 255, 255])
+        lower_2, upper_2 = np.array([174, 150, 90]), np.array([180, 255, 255])
         mask = cv2.inRange(hsv, lower_1, upper_1) | cv2.inRange(hsv, lower_2, upper_2)
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)

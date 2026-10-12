@@ -18,7 +18,7 @@ OBJECT_PROFILES = {
         "place_tilt_speed": 75.0,
     },
     "양상추": {
-        "grip_position": 400.0,
+        "grip_position": 200.0,
         "thickness_mm": 0.0,
         "place_tcp_offset_mm": 100.0,
     },
