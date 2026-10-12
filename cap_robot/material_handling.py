@@ -55,6 +55,13 @@ def material_profile(material, agent_id=None, for_assembly=False):
         profile['place_tcp_offset_mm'] = number(
             profile.get('place_tcp_offset_mm'), f'{material}.place_tcp_offset_mm'
         )
+        xy = profile.get('place_xy_offset_mm', (0.0, 0.0))
+        if not isinstance(xy, (list, tuple)) or len(xy) != 2:
+            raise ValueError(f'{material}.place_xy_offset_mm: [dX, dY]가 필요합니다.')
+        profile['place_xy_offset_mm'] = [
+            number(value, f'{material}.place_xy_offset_mm[{axis}]')
+            for axis, value in zip('xy', xy)
+        ]
     return profile
 
 
@@ -137,9 +144,10 @@ def assembly_placement(plan_task, tasks, agent_id=None, *, basket_center):
     heights = [thickness(t['assembly']['material']) for t in layers]
     offset = sum(heights[:assembly['layer_index']])
     floor_z = number(settings.BASKET_FLOOR_Z_MM, 'BASKET_FLOOR_Z_MM')
+    dx, dy = profile['place_xy_offset_mm']
     pose = {
-        'x': number(basket_center.get('x'), 'basket_center.x'),
-        'y': number(basket_center.get('y'), 'basket_center.y'),
+        'x': number(basket_center.get('x'), 'basket_center.x') + dx,
+        'y': number(basket_center.get('y'), 'basket_center.y') + dy,
         'z': floor_z + offset + profile['place_tcp_offset_mm'],
         'yaw': math.radians(number(settings.BASKET_YAW_DEG, 'BASKET_YAW_DEG')),
     }

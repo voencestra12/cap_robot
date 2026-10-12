@@ -3,6 +3,7 @@
 grip_position: SDK 그리퍼 위치(0~850).
 thickness_mm: 내려놓은 재료의 수직 두께(mm).
 place_tcp_offset_mm: 빈 바구니에 놓는 TCP의 workspace Z - 바구니 바닥 Z.
+place_xy_offset_mm: 적층 시 바구니 중심 대비 TCP의 workspace [dX, dY](mm). 생략 시 [0, 0].
 두 Agent에 동일한 두께/바닥 높이를 배포해야 합니다. 바구니 중심은 빨간 점 두 개로 계산합니다.
 None은 미설정이며 해당 작업은 로봇 이동 전에 거부됩니다.
 """
@@ -18,9 +19,11 @@ OBJECT_PROFILES = {
         "place_tilt_speed": 75.0,
     },
     "양상추": {
-        "grip_position": 200.0,
+        "grip_position": 100.0,
         "thickness_mm": 0.0,
         "place_tcp_offset_mm": 30.0,
+        # 빵은 가장자리, 양상추는 중앙을 잡으므로 빵 중심에 맞추도록 보정.
+        "place_xy_offset_mm": [0.0, -30.0],
     },
     "햄": {
         "grip_position": 30.0,
