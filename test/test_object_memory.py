@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import cv2
 import numpy as np
 
+from cap_robot.detection_fusion import cross_model_keep_indices
 from cap_robot.object_memory import (
     ObjectMemory, nearest_instance, object_class, resolve_object_target, without_nearby,
 )
@@ -123,7 +124,7 @@ class PositionFilterTest(unittest.TestCase):
 
 
 class PerceptionIntegrationTest(unittest.TestCase):
-    def test_yolo_loop_exposes_every_instance_to_prompt(self):
+    def setUp(self):
         # 실제 perception 메서드를 실행하되 카메라/YOLO/GUI/ROS만 대체합니다.
         path = Path(__file__).resolve().parents[1] / 'cap_robot/robot_agent.py'
         tree = ast.parse(path.read_text())
@@ -138,12 +139,14 @@ class PerceptionIntegrationTest(unittest.TestCase):
         drawing.waitKey = Mock(side_effect=[-1, ord('q')])
         drawing.destroyAllWindows = Mock()
         namespace = dict(np=np, math=math, cv2=drawing, rclpy=Mock(ok=lambda: True),
-                         object_class=object_class, time=Mock(monotonic=lambda: 42.0))
+                         object_class=object_class, time=Mock(monotonic=lambda: 42.0),
+                         cross_model_keep_indices=cross_model_keep_indices)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node_class], type_ignores=[])),
                      str(path), 'exec'), namespace)
         node = namespace['RobotAgentNode']()
         node.agent_id = 'test'
         node.is_moving = False
+        node.yolo_cross_model_iou_threshold = 0.6
         node.perception_lock = threading.Lock()
         node.object_memory = ObjectMemory()
         node.get_latest_perception_frames = lambda: (
@@ -152,16 +155,21 @@ class PerceptionIntegrationTest(unittest.TestCase):
         node.median_depth_m = lambda depth, x, y: None if x > 150 else 1.0
         node.deproject_pixel_to_point = lambda x, y, depth, intrinsics: (x, y, depth)
         node.camera_point_to_workspace = lambda x, y, z: (x, y, z)
+        self.node = node
+        self.drawing = drawing
 
-        def result(centers):
-            masks = [np.array([[x - 5, 10], [x + 5, 10], [x + 5, 30], [x - 5, 30]],
-                              dtype=np.float32) for x in centers]
-            return [SimpleNamespace(boxes=[SimpleNamespace(cls=[0]) for _ in centers],
-                                    masks=SimpleNamespace(xy=masks))]
+    @staticmethod
+    def result(centers):
+        masks = [np.array([[x - 5, 10], [x + 5, 10], [x + 5, 30], [x - 5, 30]],
+                          dtype=np.float32) for x in centers]
+        return [SimpleNamespace(boxes=[SimpleNamespace(cls=[0]) for _ in centers],
+                                masks=SimpleNamespace(xy=masks))]
 
+    def test_yolo_loop_exposes_every_instance_to_prompt(self):
+        node = self.node
         # 마지막 물체는 depth가 없으므로 후보에서 제외되어야 합니다.
         model = SimpleNamespace(names={0: 'bread'}, predict=Mock(side_effect=[
-            result([20, 80, 180]), result([81, 21, 180]),
+            self.result([20, 80, 180]), self.result([81, 21, 180]),
         ]))
         node.models = [('test.pt', model)]
         node.run_perception()
@@ -172,9 +180,32 @@ class PerceptionIntegrationTest(unittest.TestCase):
         prompt = node.poses_for_prompt(node.latest_poses)
         self.assertEqual(prompt['빵_2']['class_name'], '빵')
         self.assertEqual(prompt['빵_2']['x_mm'], 81)
-        labels = [call.args[1] for call in drawing.putText.call_args_list]
+        labels = [call.args[1] for call in self.drawing.putText.call_args_list]
         self.assertTrue(any('[Bread_1]' in label for label in labels))
         self.assertTrue(any('[Bread_2]' in label for label in labels))
+
+    def test_bread_apple_duplicate_is_removed_from_display_and_robot_targets(self):
+        node = self.node
+        general = SimpleNamespace(names={0: 'apple'}, predict=Mock(side_effect=[
+            self.result([80, 120]), self.result([80, 120]),
+        ]))
+        specialist = SimpleNamespace(names={0: 'bread'}, predict=Mock(side_effect=[
+            self.result([20, 81]), self.result([20, 81]),
+        ]))
+        node.models = [('general.pt', general), ('sandwich.pt', specialist)]
+        node.run_perception()
+        self.assertEqual(node.current_detected_items, ['사과_1', '빵_1', '빵_2'])
+        self.assertEqual(node.latest_poses['사과_1'][0], 120)
+        self.assertEqual(node.latest_poses['빵_2'][0], 81)
+        prompt = node.poses_for_prompt(node.latest_poses)
+        self.assertEqual(len(prompt), 3)
+        self.assertEqual(prompt['사과_1']['x_mm'], 120)
+        # 두 프레임에 각각 3개만 표시: 오검출 박스와 Apple 라벨도 없어야 합니다.
+        self.assertEqual(self.drawing.drawContours.call_count, 6)
+        apple_labels = [call for call in self.drawing.putText.call_args_list
+                        if '[Apple_' in call.args[1]]
+        self.assertEqual(len(apple_labels), 2)
+        self.assertTrue(all(call.args[2][0] == 90 for call in apple_labels))
 
 
 if __name__ == '__main__':

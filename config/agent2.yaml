@@ -38,6 +38,8 @@
     camera_info_topic: /agent2/camera/color/camera_info
     # 기본 물체 + 샌드위치 재료(bread, lettuce, ham) 세그멘테이션 모델
     yolo_model_paths: [models/yolo11m-seg.pt, models/yolo-bread-lettuce-ham.pt]
+    # 모델 간 박스 IoU가 이 값 이상이면 뒤쪽(재료 전용) 모델 우선
+    yolo_cross_model_iou_threshold: 0.6
 
     llm_model: gemma4:e4b
     ollama_url: http://localhost:11434/api/generate

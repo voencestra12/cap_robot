@@ -126,6 +126,13 @@ perception에 들어갑니다.
 기존 `latest_poses`와 `current_detected_items`를 통해 Agent LLM의 target 및
 relative_object reference 선택에 사용합니다. 각 모델에는 시각화 전 원본 영상을 입력합니다.
 
+모델 간 검출 박스의 IoU가 `yolo_cross_model_iou_threshold`(기본 0.6) 이상이면
+`yolo_model_paths`의 뒤쪽 모델을 우선합니다. 예를 들어 같은 빵에 기본 모델의
+`apple`과 재료 전용 모델의 `bread`가 겹치면 `bread`만 화면과 Agent 인식 목록에
+남습니다. 별도 위치의 사과와 같은 모델에서 검출한 여러 빵은 유지합니다.
+임계값을 낮추면 중복을 더 많이 제거하지만, 실제로 겹쳐 있는 서로 다른 물체도
+제외할 수 있으므로 현장 영상에 맞게 조정하세요.
+
 모델은 패키지 share 디렉터리 기준 상대 경로로 로드합니다. 새 모델을 배치한 뒤
 각 Agent 실행 환경에서 아래 명령으로 설치 목록과 설정을 갱신하세요.
 

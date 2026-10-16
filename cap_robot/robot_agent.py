@@ -22,6 +22,7 @@ from tf2_ros import Buffer, TransformListener
 from xarm.wrapper import XArmAPI
 
 try:
+    from .detection_fusion import cross_model_keep_indices
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from .llm_api import validate_cooperative_actions
     from .llm_api import validate_actions as validate_llm_actions
@@ -38,6 +39,7 @@ try:
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
+    from detection_fusion import cross_model_keep_indices
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from llm_api import validate_cooperative_actions
     from llm_api import validate_actions as validate_llm_actions
@@ -144,6 +146,7 @@ class RobotAgentNode(Node):
             'yolo_model_paths',
             ['models/yolo11m-seg.pt', 'models/yolo-bread-lettuce-ham.pt'],
         )
+        self.declare_parameter('yolo_cross_model_iou_threshold', 0.6)
         self.declare_parameter('guidebook_topic', '/mission/guidebook')
         self.declare_parameter('task_claim_topic', '/mission/task_claim')
         self.declare_parameter('task_status_topic', '/mission/task_status')
@@ -221,6 +224,11 @@ class RobotAgentNode(Node):
             for path in self.get_parameter('yolo_model_paths').value
             if str(path).strip()
         ]
+        self.yolo_cross_model_iou_threshold = float(
+            self.get_parameter('yolo_cross_model_iou_threshold').value
+        )
+        if not 0.0 < self.yolo_cross_model_iou_threshold <= 1.0:
+            raise ValueError('yolo_cross_model_iou_threshold는 0 초과 1 이하여야 합니다.')
         self.guidebook_topic = str(self.get_parameter('guidebook_topic').value).strip()
         self.task_claim_topic = str(self.get_parameter('task_claim_topic').value).strip()
         self.task_status_topic = str(self.get_parameter('task_status_topic').value).strip()
@@ -3326,9 +3334,10 @@ class RobotAgentNode(Node):
                 # 앞 모델의 시각화가 다음 모델의 추론 입력에 섞이지 않게 합니다.
                 inference_image = img.copy()
                 detections, annotations = [], []
+                candidates = []
                 collect_detections = not self.is_moving
 
-                for model_filename, model in self.models:
+                for model_index, (model_filename, model) in enumerate(self.models):
                     wanted_class_ids = [
                         class_id for class_id, class_name in model.names.items()
                         if str(class_name).lower() in name_map_ko
@@ -3395,15 +3404,31 @@ class RobotAgentNode(Node):
                             pose = (wx, wy, wz, yaw)
                             if not all(math.isfinite(value) for value in pose):
                                 continue
-                            detections.append((name_ko, pose))
-                            annotations.append((name_en, cx, cy, yaw))
-
-                            cv2.drawContours(img, [box], 0, (255, 0, 0), 2)
-                            cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
-                            cv2.arrowedLine(
-                                img, (cx, cy), (int(front_pt[0]), int(front_pt[1])),
-                                (0, 255, 0), 3, tipLength=0.3
-                            )
+                            candidates.append({
+                                'model_index': model_index,
+                                'bounds': (*mask_np.min(axis=0), *mask_np.max(axis=0)),
+                                'detection': (name_ko, pose),
+                                'annotation': (name_en, cx, cy, yaw),
+                                'contour': box,
+                                'front_pt': front_pt,
+                            })
+                # 전용 모델을 뒤에 배치하여 같은 물체에 대한 일반 모델의 오검출을 제거합니다.
+                kept_indices = cross_model_keep_indices(
+                    [(c['model_index'], c['bounds']) for c in candidates],
+                    self.yolo_cross_model_iou_threshold,
+                )
+                for index in kept_indices:
+                    candidate = candidates[index]
+                    detections.append(candidate['detection'])
+                    annotations.append(candidate['annotation'])
+                    _, cx, cy, _ = candidate['annotation']
+                    front_pt = candidate['front_pt']
+                    cv2.drawContours(img, [candidate['contour']], 0, (255, 0, 0), 2)
+                    cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
+                    cv2.arrowedLine(
+                        img, (cx, cy), (int(front_pt[0]), int(front_pt[1])),
+                        (0, 255, 0), 3, tipLength=0.3,
+                    )
                 if collect_detections and not self.is_moving:
                     current_poses = self.object_memory.update(detections)
                     with self.perception_lock:
