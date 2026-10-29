@@ -1,4 +1,4 @@
-"""ROS/로봇 연결 없이 검증 가능한 재료 파지 및 빨간 점 기반 바구니 적층 계산."""
+"""ROS/로봇 연결 없이 검증 가능한 재료 파지 및 파란 점 기반 바구니 적층 계산."""
 
 import math
 
@@ -168,31 +168,31 @@ def assembly_move_pose(release_pose, z_offset, pick_place_z_offset_mm):
 
 
 def basket_center_from_perception(state, workspace_frame, max_age_sec, now_sec):
-    """새로운 두 빨간 점의 3D 중심(mm). 이 중심의 Z는 바구니 바닥 Z가 아니다."""
+    """새로운 두 파란 점의 3D 중심(mm). 이 중심의 Z는 바구니 바닥 Z가 아니다."""
     if not isinstance(state, dict) or state.get('valid') is not True:
         reason = state.get('reason', '') if isinstance(state, dict) else ''
-        raise ValueError(f'바구니 빨간 점 인식이 유효하지 않습니다: {reason}')
+        raise ValueError(f'바구니 파란 점 인식이 유효하지 않습니다: {reason}')
     if state.get('frame_id') != workspace_frame:
-        raise ValueError('빨간 점 좌표계가 workspace_frame과 다릅니다.')
-    if state.get('source') != 'red_handle_detector':
-        raise ValueError('바구니 중심에는 red_handle_detector 결과가 필요합니다.')
-    age = number(state.get('received_age_sec'), '빨간 점 수신 age', 0)
-    stamp = number(state.get('stamp_sec'), '빨간 점 stamp_sec')
+        raise ValueError('파란 점 좌표계가 workspace_frame과 다릅니다.')
+    if state.get('source') != 'blue_handle_detector':
+        raise ValueError('바구니 중심에는 blue_handle_detector 결과가 필요합니다.')
+    age = number(state.get('received_age_sec'), '파란 점 수신 age', 0)
+    stamp = number(state.get('stamp_sec'), '파란 점 stamp_sec')
     source_age = now_sec - stamp
     if age > max_age_sec or source_age > max_age_sec or source_age < -0.1:
-        raise ValueError('바구니 빨간 점 좌표가 오래되었거나 시각이 올바르지 않습니다.')
+        raise ValueError('바구니 파란 점 좌표가 오래되었거나 시각이 올바르지 않습니다.')
     objects = state.get('objects', {})
     handles = []
     for name in ('basket_handle_0', 'basket_handle_1'):
         point = objects.get(name) if isinstance(objects, dict) else None
         if not isinstance(point, dict):
-            raise ValueError(f'바구니 빨간 점이 없습니다: {name}')
+            raise ValueError(f'바구니 파란 점이 없습니다: {name}')
         handles.append({
             axis: number(point.get(f'{axis}_mm'), f'{name}.{axis}_mm')
             for axis in ('x', 'y', 'z')
         })
     if math.dist(tuple(handles[0].values()), tuple(handles[1].values())) < 1e-6:
-        raise ValueError('바구니 빨간 점 두 개가 같은 좌표입니다.')
+        raise ValueError('바구니 파란 점 두 개가 같은 좌표입니다.')
     center = {axis: (handles[0][axis] + handles[1][axis]) / 2.0 for axis in ('x', 'y', 'z')}
     return dict(center, frame_id=workspace_frame, stamp_sec=stamp)
 

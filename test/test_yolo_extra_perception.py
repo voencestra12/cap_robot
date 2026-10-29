@@ -12,6 +12,7 @@ import numpy as np
 from rclpy.node import Node
 
 from cap_robot.yolo_extra_perception import YoloExtraPerception
+from cap_robot.material_handling import basket_center_from_perception
 
 
 class SynchronizedPerceptionTest(unittest.TestCase):
@@ -19,10 +20,10 @@ class SynchronizedPerceptionTest(unittest.TestCase):
         # ROS graph/카메라 없이 실제 Subscriber, ATS, CvBridge 및 검출 로직을 사용한다.
         stack = ExitStack()
         self.addCleanup(stack.close)
-        parameters = {}
+        parameters = self.parameters = {}
         stack.enter_context(patch.object(Node, '__init__', return_value=None))
         stack.enter_context(patch.object(
-            Node, 'declare_parameter', side_effect=lambda key, value: parameters.update({key: value}),
+            Node, 'declare_parameter', side_effect=lambda key, value: parameters.setdefault(key, value),
         ))
         stack.enter_context(patch.object(
             Node, 'get_parameter', side_effect=lambda key: SimpleNamespace(value=parameters[key]),
@@ -39,14 +40,14 @@ class SynchronizedPerceptionTest(unittest.TestCase):
         transform.transform.rotation.w = 1.0
         self.node._lookup_transform = Mock(return_value=transform)
 
-    def image(self, stamp_sec, *, depth=False, depth_mm=1000):
+    def image(self, stamp_sec, *, depth=False, depth_mm=1000, sticker_bgr=(255, 0, 0)):
         if depth:
             data = np.full((100, 100), depth_mm, dtype=np.uint16)
             encoding = '16UC1'
         else:
             data = np.zeros((100, 100, 3), dtype=np.uint8)
             for center in ((25, 50), (75, 50)):
-                cv2.circle(data, center, 8, (0, 0, 255), -1)
+                cv2.circle(data, center, 8, sticker_bgr, -1)
             encoding = 'bgr8'
         msg = self.node._bridge.cv2_to_imgmsg(data, encoding=encoding)
         stamp_ns = round(stamp_sec * 1e9)
@@ -75,7 +76,7 @@ class SynchronizedPerceptionTest(unittest.TestCase):
             'schema_version', 'source', 'frame_id', 'stamp_sec',
             'valid', 'objects', 'reachability',
         })
-        self.assertEqual(payload['source'], 'red_handle_detector')
+        self.assertEqual(payload['source'], 'blue_handle_detector')
         self.assertEqual(payload['frame_id'], 'workspace_0')
         self.assertEqual(payload['stamp_sec'], 100)
         self.assertEqual(set(payload['objects']), {'basket_handle_0', 'basket_handle_1'})
@@ -136,6 +137,63 @@ class SynchronizedPerceptionTest(unittest.TestCase):
             'schema_version', 'source', 'frame_id', 'stamp_sec',
             'valid', 'reason', 'objects', 'reachability',
         })
+
+    def test_blue_stickers_set_basket_center_and_ignore_larger_red_objects(self):
+        color = self.image(100)
+        data = self.node._bridge.imgmsg_to_cv2(color, desired_encoding='bgr8').copy()
+        cv2.rectangle(data, (5, 5), (40, 30), (0, 0, 255), -1)
+        cv2.rectangle(data, (60, 65), (95, 95), (0, 0, 255), -1)
+        color.data = self.node._bridge.cv2_to_imgmsg(data, encoding='bgr8').data
+        self.node._synchronized_callback(color, self.image(100.02, depth=True))
+        state = dict(self.payload(), received_age_sec=0.0)
+        center = basket_center_from_perception(state, 'workspace_0', 2.0, 100.1)
+        self.assertEqual([center[axis] for axis in ('x', 'y', 'z')], [0, 0, 1000])
+
+    def test_red_stickers_do_not_produce_basket_targets(self):
+        self.node._synchronized_callback(
+            self.image(100, sticker_bgr=(0, 0, 255)), self.image(100.02, depth=True),
+        )
+        state = self.payload()
+        self.assertFalse(state['valid'])
+        self.assertEqual(state['source'], 'blue_handle_detector')
+        self.assertEqual(state['objects'], {})
+        for publisher in self.node._pose_pubs:
+            publisher.publish.assert_not_called()
+
+    def test_hsv_thresholds_include_endpoints_and_exclude_outside_values(self):
+        self.node._last_depth = np.full((100, 100), 1000, dtype=np.uint16)
+        for hsv_value, expected in (
+            ((80, 255, 255), True), ((150, 255, 255), True),
+            ((120, 80, 255), True), ((120, 255, 40), True),
+            ((79, 255, 255), False), ((151, 255, 255), False),
+            ((120, 79, 255), False), ((120, 255, 39), False),
+        ):
+            hsv = np.full((100, 100, 3), hsv_value, dtype=np.uint8)
+            with self.subTest(hsv=hsv_value), patch.object(cv2, 'cvtColor', return_value=hsv):
+                candidates, mask = self.node._detect_candidates(
+                    hsv, 'camera_color_optical_frame', self.image(100).header.stamp,
+                )
+                self.assertEqual(bool(np.all(mask == 255)), expected)
+                self.assertEqual(len(candidates), int(expected))
+
+    def test_hsv_parameter_overrides_are_used(self):
+        self.parameters.update(sticker_hsv_lower=[100, 100, 60],
+                               sticker_hsv_upper=[130, 240, 250])
+        node = YoloExtraPerception()
+        np.testing.assert_array_equal(node.sticker_hsv_lower, [100, 100, 60])
+        np.testing.assert_array_equal(node.sticker_hsv_upper, [130, 240, 250])
+
+    def test_invalid_hsv_parameter_ranges_are_rejected(self):
+        for lower, upper in (
+            ([80, 80], [150, 255, 255]),
+            ([-1, 80, 40], [150, 255, 255]),
+            ([80, 80, 40], [180, 255, 255]),
+            ([80, 80, 40], [150, 256, 255]),
+            ([151, 80, 40], [150, 255, 255]),
+        ):
+            self.parameters.update(sticker_hsv_lower=lower, sticker_hsv_upper=upper)
+            with self.subTest(lower=lower, upper=upper), self.assertRaises(ValueError):
+                YoloExtraPerception()
 
 
 if __name__ == '__main__':

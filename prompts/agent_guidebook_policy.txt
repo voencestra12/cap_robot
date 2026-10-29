@@ -119,7 +119,7 @@ $default_pnp_actions
 - assembly.material이 인식되지 않거나, 해당 재료가 기존 조립물뿐이거나, 별도의 미사용 재료인지 구별할 근거가 부족하면 can_execute=false로 출력한다.
 - destination은 {"type":"basket_stack"}으로 출력한다. 이 표시는 정책 입력 전용이며 실행 코드가 workspace 목적지로 변환한다.
 - 조립 X/Y는 실행 코드가 /perception/yolo_extra의 basket_handle_0과 basket_handle_1 좌표를 평균하여 계산한다. LLM은 좌표를 계산하지 않는다.
-- 두 빨간 점의 workspace_0 인식이 유효하고 최신이어야 한다. 내부 바닥 Z는 별도 실측값을 사용하며 빨간 점 평균 Z와 혼동하지 않는다.
+- 두 파란 점의 workspace_0 인식이 유효하고 최신이어야 한다. 내부 바닥 Z는 별도 실측값을 사용하며 파란 점 평균 Z와 혼동하지 않는다.
 - 두께 합과 재료별 TCP 보정은 실행 코드가 더한다. z_mm 또는 적층 높이를 생성하지 않는다.
 - move_to_place의 z_offset은 기존처럼 배치 시 $pick_place_z_offset_mm, 높은 접근/후퇴 시 150 이상을 사용한다.
 - 적층에서 실제 배치 높이는 설정값이며 z_offset=$pick_place_z_offset_mm이 그 높이에 대응한다.

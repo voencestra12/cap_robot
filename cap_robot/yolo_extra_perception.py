@@ -1,6 +1,6 @@
 """바구니 손잡이용 추가 인식 노드.
 
-[MERGED] 세트 1의 빨간 스티커 기반 손잡이 인식을 ROS 이미지 토픽 기반으로
+[MERGED] 세트 1의 파란 스티커 기반 손잡이 인식을 ROS 이미지 토픽 기반으로
 분리했습니다. ArUco 캘리브레이션과 RealSense 장치 소유권을 공유하지 않으며,
 모든 외부 좌표는 ``workspace_0`` 기준으로 발행합니다.
 """
@@ -30,7 +30,7 @@ from cap_robot.utils import quaternion_xyzw_to_matrix
 
 
 class YoloExtraPerception(Node):
-    """두 빨간 손잡이를 검출하고 workspace 좌표 및 접근성 정보를 발행합니다."""
+    """두 파란 손잡이를 검출하고 workspace 좌표 및 접근성 정보를 발행합니다."""
 
     def __init__(self):
         super().__init__('yolo_extra_perception')
@@ -53,6 +53,8 @@ class YoloExtraPerception(Node):
             ['agent1:robot_1_base', 'agent2:robot_2_base'],
         )
         self.declare_parameter('minimum_area_px', 50.0)
+        self.declare_parameter('sticker_hsv_lower', [80, 80, 40])
+        self.declare_parameter('sticker_hsv_upper', [150, 255, 255])
         self.declare_parameter('depth_window_radius_px', 2)
         self.declare_parameter('smoothing_window', 5)
         self.declare_parameter('maximum_frame_age_sec', 0.5)
@@ -73,6 +75,18 @@ class YoloExtraPerception(Node):
         self.workspace_frame = str(self.get_parameter('workspace_frame').value).strip()
         self.state_topic = str(self.get_parameter('state_topic').value).strip()
         self.minimum_area_px = float(self.get_parameter('minimum_area_px').value)
+        hsv_lower = list(self.get_parameter('sticker_hsv_lower').value)
+        hsv_upper = list(self.get_parameter('sticker_hsv_upper').value)
+        if (
+            len(hsv_lower) != 3 or len(hsv_upper) != 3
+            or any(
+                not 0 <= lower <= upper <= maximum
+                for lower, upper, maximum in zip(hsv_lower, hsv_upper, (179, 255, 255))
+            )
+        ):
+            raise ValueError('스티커 HSV 범위는 H 0~179, S/V 0~255 및 하한 <= 상한이어야 합니다.')
+        self.sticker_hsv_lower = np.array(hsv_lower, dtype=np.uint8)
+        self.sticker_hsv_upper = np.array(hsv_upper, dtype=np.uint8)
         self.depth_radius = max(0, int(self.get_parameter('depth_window_radius_px').value))
         self.maximum_frame_age_sec = float(
             self.get_parameter('maximum_frame_age_sec').value
@@ -107,8 +121,8 @@ class YoloExtraPerception(Node):
             deque(maxlen=smoothing_window),
         ]
         self._last_positions = None
-        self._last_valid_red_points = None
-        self._last_valid_red_points_stamp = None
+        self._last_valid_blue_points = None
+        self._last_valid_blue_points_stamp = None
         # 기존 depth median 로직에는 현재 동기화 pair의 Depth만 전달한다.
         self._last_depth = None
         self._intrinsics = None
@@ -157,7 +171,8 @@ class YoloExtraPerception(Node):
         self.get_logger().info(
             '[MERGED] yolo_extra_perception 시작: '
             f'color={self.color_topic}, depth={self.depth_topic}, '
-            f'output={self.state_topic}, frame={self.workspace_frame}'
+            f'output={self.state_topic}, frame={self.workspace_frame}, '
+            f'blue sticker HSV={hsv_lower}..{hsv_upper}'
         )
 
     @staticmethod
@@ -246,9 +261,7 @@ class YoloExtraPerception(Node):
 
     def _detect_candidates(self, color_image, camera_frame, stamp):
         hsv = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
-        lower_1, upper_1 = np.array([0, 150, 90]), np.array([6, 255, 255])
-        lower_2, upper_2 = np.array([174, 150, 90]), np.array([180, 255, 255])
-        mask = cv2.inRange(hsv, lower_1, upper_1) | cv2.inRange(hsv, lower_2, upper_2)
+        mask = cv2.inRange(hsv, self.sticker_hsv_lower, self.sticker_hsv_upper)
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -366,7 +379,7 @@ class YoloExtraPerception(Node):
     def _publish_invalid(self, stamp, reason):
         payload = {
             'schema_version': 1,
-            'source': 'red_handle_detector',
+            'source': 'blue_handle_detector',
             'frame_id': self.workspace_frame,
             'stamp_sec': self._stamp_sec(stamp),
             'valid': False,
@@ -407,7 +420,7 @@ class YoloExtraPerception(Node):
 
         payload = {
             'schema_version': 1,
-            'source': 'red_handle_detector',
+            'source': 'blue_handle_detector',
             'frame_id': self.workspace_frame,
             'stamp_sec': self._stamp_sec(stamp),
             'valid': True,
@@ -444,30 +457,30 @@ class YoloExtraPerception(Node):
             candidates, mask = self._detect_candidates(color, camera_frame, msg.header.stamp)
             handles = self._stabilize(candidates)
             if handles is None:
-                red_target_age = (
+                blue_target_age = (
                     self.get_clock().now().nanoseconds * 1e-9
-                    - self._stamp_sec(self._last_valid_red_points_stamp)
-                    if self._last_valid_red_points_stamp is not None else None
+                    - self._stamp_sec(self._last_valid_blue_points_stamp)
+                    if self._last_valid_blue_points_stamp is not None else None
                 )
                 if (
-                    self._last_valid_red_points is not None
-                    and red_target_age is not None
+                    self._last_valid_blue_points is not None
+                    and blue_target_age is not None
                 ):
                     self._publish_valid(
-                        self._last_valid_red_points, self._last_valid_red_points_stamp
+                        self._last_valid_blue_points, self._last_valid_blue_points_stamp
                     )
                     self._warn_throttled(
-                        'red_point_fallback',
-                        f'red point fallback: using last valid workspace target, age={red_target_age:.3f}s',
+                        'blue_point_fallback',
+                        f'blue point fallback: using last valid workspace target, age={blue_target_age:.3f}s',
                     )
                 else:
                     self._publish_invalid(
                         msg.header.stamp,
-                        f'유효한 빨간 손잡이 2개 필요: detected={len(candidates)}',
+                        f'유효한 파란 손잡이 2개 필요: detected={len(candidates)}',
                     )
             else:
                 self._publish_valid(handles, msg.header.stamp)
-                self._last_valid_red_points = [
+                self._last_valid_blue_points = [
                     {
                         'position': item['position'].copy(),
                         'area_px': item['area_px'],
@@ -475,7 +488,7 @@ class YoloExtraPerception(Node):
                     }
                     for item in handles
                 ]
-                self._last_valid_red_points_stamp = msg.header.stamp
+                self._last_valid_blue_points_stamp = msg.header.stamp
                 for index, item in enumerate(handles):
                     cv2.circle(color, item['pixel'], 6, (0, 255, 0), -1)
                     cv2.putText(

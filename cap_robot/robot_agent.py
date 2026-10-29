@@ -2157,7 +2157,7 @@ class RobotAgentNode(Node):
                 basket_center=self.get_basket_center_workspace(),
             )
             pose = placement['reference_place_pose']
-            # 조립점은 두 빨간 점의 평균, 높이는 실측 설정으로 계산한다.
+            # 조립점은 두 파란 점의 평균, 높이는 실측 설정으로 계산한다.
             destination = {
                 'type': 'workspace', 'x_mm': pose['x'], 'y_mm': pose['y'],
                 'z_mm': pose['z'], 'yaw_deg': math.degrees(pose['yaw']),

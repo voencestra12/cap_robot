@@ -27,7 +27,7 @@ from cap_robot.object_memory import (
 
 def perception():
     return {
-        'valid': True, 'source': 'red_handle_detector', 'frame_id': 'workspace_0',
+        'valid': True, 'source': 'blue_handle_detector', 'frame_id': 'workspace_0',
         'received_age_sec': 0.1, 'stamp_sec': 100.0,
         'objects': {
             'basket_handle_0': {'x_mm': 250, 'y_mm': 200, 'z_mm': 60},
@@ -193,8 +193,9 @@ class MaterialHandlingTest(ConfiguredTest):
         placement = place(recipe()[0], recipe())
         self.assertEqual(placement['reference_place_pose']['z'], 45)
 
-    def test_missing_stale_nonfinite_or_wrong_frame_red_points_are_rejected(self):
-        for case in ('missing', 'invalid', 'frame', 'stale_receive', 'stale_source', 'nan', 'same'):
+    def test_missing_stale_nonfinite_or_wrong_frame_blue_points_are_rejected(self):
+        for case in ('missing', 'invalid', 'frame', 'stale_receive', 'stale_source',
+                     'nan', 'same', 'legacy_source'):
             state = perception()
             if case == 'missing':
                 del state['objects']['basket_handle_1']
@@ -208,6 +209,8 @@ class MaterialHandlingTest(ConfiguredTest):
                 state['stamp_sec'] = 90
             elif case == 'nan':
                 state['objects']['basket_handle_0']['x_mm'] = float('nan')
+            elif case == 'legacy_source':
+                state['source'] = 'red_handle_detector'
             else:
                 state['objects']['basket_handle_1'] = dict(state['objects']['basket_handle_0'])
             with self.subTest(case=case), self.assertRaises(ValueError):
@@ -602,7 +605,7 @@ class AgentAssemblyTest(ConfiguredTest):
             point['x_mm'] += 50
         self.node.get_extra_perception_snapshot.side_effect = lambda: state
         def move(*args, **kwargs):
-            state['valid'] = False  # Robot occludes the red dots after execution starts.
+            state['valid'] = False  # Robot occludes the blue dots after execution starts.
             return True
         self.node.move_to_robot_tf.side_effect = move
         self.assertTrue(self.node.execute_task(task))

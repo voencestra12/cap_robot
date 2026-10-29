@@ -1,6 +1,6 @@
 # cap_robot merged (ROS 2 Humble)
 
-`cap_robot`의 기존 실행 구조를 유지하면서, 첫 번째 코드 세트의 빨간 손잡이 인식과
+`cap_robot`의 기존 실행 구조를 유지하면서, 첫 번째 코드 세트의 파란 손잡이 인식과
 양팔 바구니 협동 기능을 통합한 패키지입니다. 두 코드 세트를 동시에 실행하지 않습니다.
 
 ## 배치 구조
@@ -27,7 +27,7 @@
 
 ### 바구니 양팔 협동
 
-1. `yolo_extra_perception`이 고정 카메라의 빨간 스티커 두 개를 손잡이로 검출합니다.
+1. `yolo_extra_perception`이 고정 카메라의 파란 스티커 두 개를 손잡이로 검출합니다.
 2. 손잡이 좌표와 각 Agent의 접근 가능성을 `/perception/yolo_extra`에 JSON으로 발행합니다.
 3. Workstation LLM이 두 손잡이 배정과 전체 공유 `actions`를 작성합니다.
 4. 두 Agent LLM이 계획을 각각 승인 또는 거부합니다.
@@ -194,10 +194,15 @@ ros2 topic echo /zone_token/state --qos-durability transient_local --once
 ## 손잡이 인식 주의사항
 
 노드 이름은 요청대로 `yolo_extra_perception`이지만, 현재 구현은 첫 번째 코드 세트의
-기능을 보존해 **빨간 스티커 HSV 분할 + 정렬 depth**를 사용합니다. ArUco 검출은
+기능을 보존해 **파란 스티커 HSV 분할 + 정렬 depth**를 사용합니다. ArUco 검출은
 `aruco_calib`에만 남아 있고, 두 노드는 동일 RealSense ROS 스트림을 구독하므로 장치를
-중복으로 직접 열지 않습니다. 조명이나 스티커 색이 바뀌면 HSV 임계값을 파라미터화하거나
-학습된 손잡이 모델 backend를 추가해야 합니다.
+중복으로 직접 열지 않습니다. 파란 스티커의 기본 HSV 범위는 **H 80–150, S 80–255,
+V 40–255**입니다(OpenCV 기준 H 0–179). 조명에 따른 임계값은
+`config/yolo_extra_perception.yaml`의 `sticker_hsv_lower`와 `sticker_hsv_upper`에서
+조정한 뒤 `workstation.launch.py`를 다시 실행합니다. 이 설정은 고정 카메라 인식
+노드에 적용되며 두 Agent가 결과를 공유합니다.
+`/perception/yolo_extra`의 `source`는 `blue_handle_detector`이며,
+바구니 중심 계산도 이 source를 검증합니다.
 
 ## 제거된 R1~R9
 
@@ -250,15 +255,15 @@ ROS 2가 설치된 실제 환경에서는 `colcon test --packages-select cap_rob
 마커 0의 개별 TF를 그대로 복사하는 방식은 아닙니다.
 
 바구니 중심은 `/perception/yolo_extra`의 `basket_handle_0`, `basket_handle_1`
-(빨간 점 두 개, workspace 기준 mm) 좌표를 평균하여 계산합니다.
+(파란 점 두 개, workspace 기준 mm) 좌표를 평균하여 계산합니다.
 
 ```text
-center_x = (red0.x_mm + red1.x_mm) / 2
-center_y = (red0.y_mm + red1.y_mm) / 2
-center_z = (red0.z_mm + red1.z_mm) / 2
+center_x = (blue0.x_mm + blue1.x_mm) / 2
+center_y = (blue0.y_mm + blue1.y_mm) / 2
+center_z = (blue0.z_mm + blue1.z_mm) / 2
 ```
 
-조립 X/Y에 center_x/y를 사용합니다. center_z는 빨간 점 높이이며 바구니 내부
+조립 X/Y에 center_x/y를 사용합니다. center_z는 파란 점 높이이며 바구니 내부
 바닥 높이가 아닙니다. 내부 바닥은 `BASKET_FLOOR_Z_MM`으로 별도 입력합니다.
 마커 평면 Z=0과 바구니 내부 바닥도 같다고 가정하지 않습니다.
 고정 `BASKET_CENTER_XY_MM` 설정은 사용하지 않습니다.
@@ -277,7 +282,7 @@ center_z = (red0.z_mm + red1.z_mm) / 2
 | `BASKET_YAW_DEG` | workspace 기준 배치 방향, 기본 0° |
 
 바닥 높이와 각 재료의 TCP 보정은 아직 `None`입니다. 해당 적층 작업은 값을
-입력하기 전 이동을 거부하며, LLM이나 빨간 점 높이로 추측하지 않습니다.
+입력하기 전 이동을 거부하며, LLM이나 파란 점 높이로 추측하지 않습니다.
 
 최종 배치 TCP 높이는 다음과 같습니다.
 

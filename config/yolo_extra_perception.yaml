@@ -10,6 +10,9 @@
     handle_1_topic: /basket/handle_1_pose
     agent_base_frames: ["agent1:robot_1_base", "agent2:robot_2_base"]
 
+    # 파란 바구니 스티커: OpenCV HSV (H 0~179, S/V 0~255)
+    sticker_hsv_lower: [80, 80, 40]
+    sticker_hsv_upper: [150, 255, 255]
     minimum_area_px: 50.0
     depth_window_radius_px: 2
     smoothing_window: 5

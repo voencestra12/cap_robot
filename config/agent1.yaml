@@ -55,6 +55,7 @@
     # [MERGED] Guidebook/Agent 검토/action barrier 통신
     task_claim_topic: /mission/task_claim
     task_status_topic: /mission/task_status
+    # 파란 바구니 스티커 HSV는 config/yolo_extra_perception.yaml에서 공통 설정
     extra_perception_topic: /perception/yolo_extra
     extra_perception_max_age_sec: 5.0
     cooperative_review_timeout_sec: 60.0
