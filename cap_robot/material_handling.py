@@ -35,7 +35,12 @@ def material_profile(material, agent_id=None, for_assembly=False):
         profile.get('grip_position'), f'{material}.grip_position', 0, 850
     )
     for key in ('place_roll_offset_deg', 'place_pitch_offset_deg'):
-        profile[key] = number(profile.get(key, 0.0), f'{material}.{key}', -90, 90)
+        offset = profile.get(key, 0.0)
+        if isinstance(offset, dict):
+            if agent_id not in offset:
+                raise ValueError(f'{material}.{key}: Agent {agent_id!r}의 보정값이 필요합니다.')
+            offset = offset[agent_id]
+        profile[key] = number(offset, f'{material}.{key}', -90, 90)
     profile['place_tilt_speed'] = number(
         profile.get('place_tilt_speed', 20.0), f'{material}.place_tilt_speed', 1, 150
     )

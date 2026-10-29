@@ -259,6 +259,75 @@ def load_agent_methods():
     return namespace['RobotAgentNode']
 
 
+class AgentRollProfileTest(unittest.TestCase):
+    def test_bread_lettuce_ham_bread_uses_each_agents_roll_direction(self):
+        original = copy.deepcopy(settings.OBJECT_PROFILES)
+        for agent_id, offset in (('agent1', 30.0), ('agent2', -30.0)):
+            for material in ('빵_1', '양상추_1', '햄_1', '빵_2'):
+                with self.subTest(agent=agent_id, material=material):
+                    tilt = placement_tilt(material, agent_id)
+                    if material.startswith('양상추'):
+                        self.assertIsNone(tilt)
+                    else:
+                        self.assertEqual(tilt['place_roll_offset_deg'], offset)
+                        self.assertEqual(tilt['place_pitch_offset_deg'], 0)
+        self.assertEqual(settings.OBJECT_PROFILES, original)
+
+    def test_missing_or_unknown_agent_does_not_use_other_agents_roll(self):
+        for material in ('빵', '햄'):
+            for agent_id in (None, '', 'agent3'):
+                with self.subTest(material=material, agent=agent_id), self.assertRaises(ValueError):
+                    placement_tilt(material, agent_id)
+
+    def test_invalid_agent_roll_is_rejected(self):
+        for invalid in (None, True, -91, 91, float('nan'), float('inf')):
+            profile = copy.deepcopy(settings.OBJECT_PROFILES['햄'])
+            profile['place_roll_offset_deg']['agent1'] = invalid
+            with self.subTest(offset=invalid), patch.dict(settings.OBJECT_PROFILES, 햄=profile):
+                with self.assertRaises(ValueError):
+                    placement_tilt('햄', 'agent1')
+
+    def test_bread_and_ham_roll_reaches_sdk_and_restores_after_retreat(self):
+        for material in ('빵_2', '햄_1'):
+            for agent_id, roll in (('agent1', 210.0), ('agent2', 150.0)):
+                for assembly in (True, False):
+                    with self.subTest(material=material, agent=agent_id, assembly=assembly):
+                        node = load_agent_methods()()
+                        node.agent_id = agent_id
+                        node.PICK_PLACE_Z_OFFSET_MM = 40
+                        node.dry_run = False
+                        node.get_logger = Mock(return_value=Mock())
+                        node.check_sdk_pose_or_raise = Mock()
+                        node.arm = Mock()
+                        node.arm.set_position.return_value = 0
+                        node.workspace_rpy_to_robot = Mock(side_effect=lambda roll, pitch, yaw:
+                            dict(roll=roll, pitch=pitch, yaw=yaw))
+                        node.convert_place_pose = lambda pose, agent: dict(pose)
+                        task = {
+                            'task_id': 'roll_test', 'target': material,
+                            'place_pose': dict(x=300, y=200, z=100, yaw=0),
+                            'reference_place_pose': dict(x=300, y=200, z=100, yaw=0),
+                            'object_pose': dict(x=10, y=20, z=30, yaw=0),
+                        }
+                        if assembly:
+                            task['assembly'] = {}
+                        state = dict(started=False, released=False)
+                        with patch.object(time, 'sleep'):
+                            for z_offset, released in ((200, False), (40, False), (200, True)):
+                                state['released'] = released
+                                self.assertTrue(node.execute_place_action(
+                                    task, dict(z_offset=z_offset, speed=100), state))
+                        moves = [call.kwargs for call in node.arm.set_position.call_args_list]
+                        np.testing.assert_allclose(
+                            [move['roll'] for move in moves], [180, roll, roll, roll, 180])
+                        self.assertTrue(all(move['pitch'] == 0 for move in moves))
+                        self.assertTrue(all(move['speed'] == 75 for move in moves))
+                        # 기울임/복원은 각각 높은 접근/후퇴 위치에서만 수행한다.
+                        self.assertEqual(moves[0]['z'], moves[1]['z'])
+                        self.assertEqual(moves[3]['z'], moves[4]['z'])
+                        self.assertLess(moves[2]['z'], moves[1]['z'])
+
+
 class AgentAssemblyTest(ConfiguredTest):
     def setUp(self):
         super().setUp()

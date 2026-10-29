@@ -295,11 +295,16 @@ center_z = (blue0.z_mm + blue1.z_mm) / 2
 기존 `z_offset=40`은 계산된 최종 배치 높이이고, `z_offset=200`은 그보다
 160 mm 위입니다. 40 mm를 중복해서 더하지 않습니다. 파지 높이는 기존 값을 유지합니다.
 
-### 빵 배치 기울임
+### 빵·햄 배치 기울임
 
 재료별 공통 파지값, TCP 높이와 배치 기울임은 `cap_robot/object_profiles.py`의
-`OBJECT_PROFILES`에서 설정합니다. 현재 빵의 roll/pitch offset은 0°이며,
-Agent별 프로필 덮어쓰기는 사용하지 않습니다. 두께와 바구니 바닥 Z도 공통 설정입니다.
+`OBJECT_PROFILES`에서 설정합니다. 빵과 햄의 `place_roll_offset_deg`는
+`{"agent1": 30.0, "agent2": -30.0}`으로, 실행 Agent에 맞는 값을 선택합니다.
+기본 배치 자세 대비 roll 보정이며 pitch 보정은 0°입니다. Agent가 누락되거나
+설정에 없으면 이동 전에 거부합니다. 양상추에는 기울임을 적용하지 않습니다.
+빵과 햄 모두 높은 접근 위치에서 기울이고, 내려놓은 뒤 기울임을 유지하여 후퇴한
+다음 높은 위치에서 기본 자세로 복원합니다. 배치 속도 상한은 75입니다.
+두께와 바구니 바닥 Z는 공통 설정입니다.
 
 각 적층 Task는 `assembly`에 id, container=basket, layer_index, material을 갖고
 직전 층 Task에 의존합니다. 앞 층이 SUCCEEDED가 되어야 다음 층을 시작합니다.
