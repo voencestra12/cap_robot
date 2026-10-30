@@ -11,11 +11,11 @@
     basket_exclusion_radius_mm: 100.0  # 적층 시 바구니 중심 XY 반경 안 재료는 후보 제외(mm), 실측 필요
 
     # 양상추 Place 직전 YOLO 빵 이동량 보정. 아래 실측 완료 후 두 플래그를 활성화.
-    lettuce_place_vision.enabled: false
-    lettuce_place_vision.baseline_calibrated: false
+    lettuce_place_vision.enabled: true
+    lettuce_place_vision.baseline_calibrated: true
     # 정상 배치된 빵의 YOLO 중심 - 파란 점 바구니 중심 (workspace_0 XY).
     # [0,0]은 미설정 자리표시자이며 양상추의 [0,-30] TCP Offset과 별개입니다.
-    lettuce_place_vision.expected_bread_xy_offset_mm: [0.0, 0.0]
+    lettuce_place_vision.expected_bread_xy_offset_mm: [0.0, 10.0]
     lettuce_place_vision.basket_half_extent_mm: [60.0, 60.0] # 내부에 완전히 포함되는 XY 반폭, 실측 필요
     lettuce_place_vision.bread_z_range_mm: [5.0, 80.0]      # workspace_0 절대 Z, 실측 필요
     lettuce_place_vision.max_correction_mm: 20.0           # XY 이동량의 유클리드 거리
@@ -41,7 +41,7 @@
     tf_debug_log_period_sec: 2.0
 
     # 안전을 위해 기본값은 dry_run입니다. 실제 구동 확인 후 false로 바꾸세요.
-    dry_run: false
+    dry_run: true
     enable_sdk_safety_box: true
     sdk_x_min: 50.0
     sdk_x_max: 750.0
