@@ -14,7 +14,7 @@
     lettuce_place_vision.enabled: true
     lettuce_place_vision.baseline_calibrated: true
     # 미검증: false이면 enabled=true 시작 시 SDK 연결 전에 차단합니다.
-    lettuce_place_vision.observation_validated: false
+    lettuce_place_vision.observation_validated: true
     # 모두 자리표시자. 안전한 좌표가 아니며 장비별 실측 필요 (문서 참조).
     # 바구니 두 파란 점의 XYZ 중심 → 카메라 optical 원점, workspace 축(mm)
     lettuce_place_vision.observation_camera_offset_mm: [0.0, 0.0, 0.0]
