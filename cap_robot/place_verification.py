@@ -24,6 +24,12 @@ DEFAULTS = {
     'sync_tolerance_sec': 0.08,
     'min_confidence': 0.6,
     'samples': 3,
+    # Unmeasured placeholders: enabling vision must not authorize a new motion.
+    'observation_validated': False,
+    'observation_camera_offset_mm': [0.0, 0.0, 0.0],
+    'observation_tcp_to_camera_mm': [0.0, 0.0, 0.0],
+    'observation_transit_clearance_mm': 0.0,
+    'observation_speed_mm_s': 30.0,
 }
 
 
@@ -50,6 +56,37 @@ def validate_config(config):
     number(config['min_confidence'], 'min_confidence', 0.3, 1.0)
     if type(config['samples']) is not int or not 2 <= config['samples'] <= 8:
         raise ValueError('samples는 2~8 정수여야 합니다.')
+
+
+def validate_observation_config(config):
+    if config.get('observation_validated') is not True:
+        raise ValueError('관측 XYZ/카메라 자세/이동 경로의 실측 검증이 필요합니다: observation_validated=false')
+    for key in ('observation_camera_offset_mm', 'observation_tcp_to_camera_mm'):
+        if len(config[key]) != 3:
+            raise ValueError(f'{key}: XYZ 세 값이 필요합니다.')
+        for value in config[key]:
+            number(value, key)
+    if number(config['observation_transit_clearance_mm'], 'transit clearance') <= 0:
+        raise ValueError('관측 이동 여유 높이는 실측한 양수여야 합니다.')
+    if number(config['observation_speed_mm_s'], 'observation speed') <= 0:
+        raise ValueError('관측 속도는 양수여야 합니다.')
+
+
+def observation_pose(basket, config, workspace_from_tcp):
+    """Nominal TF TCP = desired camera origin - rotated TCP-to-optical translation."""
+    validate_observation_config(config)
+    camera = [number(basket[a], f'basket.{a}') + d for a, d in
+              zip(('x', 'y', 'z'), config['observation_camera_offset_mm'])]
+    mount = config['observation_tcp_to_camera_mm']
+    tcp = [camera[i] - sum(workspace_from_tcp[i][j] * mount[j] for j in range(3))
+           for i in range(3)]
+    return dict(zip(('x', 'y', 'z'), (number(v, 'observation TCP') for v in tcp)))
+
+
+def transit_waypoints(start, end, clearance, minimum_z):
+    """Workspace vertical lift, horizontal traverse, vertical arrival; no diagonal descent."""
+    height = max(start['z'], end['z'], minimum_z) + clearance
+    return [dict(start, z=height), dict(end, z=height), dict(end)]
 
 
 def validate_frames(meta, request, config, now_ros, now_mono):

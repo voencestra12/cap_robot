@@ -1,6 +1,8 @@
 # 양상추 Place 직전 빵 중심 보정
 
-기본값은 비활성화이며 실제 로봇을 실행하지 않고 단위 테스트로 검증한 기능입니다.
+코드 기본값은 비활성입니다. 현재 Agent YAML은 `enabled=true`이지만 새 관측 설정은
+`observation_validated=false`라 SDK 연결 전에 시작을 차단합니다. 아래 XYZ와 자세는
+장비에서 안전성이 확인되지 않았습니다. 이 변경은 실제 로봇 실행 없이 단위 테스트로만 검증했습니다.
 
 ## 기존 좌표 의미와 보정식
 
@@ -32,33 +34,47 @@ final_lettuce_xy    = nominal_lettuce_xy + delta_xy
 동일 조립의 이전 빵 층이 있어야 하고 모두 `SUCCEEDED`여야 합니다.
 별도 sandwich task-type 필드는 추가하지 않습니다.
 
-1. `execute_task()`가 기존 Pick/파지/안전 상승을 성공시킵니다.
-2. 기존 `wait_for_assembly_predecessors()`가 성공을 확인합니다.
-3. 첫 `move_to_place` 전에 `verify_place_target()`이 잠시 `is_moving=False`로 전환합니다.
-   그 외 이동 중에는 기존처럼 위치 갱신을 제한합니다.
-4. `perception_settle_sec` 이후 촬영되고 수신된 RGB와 aligned Depth만 사용합니다.
-   기존 카메라 토픽·YOLO 모델·Depth 역투영·모델 간 중복 제거를 재사용합니다.
-   RGB/Depth timestamp 차이, 두 프레임의 freshness, CameraInfo/영상 frame,
-   depth 유효성 및 **RGB 촬영 시각**의 `workspace_0 <- camera` TF를 검사합니다.
-   최신 TF나 이전 좌표로 대체하지 않습니다.
-5. 바구니의 실측 내부 XY 영역 및 절대 Z 범위에서 빵 후보가 정확히 하나여야 합니다.
-   ID 대신 클래스를 사용하며 기본 3개의 서로 다른 새 RGB/Depth 관측을 요구합니다.
-   후보 누락/복수/낮은 confidence/Depth·TF 오류는 즉시 실패합니다.
-   빵의 Depth가 무효라 내부/외부를 판별할 수 없는 경우도 보수적으로 실패합니다.
-   오래되거나 비동기인 프레임은 사용하지 않고 제한 시간 내 새 프레임을 기다립니다.
-6. 관측 간 3D 편차와 각 관측의 XY 보정량 상한을 검사하고 XY만 한 번 변경합니다.
-   보정한 접근/하강/후퇴 경유점을 기존 Agent별 Base 변환과 SDK Safety Box로 사전 검사합니다.
-   실제 이동에서도 기존 Safety Box 검사가 그대로 적용됩니다.
-7. 공용 구역 경로를 다시 판정하고 기존 토큰 획득/상실 검사/반납 경로를 사용합니다.
-   토큰 대기 후 관측이 오래되면 첫 Place도 중단합니다. 이후 경유점은 같은 XY를 유지합니다.
+1. 기존 Pick, 그리퍼 파지, 안전 상승을 완료합니다.
+2. `wait_for_assembly_predecessors()`와 같은 조립의 선행 빵 `SUCCEEDED` 검사를 수행합니다.
+3. 관측 경로용 공용 구역 Token을 확보합니다. 기존 Pick 위치 자체가 공용 구역이면
+   기존 규칙대로 Pick 전부터 보유합니다. Token/Safety Box 비활성 시 관측 작업은 거부합니다.
+4. 아래 카메라 장착 오프셋을 반영해 관측 TCP를 계산합니다. Pick 상승 위치에서
+   workspace 수직 상승 → 일정 높이 수평 이동 → 관측 위치 수직 진입으로 이동합니다.
+   기존 첫 `move_to_place(z_offset=200)`은 이 단계에서 실행하지 않습니다.
+5. 기존 SDK `wait=True` 이동이 성공한 뒤 정지/settle 시각을 새로 기록합니다.
+   `perception_settle_sec` 이후 촬영 및 수신된 RGB + aligned Depth만 사용합니다.
+   촬영 시각의 TF, CameraInfo/frame 일치, 시각 동기화, freshness, Depth 유효성을 검사합니다.
+   기존 YOLO/Depth 역투영/중복 제거를 사용하고 과거 저장 좌표로 대체하지 않습니다.
+6. 실측 바구니 내부에 빵이 정확히 하나이고 서로 다른 새 프레임들의 중심이 안정적일 때,
+   기존 양상추 `[0,-30]`에 빵 이동량만 한 번 더합니다. Z/yaw/TCP/그리퍼/Roll은 유지합니다.
+7. 보정된 모든 Place 경유점을 사전 검증합니다. 관측 위치에서 다시 수직 상승하고,
+   관측 및 높은 Place 위치보다 높은 높이에서 보정된 X/Y로 수평 이동합니다.
+   TF/Safety Box 사전 검증을 마친 **첫 보정 이동 직전** freshness를 재검사합니다.
+   이후 같은 보정 좌표를 유지하며, 카메라가 관측 위치를 떠난 뒤 재인식하지 않습니다.
+8. 원래 첫 높은 Place 접근부터 수직 이동하고 기존 하강, 그리퍼 해제, 후퇴를 수행합니다.
+   재료별 높은 위치 자세 변경과 복원, 기존 홈 복귀도 유지합니다.
+
+관측 진입/이탈 각 선분에 기존 공용 구역 기하 판정을 적용하고 Token을 보수적으로
+전체 구간에 요구합니다. 각 경유점은 기존 workspace→Base→SDK 및 Agent2 `-10mm`
+보정을 거쳐 Safety Box를 검사합니다. 직선 선분의 양 끝이 볼록한 Safety Box 내부이면
+그 선분도 내부입니다. 이는 **TCP 위치 검사**이며, 팔 링크/그리퍼/재료의 충돌 및
+관절 가동 범위나 실제 경로의 안전성을 보증하지 않습니다.
 
 기존 `latest_poses`나 `ObjectMemory`의 저장값을 Place 검증에 읽지 않습니다.
 `ObjectMemory.update()` 자체도 현재 검출만 반환하지만, 새 검증은 그것과 분리된
 요청별 관측 큐를 사용합니다. 카메라 callback에서 실제 수신 시각을 기록하므로
 일반 `latest_poses_stamp`도 추론 시작 시각 대신 RGB 수신 시각을 가집니다.
 
-검증 실패는 기존 Task 실패 경로로 이어지며 자동 하강, 그리퍼 해제, 홈 복귀,
-재시도/재할당을 추가하지 않습니다. 이미 확보한 토큰은 기존 finally에서 반납합니다.
+검출 누락/복수/불안정/과도한 보정, Depth/TF 오류 또는 timeout은 Task 실패로 끝납니다.
+관측 진입 이후 실패하면 자동 하강/해제/홈 복귀를 하지 않고 현재 그리퍼 상태를 유지합니다.
+팔이 바구니 근처에 남을 수 있으므로 Token을 자동 반납하지 않고 기존 heartbeat를 유지하며,
+해당 Agent의 후속 일반/협동 Task를 차단합니다. 성공 후 홈 복귀 완료 시에는 기존처럼 반납합니다.
+Token을 이미 상실했다면 보유를 복구했다고 가정하지 않고 추가 동작을 중단합니다.
+
+실패 복구는 작업자가 두 로봇과 파지물 위치를 확인하고, 다른 Agent의 진입을 막은 상태에서
+수행해야 합니다. 팔이 공용 구역에서 벗어난 것을 확인한 뒤 관리 절차로 Token을 반납하고
+노드를 재시작해 로컬 실패 latch를 해제합니다. 원인 해결 전 재시작/lease 만료를 안전 복구로
+간주하면 안 됩니다. 자동 복구 이동이나 임의 Place 좌표는 제공하지 않습니다.
 
 ## 실측 및 활성화
 
@@ -68,7 +84,7 @@ final_lettuce_xy    = nominal_lettuce_xy + delta_xy
 - `expected_bread_xy_offset_mm`: 정상적으로 놓인 빵의 YOLO 중심에서 동일한
   파란 점 바구니 중심을 뺀 workspace_0 `[dx,dy]`(mm).
   두 카메라의 관측 오차와 빵을 배치하는 Agent 조합을 확인해 Agent별로 실측합니다.
-  YAML의 `[0,0]`은 자리표시자입니다.
+  현재 YAML의 `[0,10]`은 기존 값을 유지했으며, 이번 변경에서 실측 확인하지 않았습니다.
 - `basket_half_extent_mm`: 파란 점 중심을 기준으로 **실제 바구니 내부에 완전히
   포함되는** workspace 축 방향 직사각형 반폭 `[hx,hy]`.
   바구니가 회전했으면 외부가 포함되지 않도록 보수적으로 줄여야 합니다.
@@ -78,17 +94,64 @@ final_lettuce_xy    = nominal_lettuce_xy + delta_xy
 - `stability_mm`: 모든 관측 쌍의 3D 거리 상한, 기본 3mm.
 - `samples=3`, `min_confidence=0.6`, `timeout_sec=5.0`, `max_age_sec=1.0`,
   `sync_tolerance_sec=0.08`은 카메라 FPS·모델 추론 시간·TF 지연을 측정해 검증합니다.
-  첫 관측부터 마지막 관측 및 첫 Place까지 모두 freshness 한도 안이어야 합니다.
+  첫 관측부터 마지막 관측 및 첫 보정 이동 직전까지 모두 freshness 한도 안이어야 합니다.
 
-정상 배치 기준과 내부 영역을 실측한 뒤 아래 두 값을 설정합니다.
+정상 배치 기준과 내부 영역, 다음 관측 경로 검증을 모두 완료한 뒤 활성화합니다.
 
 ```yaml
 lettuce_place_vision.baseline_calibrated: true
+lettuce_place_vision.observation_validated: true
 lettuce_place_vision.enabled: true
 ```
 
 `enabled=true`이지만 `baseline_calibrated=false`이면 로봇 연결 전에 설정 오류로
 종료합니다. 인식 비활성 또는 workspace_0 이외의 좌표계에서도 보정 Place를 거부합니다.
+
+### 관측 위치 설정과 장비 검증 절차
+
+| 파라미터 | 좌표 의미 |
+| --- | --- |
+| `observation_validated` | XYZ, 자세, 파지물 시야 및 전체 경로의 장비별 검증 완료 표시. 기본 `false` |
+| `observation_camera_offset_mm` | 두 파란 점의 **XYZ 평균**에서 원하는 카메라 optical 원점까지의 workspace 축 `[dx,dy,dz]` |
+| `observation_tcp_to_camera_mm` | 현재 활성 TCP 원점에서 카메라 optical 원점까지의 **TCP 로컬 축** 장착 이동량 |
+| `observation_transit_clearance_mm` | 시작점/관측점/높은 Place의 최대 workspace Z보다 추가로 올리는 여유. 실측한 양수 필요 |
+| `observation_speed_mm_s` | 관측 및 보정 X/Y 정렬 이동 속도. 기본 30 mm/s도 안전하다고 검증된 값은 아님 |
+
+벡터 기본 `[0,0,0]`과 clearance `0`은 실행 가능한 예시가 아닌 미설정 자리표시자입니다.
+새 절대 XYZ나 임의 카메라 각도는 코드에 넣지 않습니다. 바구니 중심 Z는 손잡이 평균이며
+바닥 Z가 아닙니다. 관측 자세는 해당 Agent의 **기존 Pick Base RPY**를 그대로 유지합니다.
+카메라 optical 자세는 TCP 자세와 실제 장착 회전으로 결정되며, 별도로 Roll을 바꾸지 않습니다.
+
+```text
+camera_workspace = basket_xyz + observation_camera_offset_mm
+R_workspace_tcp  = transpose(R_base_workspace) × R_base_tcp_pick
+observation_tcp  = camera_workspace - R_workspace_tcp × observation_tcp_to_camera_mm
+transit_z        = max(start_z, observation_z, high_place_z) + transit_clearance
+```
+
+위 카메라 목표는 기존 Z 보정 적용 **전 TF 기준**입니다. Agent2의 기존 SDK `-10mm`를
+관측에도 그대로 적용하므로 실제 카메라 원점은 Base Z 방향으로 10mm 내려갑니다.
+설정 측정과 시야/간섭 검증에 이 차이를 포함해야 하며, 기존 Place Z 보정값은 바꾸지 않습니다.
+
+1. 노드를 실행하지 않은 상태에서 Agent별 활성 TCP, TCP→optical 장착 이동/회전,
+   Base↔workspace TF와 기존 Pick RPY를 확인합니다. URDF/측정 결과의 축과 단위를 대조합니다.
+2. 바구니 중심과 내부/빵 높이 범위를 실측하고, 그리퍼에 양상추를 든 상태를 고려해
+   카메라 목표 상대 XYZ 및 경로 여유를 정합니다. 카메라 intrinsics와 장착 회전으로
+   빵/바구니가 시야 안에 있고 유효 Depth 거리 내인지 검토합니다.
+3. Pick 상승점→관측점→허용 보정 범위 전체의 높은 접근점에 대해 각 경유점의
+   TF/SDK 좌표와 Safety Box, 공용 구역 교차를 확인합니다. 팔 링크와 파지물 전체의
+   swept volume, 바구니 벽/손잡이/다른 팔, 관절 한계를 장비 도면 또는 시뮬레이션으로 검토합니다.
+   높은 경로라는 이유만으로 안전하다고 간주하지 않습니다.
+4. 별도 승인된 현장 검증 절차에서, 설정한 자세로 **정지한** 카메라 영상과 Depth를
+   양상추 파지 전후 비교합니다. 로그의 관측 TCP/Base 자세/장착 오프셋,
+   RGB/Depth stamp, `시야/가림 진단`의 영상 크기·빵/양상추 픽셀 중심·bbox·Depth·confidence·
+   촬영 시각 camera TF를 대조합니다. 빵이 사라지는지, 양상추 bbox와 겹치는지,
+   Depth가 가까운 양상추/그리퍼 표면을 읽는지 확인합니다.
+5. 로그만으로 가림을 확정하지 않습니다. 그리퍼 검출 모델은 추가하지 않았고,
+   부분 가림에 의한 안정적인 중심 편향도 있을 수 있으므로 실제 RGB/Depth 확인이 필요합니다.
+   현장 확인 전에는 `observation_validated=false`를 유지합니다.
+
+이 작업에서는 위 현장 확인이나 로봇 구동을 수행하지 않았습니다.
 
 빌드 예시(이 문서 작업 중 실행하지 않음):
 
@@ -119,11 +182,8 @@ python3 -m pytest -q test/test_place_verification.py test/test_material_handling
 실제 Agent 메서드 본문을 AST로 로드하고 카메라·YOLO·ROS·SDK를 mock합니다.
 정상 좌표, 이동량만 적용, Offset 비중복, 미검출/복수/외부 후보, 오래된/중복 프레임,
 불안정/과도한 이동, Depth/TF 오류, 양쪽 Agent 좌표 변환, Safety Box,
-토큰 재판정/상실/대기 중 freshness 만료 및 기존 재료 동작을 검증합니다.
-기존 테스트의 Agent2 Z 기대값만 현재 구현의 `-10mm`에 맞췄습니다.
-기존 `-50mm` 기대값 실패는 수정 전 HEAD 코드에서도 재현했습니다.
-
-검증 결과: 위 회귀 테스트 159개 및 하위 검증 80개 통과. ROS Humble 환경의
-`test/test_yolo_extra_perception.py`도 11개 및 하위 검증 15개 통과했습니다.
-Python 문법 컴파일, YAML 기본값 일치, `git diff --check`도 확인했습니다.
-환경의 SciPy/NumPy 권장 버전 불일치 경고 1종이 있으나 테스트 실패는 없습니다.
+관측 전 Token 확보/상실, 카메라 장착 오프셋 회전, 수직/수평 경로 분리,
+미검증 설정 차단, 실패 후 Token 유지와 후속 작업 차단 및 기존 재료 동작을 검증합니다.
+이번 변경의 회귀 테스트: 179개 및 하위 검증 80개 통과. Python 문법, YAML의
+미검증 설정 차단, `git diff --check`도 확인했습니다. 테스트는 실제 ROS 노드나
+SDK 연결을 만들지 않습니다. 환경의 SciPy/NumPy 버전 경고 1종이 남아 있습니다.

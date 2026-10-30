@@ -10,9 +10,19 @@
     pick_verify_timeout_sec: 3.0     # 재확인용 새 프레임 대기 한도(초)
     basket_exclusion_radius_mm: 100.0  # 적층 시 바구니 중심 XY 반경 안 재료는 후보 제외(mm), 실측 필요
 
-    # 양상추 Place 직전 YOLO 빵 이동량 보정. 아래 실측 완료 후 두 플래그를 활성화.
+    # 양상추 Place 직전 YOLO 빵 이동량 보정. 기준값과 관측 경로를 실측한 뒤 활성화.
     lettuce_place_vision.enabled: true
     lettuce_place_vision.baseline_calibrated: true
+    # 미검증: false이면 enabled=true 시작 시 SDK 연결 전에 차단합니다.
+    lettuce_place_vision.observation_validated: false
+    # 모두 자리표시자. 안전한 좌표가 아니며 장비별 실측 필요 (문서 참조).
+    # 바구니 두 파란 점의 XYZ 중심 → 카메라 optical 원점, workspace 축(mm)
+    lettuce_place_vision.observation_camera_offset_mm: [0.0, 0.0, 0.0]
+    # 기존 활성 TCP → 카메라 optical 원점, TCP 로컬 축(mm)
+    lettuce_place_vision.observation_tcp_to_camera_mm: [0.0, 0.0, 0.0]
+    # 양 끝점/높은 Place보다 추가 상승할 workspace Z 여유(mm), 양수 실측 필요
+    lettuce_place_vision.observation_transit_clearance_mm: 0.0
+    lettuce_place_vision.observation_speed_mm_s: 30.0
     # 정상 배치된 빵의 YOLO 중심 - 파란 점 바구니 중심 (workspace_0 XY).
     # [0,0]은 미설정 자리표시자이며 양상추의 [0,-30] TCP Offset과 별개입니다.
     lettuce_place_vision.expected_bread_xy_offset_mm: [0.0, 10.0]

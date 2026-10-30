@@ -179,6 +179,7 @@ class RobotAgentNode(Node):
         }
         if self.place_vision_config['enabled']:
             place_verification.validate_config(self.place_vision_config)
+            place_verification.validate_observation_config(self.place_vision_config)
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
@@ -2893,8 +2894,14 @@ class RobotAgentNode(Node):
         # 큐에서 기다리는 동안 미션/설정/선행 상태가 달라졌을 수 있다.
         # 미설정 재료는 clean_error/set_state를 포함한 SDK 호출 전에 거부한다.
         try:
+            if getattr(self, '_place_observation_fault', False):
+                raise RuntimeError('이전 관측 실패의 안전 복구 전에는 새 Task를 실행할 수 없습니다.')
             if not self.validate_received_task(task):
                 return False
+            if self.needs_place_verification(task):
+                place_verification.validate_observation_config(self.place_vision_config)
+                if not self.zone_token_enabled or not self.enable_sdk_safety_box:
+                    raise ValueError('양상추 관측에는 Token과 SDK Safety Box가 활성화되어야 합니다.')
             placement_profile = placement_tilt(task['target'], self.agent_id)
             pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
                         if placement_profile is not None else None)
@@ -2936,21 +2943,50 @@ class RobotAgentNode(Node):
         acquired_here = False
         assembly_place_ready = False
         grasped = lifted = False
-        place_verification_result = None
+        observation_entered = False
+        completed = False
+        last_pick_pose = None
         try:
             self.arm.clean_error()
             self.arm.set_state(0)
             for index, action in enumerate(task['actions'], start=1):
                 api = action['api']
+                if observation_entered:
+                    self.require_observation_token()
 
                 if 'assembly' in task and api == 'move_to_place' and not assembly_place_ready:
                     self.wait_for_assembly_predecessors(task)
                     if self.needs_place_verification(task):
                         if not (grasped and lifted):
                             raise ValueError('양상추 파지 후 안전 상승이 확인되지 않았습니다.')
-                        place_verification_result = self.verify_place_target(task)
-                        # Reclassify the corrected path before the existing token gate.
+                        self.check_place_bread_predecessors(task)
+                        if action['z_offset'] < 150:
+                            raise ValueError('관측 후 첫 Place는 높은 접근 위치여야 합니다.')
+                        # Observation and its detour are protected even when the nominal
+                        # pick-to-place line never touches the shared zone.
+                        if not acquired_here:
+                            if not self.acquire_zone_token(task['task_id']):
+                                return False
+                            acquired_here = True
+                        self.require_observation_token()
+                        observation_pose, observation_attitude, path = self.plan_place_observation(
+                            task, last_pick_pose, pick_rpy, action)
+                        observation_entered = True
+                        self.move_observation_path(task, path, observation_attitude, 'observe')
+                        request, observations = self.verify_place_target(task)
                         zone_plan = self.task_shared_zone_plan(task)
+                        # Keep the original first Place action. First align corrected XY
+                        # above both endpoints, so it can only descend vertically.
+                        high = assembly_move_pose(task['reference_place_pose'],
+                                                  action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM)
+                        path = place_verification.transit_waypoints(
+                            observation_pose, high,
+                            self.place_vision_config['observation_transit_clearance_mm'], high['z'])
+                        # Freshness gates the start of the corrected transfer. Inference
+                        # must not be repeated after the camera has left its view pose.
+                        self.move_observation_path(
+                            task, [observation_pose] + path[:2], observation_attitude,
+                            'corrected approach', verification=(request, observations))
                     assembly_place_ready = True
 
                 # 공용 구역에 처음 들어가는 모션 직전에 토큰을 확보합니다.
@@ -2980,15 +3016,6 @@ class RobotAgentNode(Node):
                     # 실행 시작 때 갱신한 중심을 유지한다. 팔의 가림/노이즈를 따라 움직이지 않는다.
                     self.resolve_task_assembly(task, basket_center=basket_center)
 
-                if api == 'move_to_place' and place_verification_result is not None:
-                    # A token wait must not turn a fresh observation into a stale Place command.
-                    request, observations = place_verification_result
-                    for observation in observations:
-                        place_verification.validate_frames(
-                            observation['meta'], request, self.place_vision_config,
-                            self.now_sec(), time.monotonic())
-                    place_verification_result = None
-
                 self.get_logger().info(f"💻 [{task['task_id']}] Action {index}: {action}")
 
                 if api == 'control_gripper':
@@ -3011,6 +3038,8 @@ class RobotAgentNode(Node):
                     )
                     if success and grasped:
                         lifted = action['z_offset'] >= 150
+                        last_pick_pose = dict(x=obj['x'], y=obj['y'],
+                                              z=obj['z'] + action['z_offset'], yaw=obj['yaw'])
                 elif api == 'move_to_place':
                     success = self.execute_place_action(task, action, placement_state)
                 elif api == 'wait':
@@ -3035,6 +3064,8 @@ class RobotAgentNode(Node):
             self.get_logger().info(
                 f"🏠 [{task['task_id']}] 작업 완료 후 기본 자세로 복귀"
             )
+            if observation_entered:
+                self.require_observation_token()
             if not self.return_to_home_joint_pose():
                 return False
 
@@ -3046,14 +3077,22 @@ class RobotAgentNode(Node):
                         float(reference_place['x']), float(reference_place['y'])
                     ))
             self.get_logger().info(f"✅ [{task['task_id']}] 작업 완료")
+            completed = True
             return True
 
         except Exception as error:
             self.get_logger().error(f"🚨 [{task['task_id']}] 작업 오류: {error}")
             return False
         finally:
-            # 성공/실패/예외 어느 경로로 끝나든 확보한 토큰은 반드시 반납합니다.
-            if acquired_here:
+            # A failed observation leaves the arm holding lettuce near the basket.
+            # Keep the reservation/heartbeat until an operator has recovered it.
+            if acquired_here and observation_entered and not completed:
+                self._place_observation_fault = True
+                self.get_logger().error(
+                    f'관측/Place 중단: 현재 그리퍼 상태 유지, 자동 복귀 없음. '
+                    f'공용 구역 Token 자동 반납 안 함 (보유={self._zone_token_held}); '
+                    '작업자 위치 확인 및 안전 복구 후 반납이 필요합니다.')
+            elif acquired_here:
                 self.release_zone_token(task['task_id'])
 
     def needs_place_verification(self, task):
@@ -3062,13 +3101,79 @@ class RobotAgentNode(Node):
                 and assembly.get('container') == 'basket'
                 and assembly.get('material') == '양상추')
 
-    def verify_place_target(self, task):
-        """After successful grasp/lift and predecessor wait, observe without moving."""
+    def require_observation_token(self):
+        if not self.zone_token_enabled or not self._zone_token_held:
+            raise RuntimeError('양상추 관측/보정 이동 중 공용 구역 Token이 없습니다.')
+
+    def plan_place_observation(self, task, last_pick_pose, pick_rpy, action):
+        """Camera-relative basket view, preserving the existing grasp attitude."""
         config = self.place_vision_config
-        place_verification.validate_config(config)
-        if not self.enable_perception or self.workspace_frame != 'workspace_0':
-            raise ValueError('양상추 비전 보정에는 마운트 인식과 workspace_0이 필요합니다.')
-        # Existing schema identifies sandwich assembly by basket/material/layer dependencies.
+        place_verification.validate_observation_config(config)
+        transform = self.lookup_workspace_transform(self.agent_id).transform
+        q = transform.rotation
+        rotation = self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
+        translation = np.array([transform.translation.x, transform.translation.y,
+                                transform.translation.z]) * 1000.0
+        attitude = (dict(roll_deg=pick_rpy[0], pitch_deg=pick_rpy[1],
+                         yaw=math.radians(pick_rpy[2])) if pick_rpy is not None else
+                    dict(roll_deg=180.0, pitch_deg=0.0, yaw=last_pick_pose['yaw']))
+        tcp_rotation = rpy_to_matrix(math.radians(attitude['roll_deg']),
+                                     math.radians(attitude['pitch_deg']), attitude['yaw'])
+        view = place_verification.observation_pose(
+            task['basket_center_workspace'], config, rotation.T @ tcp_rotation)
+        view['yaw'] = task['reference_place_pose'].get('yaw', 0.0)
+        start_xyz = rotation.T @ (np.array([last_pick_pose[a] for a in ('x', 'y', 'z')])
+                                  - translation)
+        start = dict(zip(('x', 'y', 'z'), start_xyz), yaw=view['yaw'])
+        high = assembly_move_pose(task['reference_place_pose'], action['z_offset'],
+                                  self.PICK_PLACE_Z_OFFSET_MM)
+        path = [start] + place_verification.transit_waypoints(
+            start, view, config['observation_transit_clearance_mm'], high['z'])
+        self.get_logger().info(
+            f"[{task['task_id']}] 관측 계획 workspace TCP={view}, basket={task['basket_center_workspace']}, "
+            f"camera_offset={config['observation_camera_offset_mm']}, "
+            f"mount_TCP={config['observation_tcp_to_camera_mm']}, Base 자세={attitude}, "
+            f"기존 SDK Z 보정={-10 if self.agent_id == 'agent2' else 0}mm; "
+            '양상추 파지 상태에서 빵 시야/Depth 가림을 확인해야 합니다.')
+        return view, attitude, path
+
+    def move_observation_path(self, task, path, attitude, label, verification=None):
+        """Preflight every segment, then use the existing blocking TF/SDK mover."""
+        self.require_observation_token()
+        robot_path = []
+        box = self._shared_zone_box()
+        for index, point in enumerate(path):
+            if index:
+                previous = path[index - 1]
+                _, reason = classify_shared_zone_entry(
+                    previous['x'], previous['y'], point['x'], point['y'], box)
+                self.get_logger().info(f'[{task["task_id"]}] {label} segment {index}: {reason}')
+            pose = self.convert_place_pose(point, self.agent_id)
+            sdk = self.tf_pose_to_sdk_pose(
+                pose['x'], pose['y'], pose['z'] - (10.0 if self.agent_id == 'agent2' else 0.0),
+                yaw=attitude['yaw'], agent_id=self.agent_id)
+            if not all(math.isfinite(sdk[a]) for a in ('x', 'y', 'z')):
+                raise ValueError('관측 경로 TF/SDK 좌표가 유한하지 않습니다.')
+            # A box is convex: checked endpoints bound each straight Cartesian segment.
+            self.check_sdk_pose_or_raise(sdk['x'], sdk['y'], sdk['z'], label=label)
+            robot_path.append(pose)
+        # TF preflight can itself take time; gate freshness after it, just before motion.
+        self.check_place_bread_predecessors(task)
+        if verification is not None:
+            request, observations = verification
+            for observation in observations:
+                place_verification.validate_frames(
+                    observation['meta'], request, self.place_vision_config,
+                    self.now_sec(), time.monotonic())
+        for pose in robot_path[1:]:
+            self.require_observation_token()
+            if not self.move_to_robot_tf(
+                    pose['x'], pose['y'], pose['z'], **attitude,
+                    speed=self.place_vision_config['observation_speed_mm_s'], label=label):
+                raise RuntimeError(f'{label} 이동 실패')
+            self.require_observation_token()
+
+    def check_place_bread_predecessors(self, task):
         self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
         with self.guidebook_lock:
             assembly = task['assembly']
@@ -3079,6 +3184,15 @@ class RobotAgentNode(Node):
             if not breads or any(self.guidebook_task_status.get(t['task_id']) != 'SUCCEEDED'
                                  for t in breads):
                 raise ValueError('동일 조립의 선행 빵 Place 성공이 확인되지 않았습니다.')
+
+    def verify_place_target(self, task):
+        """Called only after the blocking observation move has completed."""
+        config = self.place_vision_config
+        place_verification.validate_config(config)
+        self.require_observation_token()
+        if not self.enable_perception or self.workspace_frame != 'workspace_0':
+            raise ValueError('양상추 비전 보정에는 마운트 인식과 workspace_0이 필요합니다.')
+        self.check_place_bread_predecessors(task)
         settle = max(0.0, self.perception_settle_sec)
         request = dict(since_mono=time.monotonic() + settle,
                        since_ros=self.now_sec() + settle, last_stamps=(0.0, 0.0))
@@ -3091,10 +3205,16 @@ class RobotAgentNode(Node):
             self.is_moving = False
         try:
             while rclpy.ok() and time.monotonic() < deadline:
+                self.require_observation_token()
                 with self.perception_lock:
                     batch = self.place_observations
                     self.place_observations = []
                 for observation in batch:
+                    self.get_logger().info(
+                        f"[{task['task_id']}] 관측 RGB/Depth={observation['meta']}, "
+                        f"detections={observation['detections']}, "
+                        f"시야/가림 진단={observation.get('visibility', '미제공')}; "
+                        '미검출은 가림 확정이 아니며 그리퍼/양상추와 빵의 영상 중첩 확인 필요')
                     place_verification.validate_frames(
                         observation['meta'], request, config, self.now_sec(), time.monotonic())
                     if observations and any(
@@ -3225,6 +3345,9 @@ class RobotAgentNode(Node):
         - 같은 Agent에서 단일 task와 협동 task는 직렬 큐(process_task_queue) 덕분에
           동시에 실행되지 않는다.
         """
+        if getattr(self, '_place_observation_fault', False):
+            self.get_logger().error('관측 실패 복구 전 협동 Task를 차단합니다.')
+            return False
         task_id = str(task['task_id'])
         is_coordinator = str(task.get('coordinator_id', '')) == self.agent_id
         local_pose = dict(task['target_poses_workspace'][self.agent_id])
@@ -3509,6 +3632,7 @@ class RobotAgentNode(Node):
                 # 앞 모델의 시각화가 다음 모델의 추론 입력에 섞이지 않게 합니다.
                 inference_image = img.copy()
                 detections, annotations = [], []
+                visibility = []
                 candidates = []
                 collect_detections = not self.is_moving
 
@@ -3563,6 +3687,11 @@ class RobotAgentNode(Node):
                             front_pt = pt1 if np.linalg.norm(center_px - pt1) > np.linalg.norm(center_px - pt2) else pt2
 
                             dist_z = self.median_depth_m(depth_img, cx, cy)
+                            if place_request is not None and name_ko in ('빵', '양상추'):
+                                visibility.append(dict(
+                                    material=name_ko, center_px=[cx, cy],
+                                    bounds_px=mask_np.min(axis=0).tolist() + mask_np.max(axis=0).tolist(),
+                                    depth_m=dist_z, confidence=float(detected_box.conf[0])))
                             if dist_z is None:
                                 if place_request is not None and name_ko == '빵':
                                     observation_error = '빵 Depth가 유효하지 않습니다.'
@@ -3618,6 +3747,8 @@ class RobotAgentNode(Node):
                     if place_request is not None:
                         observation = dict(
                             frame_id=self.workspace_frame, meta=frame_meta, error=observation_error,
+                            visibility=dict(image_size=list(img.shape[:2]), objects=visibility,
+                                            camera_transform=str(strict_transform)),
                             detections=[(*candidates[i]['detection'], candidates[i]['confidence'])
                                         for i in kept_indices],
                         )

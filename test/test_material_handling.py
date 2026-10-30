@@ -20,6 +20,7 @@ from cap_robot.material_handling import (
     material_profile, validate_assembly_tasks, basket_center_from_perception, placement_tilt,
 )
 
+from cap_robot.shared_zone import classify_shared_zone_entry
 from cap_robot.utils import rpy_to_matrix, matrix_to_rpy, quaternion_xyzw_to_matrix
 from cap_robot.object_memory import (
     nearest_instance, object_class, resolve_object_target, without_nearby,
@@ -233,13 +234,15 @@ def load_agent_methods():
     names = {
         'validate_actions', 'resolve_task_assembly', 'refresh_execution_assembly',
         'validate_guidebook_policy_candidate', 'build_tasks', 'validate_received_task',
-        'execute_task', 'execute_place_action', 'get_basket_center_workspace',
+        'execute_task', 'execute_place_action', 'execute_cooperative_task', 'get_basket_center_workspace',
         'workspace_rpy_to_robot', 'move_to_sdk', 'move_to_robot_tf',
         'normalize_angle_rad', 'tf_pose_to_sdk_pose',
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
         'find_detected_target', 'normalize_zone', 'resolve_target_destination',
         'verify_pick_target', 'needs_place_verification', 'verify_place_target',
+        'require_observation_token', 'plan_place_observation', 'move_observation_path',
+        'check_place_bread_predecessors',
         'image_frame_metadata', 'color_callback', 'depth_callback',
         'get_latest_perception_frames', 'place_camera_transform',
         'workspace_place_to_robot_place', 'convert_place_pose',
@@ -249,6 +252,7 @@ def load_agent_methods():
     module = ast.fix_missing_locations(ast.Module(body=[original], type_ignores=[]))
     namespace = {
         'place_verification': place_verification,
+        'classify_shared_zone_entry': classify_shared_zone_entry,
         'RclpyTime': lambda **kw: SimpleNamespace(**kw),
         'Duration': lambda **kw: SimpleNamespace(**kw),
         'math': math, 'time': time, 'rclpy': SimpleNamespace(ok=lambda: True),
