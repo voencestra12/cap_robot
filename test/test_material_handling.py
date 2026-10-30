@@ -13,6 +13,7 @@ import numpy as np
 from unittest.mock import Mock, patch
 
 from cap_robot import object_profiles as settings
+from cap_robot import place_verification
 from cap_robot.llm_api import DEFAULT_PNP_ACTIONS, validate_actions
 from cap_robot.material_handling import (
     assembly_move_pose, assembly_placement, bind_gripper_actions,
@@ -238,12 +239,18 @@ def load_agent_methods():
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
         'find_detected_target', 'normalize_zone', 'resolve_target_destination',
-        'verify_pick_target',
+        'verify_pick_target', 'needs_place_verification', 'verify_place_target',
+        'image_frame_metadata', 'color_callback', 'depth_callback',
+        'get_latest_perception_frames', 'place_camera_transform',
+        'workspace_place_to_robot_place', 'convert_place_pose',
     }
     original.bases = []
     original.body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]
     module = ast.fix_missing_locations(ast.Module(body=[original], type_ignores=[]))
     namespace = {
+        'place_verification': place_verification,
+        'RclpyTime': lambda **kw: SimpleNamespace(**kw),
+        'Duration': lambda **kw: SimpleNamespace(**kw),
         'math': math, 'time': time, 'rclpy': SimpleNamespace(ok=lambda: True),
         'object_class': object_class, 'resolve_object_target': resolve_object_target,
         'nearest_instance': nearest_instance, 'without_nearby': without_nearby,
@@ -638,7 +645,7 @@ class AgentAssemblyTest(ConfiguredTest):
                     self.assertEqual(xyz[6], xyz[7])
                     self.assertNotEqual(xyz[5], xyz[6])
                     if not assembly:
-                        self.assertEqual(xyz[5], [401, 202, 140])  # 150 + 40 - agent2 보정 50
+                        self.assertEqual(xyz[5], [401, 202, 180])  # 기존 코드: 150 + 40 - agent2 보정 10
                     release = max(i for i, event in enumerate(events) if event == ('grip', 850))
                     self.assertEqual(events[release - 1][1], moves[5])
                     self.assertEqual(events[release + 1][1], moves[6])

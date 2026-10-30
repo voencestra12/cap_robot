@@ -146,15 +146,16 @@ class PerceptionIntegrationTest(unittest.TestCase):
         node = namespace['RobotAgentNode']()
         node.agent_id = 'test'
         node.is_moving = False
+        node.place_verification_request = None
         node.yolo_cross_model_iou_threshold = 0.6
         node.perception_lock = threading.Lock()
         node.object_memory = ObjectMemory()
         node.get_latest_perception_frames = lambda: (
-            np.zeros((100, 200, 3), dtype=np.uint8), None, {},
+            np.zeros((100, 200, 3), dtype=np.uint8), None, {}, {'color_received': 42.0},
         )
         node.median_depth_m = lambda depth, x, y: None if x > 150 else 1.0
         node.deproject_pixel_to_point = lambda x, y, depth, intrinsics: (x, y, depth)
-        node.camera_point_to_workspace = lambda x, y, z: (x, y, z)
+        node.camera_point_to_workspace = lambda x, y, z, **kw: (x, y, z)
         self.node = node
         self.drawing = drawing
 
@@ -162,7 +163,7 @@ class PerceptionIntegrationTest(unittest.TestCase):
     def result(centers):
         masks = [np.array([[x - 5, 10], [x + 5, 10], [x + 5, 30], [x - 5, 30]],
                           dtype=np.float32) for x in centers]
-        return [SimpleNamespace(boxes=[SimpleNamespace(cls=[0]) for _ in centers],
+        return [SimpleNamespace(boxes=[SimpleNamespace(cls=[0], conf=[0.9]) for _ in centers],
                                 masks=SimpleNamespace(xy=masks))]
 
     def test_yolo_loop_exposes_every_instance_to_prompt(self):
