@@ -10,31 +10,29 @@
     pick_verify_timeout_sec: 3.0     # 재확인용 새 프레임 대기 한도(초)
     basket_exclusion_radius_mm: 100.0  # 적층 시 바구니 중심 XY 반경 안 재료는 후보 제외(mm), 실측 필요
 
-    # 양상추 Place 직전 YOLO 빵 이동량 보정. 기준값과 관측 경로를 실측한 뒤 활성화.
-    lettuce_place_vision.enabled: true
-    lettuce_place_vision.baseline_calibrated: true
-    # 미검증: false이면 enabled=true 시작 시 SDK 연결 전에 차단합니다.
-    lettuce_place_vision.observation_validated: true
-    # 모두 자리표시자. 안전한 좌표가 아니며 장비별 실측 필요 (문서 참조).
-    # 바구니 두 파란 점의 XYZ 중심 → 카메라 optical 원점, workspace 축(mm)
-    lettuce_place_vision.observation_camera_offset_mm: [0.0, 0.0, 0.0]
-    # 기존 활성 TCP → 카메라 optical 원점, TCP 로컬 축(mm)
-    lettuce_place_vision.observation_tcp_to_camera_mm: [0.0, 0.0, 0.0]
-    # 양 끝점/높은 Place보다 추가 상승할 workspace Z 여유(mm), 양수 실측 필요
-    lettuce_place_vision.observation_transit_clearance_mm: 0.0
-    lettuce_place_vision.observation_speed_mm_s: 30.0
-    # 정상 배치된 빵의 YOLO 중심 - 파란 점 바구니 중심 (workspace_0 XY).
-    # [0,0]은 미설정 자리표시자이며 양상추의 [0,-30] TCP Offset과 별개입니다.
-    lettuce_place_vision.expected_bread_xy_offset_mm: [0.0, 10.0]
-    lettuce_place_vision.basket_half_extent_mm: [60.0, 60.0] # 내부에 완전히 포함되는 XY 반폭, 실측 필요
-    lettuce_place_vision.bread_z_range_mm: [5.0, 80.0]      # workspace_0 절대 Z, 실측 필요
-    lettuce_place_vision.max_correction_mm: 20.0           # XY 이동량의 유클리드 거리
-    lettuce_place_vision.stability_mm: 3.0                 # 관측 간 최대 3D 거리
-    lettuce_place_vision.samples: 3
-    lettuce_place_vision.min_confidence: 0.6
-    lettuce_place_vision.timeout_sec: 5.0
-    lettuce_place_vision.max_age_sec: 1.0
-    lettuce_place_vision.sync_tolerance_sec: 0.08
+    # 공통 적층 보정. .nan/빈 문자열은 미설정이며 enabled=true 실행을 차단합니다.
+    stack_place_vision.enabled: false
+    stack_place_vision.materials: ["양상추"]  # 햄/빵은 파지 중심 Offset 실측 후 추가
+    # 파지 자세를 유지한 카메라 시야/경로/높이 검증 후에만 true
+    stack_place_vision.observation_validated: false
+    stack_place_vision.tcp_frame: ""  # SDK 활성 TCP와 일치하는 실제 TF 프레임; link6로 추정 금지
+    # 바구니 파란 점 XY 평균 → 카메라 optical 원점 XY (workspace 축, mm)
+    stack_place_vision.observation_camera_xy_offset_mm: [.nan, .nan]
+    # 카메라 원점의 workspace_0 절대 Z. 손잡이 Z를 더하지 않음
+    stack_place_vision.observation_camera_z_mm: .nan
+    # 수평 이동 workspace TCP 높이: Pick 상승/관측/기존 높은 Place보다 높게 실측 검증
+    stack_place_vision.observation_transit_z_mm: .nan
+    stack_place_vision.observation_speed_mm_s: .nan  # 파지 상태에서 검증할 관측 이동 속도
+    stack_place_vision.basket_half_extent_mm: [.nan, .nan]  # 바구니 내부 XY 반폭 실측
+    stack_place_vision.target_z_range_mm: [.nan, .nan]  # 이전 층 중심 workspace 절대 Z 범위 실측
+    stack_place_vision.max_correction_mm: .nan  # 기존 TCP XY 대비 허용 이동 거리 실측
+    # 아래는 기존 영상 검증 기준을 재사용; 현장 영상 품질 확인 필요
+    stack_place_vision.stability_mm: 3.0
+    stack_place_vision.samples: 3
+    stack_place_vision.min_confidence: 0.6
+    stack_place_vision.timeout_sec: 5.0
+    stack_place_vision.max_age_sec: 1.0
+    stack_place_vision.sync_tolerance_sec: 0.08
 
     # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
     agent_specs: ["agent1:A", "agent2:B"]

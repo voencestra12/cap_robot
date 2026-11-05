@@ -22,7 +22,7 @@ from tf2_ros import Buffer, TransformListener
 from xarm.wrapper import XArmAPI
 
 try:
-    from . import place_verification
+    from . import stack_place
     from .detection_fusion import cross_model_keep_indices
     from .llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from .llm_api import validate_cooperative_actions
@@ -40,7 +40,7 @@ try:
     from .shared_zone import classify_shared_zone_entry, expand_aabb
 except ImportError:
     # 소스 디렉터리에서 직접 실행할 때를 위한 fallback
-    import place_verification
+    import stack_place
     from detection_fusion import cross_model_keep_indices
     from llm_api import DEFAULT_PNP_ACTIONS as LLM_DEFAULT_PNP_ACTIONS
     from llm_api import validate_cooperative_actions
@@ -92,8 +92,8 @@ class RobotAgentNode(Node):
     def __init__(self):
         super().__init__('robot_agent_node')
         
-        for name, default in place_verification.DEFAULTS.items():
-            self.declare_parameter(f'lettuce_place_vision.{name}', default)
+        for name, default in stack_place.DEFAULTS.items():
+            self.declare_parameter(f'stack_place_vision.{name}', default)
 
         self.declare_parameter('agent_id', 'agent1')
         self.declare_parameter('robot_ip', '192.168.1.218')
@@ -173,13 +173,13 @@ class RobotAgentNode(Node):
         self.declare_parameter('shared_zone_y_max', 500.0)
         self.declare_parameter('shared_zone_margin_mm', 0.0)
 
-        self.place_vision_config = {
-            name: self.get_parameter(f'lettuce_place_vision.{name}').value
-            for name in place_verification.DEFAULTS
+        self.stack_vision_config = {
+            name: self.get_parameter(f'stack_place_vision.{name}').value
+            for name in stack_place.DEFAULTS
         }
-        if self.place_vision_config['enabled']:
-            place_verification.validate_config(self.place_vision_config)
-            place_verification.validate_observation_config(self.place_vision_config)
+        if self.stack_vision_config['enabled']:
+            stack_place.validate_config(self.stack_vision_config)
+            stack_place.validate_observation_config(self.stack_vision_config)
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
@@ -2865,12 +2865,18 @@ class RobotAgentNode(Node):
         speed = min(action['speed'], tilt['place_tilt_speed'])
 
         def move(attitude, suffix):
-            return self.move_to_robot_tf(
+            if self.needs_stack_place(task):
+                self.require_observation_token()
+                self.get_previous_layer_target(task)
+            success = self.move_to_robot_tf(
                 target_pose['x'], target_pose['y'], target_pose['z'],
                 yaw=attitude['yaw'], roll_deg=math.degrees(attitude['roll']),
                 pitch_deg=math.degrees(attitude['pitch']), speed=speed,
                 label=f'{label} {suffix}',
             )
+            if self.needs_stack_place(task):
+                self.require_observation_token()
+            return success
 
         if not state['started']:
             if action['z_offset'] < 150:
@@ -2898,10 +2904,12 @@ class RobotAgentNode(Node):
                 raise RuntimeError('이전 관측 실패의 안전 복구 전에는 새 Task를 실행할 수 없습니다.')
             if not self.validate_received_task(task):
                 return False
-            if self.needs_place_verification(task):
-                place_verification.validate_observation_config(self.place_vision_config)
+            if self.needs_stack_place(task):
+                stack_place.validate_config(self.stack_vision_config)
+                stack_place.validate_observation_config(self.stack_vision_config)
+                stack_place.material_center_offset(task['assembly']['material'], self.agent_id)
                 if not self.zone_token_enabled or not self.enable_sdk_safety_box:
-                    raise ValueError('양상추 관측에는 Token과 SDK Safety Box가 활성화되어야 합니다.')
+                    raise ValueError('적층 관측에는 Token과 SDK Safety Box가 활성화되어야 합니다.')
             placement_profile = placement_tilt(task['target'], self.agent_id)
             pick_rpy = (placement_profile.get('pick_rpy_robot_deg')
                         if placement_profile is not None else None)
@@ -2953,13 +2961,14 @@ class RobotAgentNode(Node):
                 api = action['api']
                 if observation_entered:
                     self.require_observation_token()
+                    self.get_previous_layer_target(task)
 
                 if 'assembly' in task and api == 'move_to_place' and not assembly_place_ready:
                     self.wait_for_assembly_predecessors(task)
-                    if self.needs_place_verification(task):
+                    if self.needs_stack_place(task):
                         if not (grasped and lifted):
-                            raise ValueError('양상추 파지 후 안전 상승이 확인되지 않았습니다.')
-                        self.check_place_bread_predecessors(task)
+                            raise ValueError('재료 파지 후 안전 상승이 확인되지 않았습니다.')
+                        self.get_previous_layer_target(task)
                         if action['z_offset'] < 150:
                             raise ValueError('관측 후 첫 Place는 높은 접근 위치여야 합니다.')
                         # Observation and its detour are protected even when the nominal
@@ -2969,24 +2978,9 @@ class RobotAgentNode(Node):
                                 return False
                             acquired_here = True
                         self.require_observation_token()
-                        observation_pose, observation_attitude, path = self.plan_place_observation(
-                            task, last_pick_pose, pick_rpy, action)
                         observation_entered = True
-                        self.move_observation_path(task, path, observation_attitude, 'observe')
-                        request, observations = self.verify_place_target(task)
+                        self.prepare_stack_place(task, last_pick_pose, pick_rpy, action)
                         zone_plan = self.task_shared_zone_plan(task)
-                        # Keep the original first Place action. First align corrected XY
-                        # above both endpoints, so it can only descend vertically.
-                        high = assembly_move_pose(task['reference_place_pose'],
-                                                  action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM)
-                        path = place_verification.transit_waypoints(
-                            observation_pose, high,
-                            self.place_vision_config['observation_transit_clearance_mm'], high['z'])
-                        # Freshness gates the start of the corrected transfer. Inference
-                        # must not be repeated after the camera has left its view pose.
-                        self.move_observation_path(
-                            task, [observation_pose] + path[:2], observation_attitude,
-                            'corrected approach', verification=(request, observations))
                     assembly_place_ready = True
 
                 # 공용 구역에 처음 들어가는 모션 직전에 토큰을 확보합니다.
@@ -3084,7 +3078,7 @@ class RobotAgentNode(Node):
             self.get_logger().error(f"🚨 [{task['task_id']}] 작업 오류: {error}")
             return False
         finally:
-            # A failed observation leaves the arm holding lettuce near the basket.
+            # A failed observation leaves the arm holding material near the basket.
             # Keep the reservation/heartbeat until an operator has recovered it.
             if acquired_here and observation_entered and not completed:
                 self._place_observation_fault = True
@@ -3095,20 +3089,21 @@ class RobotAgentNode(Node):
             elif acquired_here:
                 self.release_zone_token(task['task_id'])
 
-    def needs_place_verification(self, task):
+    def needs_stack_place(self, task):
         assembly = task.get('assembly', {})
-        return (getattr(self, 'place_vision_config', {}).get('enabled', False)
+        return (getattr(self, 'stack_vision_config', {}).get('enabled', False)
                 and assembly.get('container') == 'basket'
-                and assembly.get('material') == '양상추')
+                and assembly.get('layer_index', 0) >= 1
+                and assembly.get('material') in self.stack_vision_config['materials'])
 
     def require_observation_token(self):
         if not self.zone_token_enabled or not self._zone_token_held:
-            raise RuntimeError('양상추 관측/보정 이동 중 공용 구역 Token이 없습니다.')
+            raise RuntimeError('적층 관측/보정 이동 중 공용 구역 Token이 없습니다.')
 
-    def plan_place_observation(self, task, last_pick_pose, pick_rpy, action):
+    def plan_stack_observation(self, task, last_pick_pose, pick_rpy, action):
         """Camera-relative basket view, preserving the existing grasp attitude."""
-        config = self.place_vision_config
-        place_verification.validate_observation_config(config)
+        config = self.stack_vision_config
+        stack_place.validate_observation_config(config)
         transform = self.lookup_workspace_transform(self.agent_id).transform
         q = transform.rotation
         rotation = self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
@@ -3119,25 +3114,32 @@ class RobotAgentNode(Node):
                     dict(roll_deg=180.0, pitch_deg=0.0, yaw=last_pick_pose['yaw']))
         tcp_rotation = rpy_to_matrix(math.radians(attitude['roll_deg']),
                                      math.radians(attitude['pitch_deg']), attitude['yaw'])
-        view = place_verification.observation_pose(
-            task['basket_center_workspace'], config, rotation.T @ tcp_rotation)
+        mount = self.stack_camera_mount()
+        view = stack_place.observation_pose(
+            task['basket_center_workspace'], config, rotation.T @ tcp_rotation, mount)
+        # Account for the existing Agent2 SDK Z adjustment only in the camera view plan.
+        # The common mover and the existing Place coordinates remain unchanged.
+        if self.agent_id == 'agent2':
+            compensation = rotation.T @ np.array([0.0, 0.0, 10.0])
+            for axis, delta in zip(('x', 'y', 'z'), compensation):
+                view[axis] += delta
         view['yaw'] = task['reference_place_pose'].get('yaw', 0.0)
         start_xyz = rotation.T @ (np.array([last_pick_pose[a] for a in ('x', 'y', 'z')])
                                   - translation)
         start = dict(zip(('x', 'y', 'z'), start_xyz), yaw=view['yaw'])
         high = assembly_move_pose(task['reference_place_pose'], action['z_offset'],
                                   self.PICK_PLACE_Z_OFFSET_MM)
-        path = [start] + place_verification.transit_waypoints(
-            start, view, config['observation_transit_clearance_mm'], high['z'])
+        path = [start] + stack_place.transit_waypoints(
+            start, view, config['observation_transit_z_mm'], high['z'])
         self.get_logger().info(
             f"[{task['task_id']}] 관측 계획 workspace TCP={view}, basket={task['basket_center_workspace']}, "
-            f"camera_offset={config['observation_camera_offset_mm']}, "
-            f"mount_TCP={config['observation_tcp_to_camera_mm']}, Base 자세={attitude}, "
+            f"camera_XY={config['observation_camera_xy_offset_mm']}, "
+            f"mount_TCP_TF={mount}, Base 자세={attitude}, "
             f"기존 SDK Z 보정={-10 if self.agent_id == 'agent2' else 0}mm; "
-            '양상추 파지 상태에서 빵 시야/Depth 가림을 확인해야 합니다.')
+            '파지 상태에서 이전 층 시야/Depth 가림을 확인해야 합니다.')
         return view, attitude, path
 
-    def move_observation_path(self, task, path, attitude, label, verification=None):
+    def move_stack_observation_path(self, task, path, attitude, label, verification=None):
         """Preflight every segment, then use the existing blocking TF/SDK mover."""
         self.require_observation_token()
         robot_path = []
@@ -3158,44 +3160,108 @@ class RobotAgentNode(Node):
             self.check_sdk_pose_or_raise(sdk['x'], sdk['y'], sdk['z'], label=label)
             robot_path.append(pose)
         # TF preflight can itself take time; gate freshness after it, just before motion.
-        self.check_place_bread_predecessors(task)
+        self.get_previous_layer_target(task)
         if verification is not None:
             request, observations = verification
             for observation in observations:
-                place_verification.validate_frames(
-                    observation['meta'], request, self.place_vision_config,
+                stack_place.validate_frames(
+                    observation['meta'], request, self.stack_vision_config,
                     self.now_sec(), time.monotonic())
         for pose in robot_path[1:]:
             self.require_observation_token()
+            self.get_previous_layer_target(task)
             if not self.move_to_robot_tf(
                     pose['x'], pose['y'], pose['z'], **attitude,
-                    speed=self.place_vision_config['observation_speed_mm_s'], label=label):
+                    speed=self.stack_vision_config['observation_speed_mm_s'], label=label):
                 raise RuntimeError(f'{label} 이동 실패')
             self.require_observation_token()
 
-    def check_place_bread_predecessors(self, task):
+    def get_previous_layer_target(self, task):
         self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
         with self.guidebook_lock:
-            assembly = task['assembly']
-            breads = [t for t in self.guidebook_tasks.values()
-                      if t.get('assembly', {}).get('id') == assembly['id']
-                      and t['assembly']['material'] == '빵'
-                      and t['assembly']['layer_index'] < assembly['layer_index']]
-            if not breads or any(self.guidebook_task_status.get(t['task_id']) != 'SUCCEEDED'
-                                 for t in breads):
-                raise ValueError('동일 조립의 선행 빵 Place 성공이 확인되지 않았습니다.')
+            return stack_place.get_previous_layer_target(
+                task, list(self.guidebook_tasks.values()), self.guidebook_task_status)
 
-    def verify_place_target(self, task):
+    def stack_camera_mount(self):
+        """Use the real active TCP -> CameraInfo optical frame TF, never a guessed mount."""
+        tcp_frame = self.stack_vision_config['tcp_frame']
+        if not tcp_frame or not self.camera_frame:
+            raise ValueError('활성 TCP 및 CameraInfo optical 프레임이 필요합니다.')
+        stamped = self.tf_buffer.lookup_transform(
+            tcp_frame, self.camera_frame, RclpyTime(),
+            timeout=Duration(seconds=self.tf_lookup_timeout_sec))
+        if stamped.header.frame_id != tcp_frame or stamped.child_frame_id != self.camera_frame:
+            raise ValueError('TCP/카메라 TF 프레임이 일치하지 않습니다.')
+        q, t = stamped.transform.rotation, stamped.transform.translation
+        if (not all(math.isfinite(v) for v in (t.x, t.y, t.z, q.x, q.y, q.z, q.w))
+                or abs(sum(v * v for v in (q.x, q.y, q.z, q.w)) - 1.0) > 0.01):
+            raise ValueError('TCP/카메라 TF가 유효하지 않습니다.')
+        return [t.x * 1000.0, t.y * 1000.0, t.z * 1000.0]
+
+    def stack_release_rotation(self, task):
+        """Mirror execute_place_action's final attitude without altering its commands."""
+        tilt = placement_tilt(task['target'], self.agent_id)
+        if tilt is not None and 'place_rpy_robot_deg' not in tilt:
+            return rpy_to_matrix(
+                math.radians(180.0 + tilt['place_roll_offset_deg']),
+                math.radians(tilt['place_pitch_offset_deg']),
+                task['reference_place_pose'].get('yaw', 0.0))
+        rpy = (list(map(math.radians, tilt['place_rpy_robot_deg'])) if tilt is not None
+               else [math.pi, 0.0, self.convert_place_pose(
+                   task['reference_place_pose'], self.agent_id)['yaw']])
+        q = self.lookup_workspace_transform(self.agent_id).transform.rotation
+        base_from_workspace = self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
+        return base_from_workspace.T @ rpy_to_matrix(*rpy)
+
+    def prepare_stack_place(self, task, last_pick_pose, pick_rpy, action):
+        """Called once after predecessor wait, Pick lift and Token acquisition."""
+        self.require_observation_token()
+        self.get_previous_layer_target(task)
+        # Refresh blue handles after predecessor completion / possible long token wait.
+        basket = self.get_basket_center_workspace()
+        task.update(self.resolve_task_assembly(task, basket_center=basket))
+        view, attitude, path = self.plan_stack_observation(task, last_pick_pose, pick_rpy, action)
+        self.move_stack_observation_path(task, path, attitude, 'observe')
+        request, observations, centers = self.observe_previous_layer(task)
+        self.get_previous_layer_target(task)
+        config = self.stack_vision_config
+        corrected = stack_place.corrected_place(
+            task['reference_place_pose'], centers,
+            stack_place.material_center_offset(task['assembly']['material'], self.agent_id),
+            self.stack_release_rotation(task), config)
+        # Preflight all original high approach, release and retreat endpoints.
+        for place_action in task['actions']:
+            if place_action['api'] != 'move_to_place':
+                continue
+            pose = self.convert_place_pose(assembly_move_pose(
+                corrected, place_action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM), self.agent_id)
+            sdk = self.tf_pose_to_sdk_pose(
+                pose['x'], pose['y'], pose['z'] - (10.0 if self.agent_id == 'agent2' else 0.0),
+                yaw=pose['yaw'], agent_id=self.agent_id)
+            self.check_sdk_pose_or_raise(sdk['x'], sdk['y'], sdk['z'], label='stack vision place')
+        high = assembly_move_pose(corrected, action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM)
+        path = stack_place.transit_waypoints(view, high, config['observation_transit_z_mm'], high['z'])
+        self.move_stack_observation_path(
+            task, [view] + path[:2], attitude, 'corrected approach',
+            verification=(request, observations))
+        # Commit once; later actions only validate assembly and reuse this pose.
+        task['reference_place_pose'] = corrected
+        task['place_pose'] = self.convert_place_pose(corrected, self.agent_id)
+        task['destination_spec'].update(x_mm=corrected['x'], y_mm=corrected['y'])
+        self.get_logger().info(f"[{task['task_id']}] 이전 층 실제 중심 기반 TCP={corrected}")
+
+    def observe_previous_layer(self, task):
         """Called only after the blocking observation move has completed."""
-        config = self.place_vision_config
-        place_verification.validate_config(config)
+        config = self.stack_vision_config
+        stack_place.validate_config(config)
         self.require_observation_token()
         if not self.enable_perception or self.workspace_frame != 'workspace_0':
-            raise ValueError('양상추 비전 보정에는 마운트 인식과 workspace_0이 필요합니다.')
-        self.check_place_bread_predecessors(task)
+            raise ValueError('적층 비전 보정에는 마운트 인식과 workspace_0이 필요합니다.')
+        target = self.get_previous_layer_target(task)
         settle = max(0.0, self.perception_settle_sec)
         request = dict(since_mono=time.monotonic() + settle,
-                       since_ros=self.now_sec() + settle, last_stamps=(0.0, 0.0))
+                       since_ros=self.now_sec() + settle, last_stamps=(0.0, 0.0),
+                       target_material=target['material'])
         deadline = request['since_mono'] + config['timeout_sec']
         centers, observations = [], []
         was_moving = self.is_moving
@@ -3214,22 +3280,22 @@ class RobotAgentNode(Node):
                         f"[{task['task_id']}] 관측 RGB/Depth={observation['meta']}, "
                         f"detections={observation['detections']}, "
                         f"시야/가림 진단={observation.get('visibility', '미제공')}; "
-                        '미검출은 가림 확정이 아니며 그리퍼/양상추와 빵의 영상 중첩 확인 필요')
-                    place_verification.validate_frames(
+                        '미검출 시 파지 재료와 이전 층의 영상 중첩 확인 필요')
+                    stack_place.validate_frames(
                         observation['meta'], request, config, self.now_sec(), time.monotonic())
                     if observations and any(
                         observation['meta'][f'{kind}_stamp'] <= observations[-1]['meta'][f'{kind}_stamp']
                         for kind in ('color', 'depth')
                     ):
                         raise ValueError('중복 또는 역순 RGB/Depth 관측입니다.')
-                    centers.append(place_verification.bread_center(
-                        observation, task['basket_center_workspace'], config))
+                    centers.append(stack_place.previous_layer_center(
+                        observation, task['basket_center_workspace'], target['material'], config))
                     observations.append(observation)
                 if len(centers) >= config['samples']:
                     break
                 time.sleep(0.02)
             else:
-                raise ValueError('양상추 Place용 새 빵 관측 시간 초과입니다.')
+                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
         finally:
             with self.perception_lock:
                 self.is_moving = was_moving
@@ -3237,29 +3303,10 @@ class RobotAgentNode(Node):
                 self.place_observations = []
         # Recheck freshness and mission after inference/wait; no cached pose fallback.
         for observation in observations:
-            place_verification.validate_frames(
+            stack_place.validate_frames(
                 observation['meta'], request, config, self.now_sec(), time.monotonic())
-        self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
-        corrected = place_verification.corrected_place(
-            task['reference_place_pose'], task['basket_center_workspace'], centers, config)
-        # Preflight every corrected waypoint through the same Base/SDK conversion and Z adjustment.
-        for action in task['actions']:
-            if action['api'] != 'move_to_place':
-                continue
-            pose = self.convert_place_pose(assembly_move_pose(
-                corrected, action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM), self.agent_id)
-            sdk = self.tf_pose_to_sdk_pose(
-                pose['x'], pose['y'], pose['z'] - (10.0 if self.agent_id == 'agent2' else 0.0),
-                yaw=pose['yaw'], agent_id=self.agent_id)
-            self.check_sdk_pose_or_raise(sdk['x'], sdk['y'], sdk['z'], label='vision place')
-        nominal = task['reference_place_pose']
-        task['reference_place_pose'] = corrected
-        task['place_pose'] = self.convert_place_pose(corrected, self.agent_id)
-        task['destination_spec'].update(x_mm=corrected['x'], y_mm=corrected['y'])
-        self.get_logger().info(
-            f"[{task['task_id']}] 빵 YOLO 보정 workspace_0: "
-            f"dXY=({corrected['x'] - nominal['x']:.2f}, {corrected['y'] - nominal['y']:.2f}) mm")
-        return request, observations
+        self.get_previous_layer_target(task)
+        return request, observations, centers
 
     def verify_pick_target(self, task):
         """홈 자세에서 새 프레임으로 target이 계획 위치에 남아 있는지 확인합니다.
@@ -3613,8 +3660,8 @@ class RobotAgentNode(Node):
                 if place_request is not None:
                     # Ignore pre-stop/duplicate/unsynchronized frames; bounded verifier times out.
                     try:
-                        place_verification.validate_frames(
-                            frame_meta, place_request, self.place_vision_config,
+                        stack_place.validate_frames(
+                            frame_meta, place_request, self.stack_vision_config,
                             self.now_sec(), time.monotonic(),
                         )
                     except ValueError:
@@ -3687,14 +3734,14 @@ class RobotAgentNode(Node):
                             front_pt = pt1 if np.linalg.norm(center_px - pt1) > np.linalg.norm(center_px - pt2) else pt2
 
                             dist_z = self.median_depth_m(depth_img, cx, cy)
-                            if place_request is not None and name_ko in ('빵', '양상추'):
+                            if place_request is not None:
                                 visibility.append(dict(
                                     material=name_ko, center_px=[cx, cy],
                                     bounds_px=mask_np.min(axis=0).tolist() + mask_np.max(axis=0).tolist(),
                                     depth_m=dist_z, confidence=float(detected_box.conf[0])))
                             if dist_z is None:
-                                if place_request is not None and name_ko == '빵':
-                                    observation_error = '빵 Depth가 유효하지 않습니다.'
+                                if place_request is not None and name_ko == place_request['target_material']:
+                                    observation_error = '이전 층 Depth가 유효하지 않습니다.'
                                 continue
 
                             try:
@@ -3708,14 +3755,14 @@ class RobotAgentNode(Node):
                                 wx_front, wy_front, _ = self.camera_point_to_workspace(
                                     *p3d_front, transform=strict_transform)
                             except Exception as error:
-                                if place_request is not None and name_ko == '빵':
+                                if place_request is not None and name_ko == place_request['target_material']:
                                     observation_error = str(error)
                                 continue
                             yaw = np.arctan2(wy_front - wy, wx_front - wx)
                             pose = (wx, wy, wz, yaw)
                             if not all(math.isfinite(value) for value in pose):
-                                if place_request is not None and name_ko == '빵':
-                                    observation_error = '빵 TF 좌표가 유한하지 않습니다.'
+                                if place_request is not None and name_ko == place_request['target_material']:
+                                    observation_error = '이전 층 TF 좌표가 유한하지 않습니다.'
                                 continue
                             candidates.append({
                                 'model_index': model_index,

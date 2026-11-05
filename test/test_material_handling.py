@@ -13,7 +13,7 @@ import numpy as np
 from unittest.mock import Mock, patch
 
 from cap_robot import object_profiles as settings
-from cap_robot import place_verification
+from cap_robot import stack_place
 from cap_robot.llm_api import DEFAULT_PNP_ACTIONS, validate_actions
 from cap_robot.material_handling import (
     assembly_move_pose, assembly_placement, bind_gripper_actions,
@@ -240,9 +240,9 @@ def load_agent_methods():
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
         'find_detected_target', 'normalize_zone', 'resolve_target_destination',
-        'verify_pick_target', 'needs_place_verification', 'verify_place_target',
-        'require_observation_token', 'plan_place_observation', 'move_observation_path',
-        'check_place_bread_predecessors',
+        'verify_pick_target', 'needs_stack_place', 'observe_previous_layer',
+        'require_observation_token', 'plan_stack_observation', 'move_stack_observation_path',
+        'get_previous_layer_target', 'prepare_stack_place', 'stack_camera_mount', 'stack_release_rotation',
         'image_frame_metadata', 'color_callback', 'depth_callback',
         'get_latest_perception_frames', 'place_camera_transform',
         'workspace_place_to_robot_place', 'convert_place_pose',
@@ -251,7 +251,7 @@ def load_agent_methods():
     original.body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]
     module = ast.fix_missing_locations(ast.Module(body=[original], type_ignores=[]))
     namespace = {
-        'place_verification': place_verification,
+        'stack_place': stack_place,
         'classify_shared_zone_entry': classify_shared_zone_entry,
         'RclpyTime': lambda **kw: SimpleNamespace(**kw),
         'Duration': lambda **kw: SimpleNamespace(**kw),

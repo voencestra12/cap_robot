@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from cap_robot import object_profiles, place_verification as vision
+from cap_robot import object_profiles, stack_place as vision
 from cap_robot.material_handling import assembly_placement
 import test_material_handling as handling
 from test_material_handling import load_agent_methods, recipe
@@ -17,8 +17,12 @@ import test_object_memory as memory_tests
 
 
 def config(**overrides):
-    return dict(copy.deepcopy(vision.DEFAULTS), baseline_calibrated=True,
-                **overrides)
+    cfg = dict(copy.deepcopy(vision.DEFAULTS),
+               basket_half_extent_mm=[60., 60.], target_z_range_mm=[5., 80.],
+               max_correction_mm=20., tcp_frame='test_tcp',
+               observation_camera_xy_offset_mm=[0., 0.], observation_camera_z_mm=330.,
+               observation_transit_z_mm=400., observation_speed_mm_s=30.)
+    return dict(cfg, **overrides)
 
 
 def metadata(stamp=100.1, received=10.1):
@@ -44,12 +48,10 @@ def test_real_profile_and_offset_are_preserved():
         nominal = assembly_placement(task, recipe(), agent,
                                      basket_center=dict(x=300, y=200))['reference_place_pose']
         assert (nominal['x'], nominal['y']) == (300, 170)
-        # Calibration need not equal the lettuce offset; do not infer either from the other.
-        cfg = config(expected_bread_xy_offset_mm=[2.0, -25.0])
-        for delta in ((0, 0), (10, 10), (-10, -5)):
-            centers = [(302 + delta[0], 175 + delta[1], 30)] * 3
-            result = vision.corrected_place(nominal, dict(x=300, y=200), centers, cfg)
-            assert result == dict(nominal, x=300 + delta[0], y=170 + delta[1])
+        cfg = config(max_correction_mm=50.)
+        for xy in ((300, 200), (310, 210), (290, 195)):
+            result = vision.corrected_place(nominal, [(*xy, 30)] * 3, [0., 0., 0.], np.eye(3), cfg)
+            assert result == dict(nominal, x=xy[0], y=xy[1])
 
 
 @pytest.mark.parametrize('change', [
@@ -66,6 +68,7 @@ def test_old_future_unsynchronized_or_wrong_frame_is_rejected(change):
 
 
 @pytest.mark.parametrize('detections', [[],
+    [('햄_1', (300, 170, 30, 0), 0.99)],
     [('빵_1', (100, 100, 30, 0), 0.99)],
     [('빵_1', (300, 170, 200, 0), 0.99)],
     [('빵_1', (300, 170, 30, 0), 0.5)],
@@ -75,14 +78,14 @@ def test_missing_outside_low_confidence_or_multiple_bread_is_rejected(detections
     obs = observation()
     obs['detections'] = detections
     with pytest.raises(ValueError):
-        vision.bread_center(obs, dict(x=300, y=200), config())
+        vision.previous_layer_center(obs, dict(x=300, y=200), '빵', config())
 
 
 def test_class_and_position_choose_candidate_without_id_dependency():
     obs = observation()
     obs['detections'] += [('빵_1', (500, 170, 30, 0), 0.9),
                           ('양상추_1', (300, 170, 30, 0), 0.9)]
-    assert vision.bread_center(obs, dict(x=300, y=200), config()) == (300, 170, 30)
+    assert vision.previous_layer_center(obs, dict(x=300, y=200), '빵', config()) == (300, 170, 30)
 
 
 @pytest.fixture
@@ -90,14 +93,14 @@ def agent():
     case = handling.AgentAssemblyTest()
     case.setUp()
     node = case.node
-    node.place_vision_config = config(
-        enabled=True, expected_bread_xy_offset_mm=[0., -30.], observation_validated=True,
-        observation_camera_offset_mm=[0., 0., 260.], observation_transit_clearance_mm=30.)
+    node.stack_vision_config = config(
+        enabled=True, observation_validated=True)
     node.zone_token_enabled = node.enable_sdk_safety_box = True
     node._shared_zone_box = lambda: dict(x_min=150., x_max=450., y_min=-50., y_max=500.)
     node.lookup_workspace_transform = Mock(return_value=SimpleNamespace(transform=SimpleNamespace(
         translation=SimpleNamespace(x=0., y=0., z=0.),
         rotation=SimpleNamespace(x=0., y=0.70710678, z=0., w=0.70710678))))
+    node.stack_camera_mount = Mock(return_value=[0., 0., 0.])
     node.quaternion_to_rotation_matrix = lambda *a: np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
     def acquire(_):
         node._zone_token_held = True
@@ -116,7 +119,7 @@ def agent():
     node.now_sec = lambda: 100.1 + time.monotonic() - start
     # Preserve the production lettuce profile values in the otherwise synthetic recipe fixture.
     object_profiles.OBJECT_PROFILES['양상추'].update(
-        grip_position=100., place_xy_offset_mm=[0., -30.])
+        grip_position=100., place_xy_offset_mm=[0., -30.], stack_tcp_to_material_center_mm=[0., 0., 0.])
     node.guidebook_task_status.update(layer_0='SUCCEEDED', layer_1='READY')
     task = case.bread_task()
     node.guidebook_task_status['layer_0'] = 'SUCCEEDED'
@@ -145,23 +148,24 @@ def feed(monkeypatch, node, observations):
 
 
 @pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
-@pytest.mark.parametrize('delta', [(0, 0), (10, 10)])
+@pytest.mark.parametrize('delta', [(0, 30), (10, 35)])
 def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, monkeypatch, agent_id, delta):
     node, task = agent
     node.agent_id = task['assignee_id'] = agent_id
+    node.stack_vision_config['max_correction_mm'] = 50.
     # Exercise the real convert_place_pose/workspace_place_to_robot_place methods.
     node.workspace_point_to_robot = Mock(side_effect=lambda x, y, z, **kw: (z, y, -x))
     node.workspace_yaw_to_robot = Mock(side_effect=lambda yaw, **kw: yaw + 0.2)
     node.convert_place_pose = lambda pose, agent: type(node).convert_place_pose(node, pose, agent)
     feed(monkeypatch, node, [observation(300 + delta[0], 170 + delta[1])] * 3)
-    original = node.verify_place_target
+    original = node.observe_previous_layer
     def verify(t):
         assert node.move_to_robot_tf.call_count == 6  # pick trio + observation lift/traverse/arrival
         assert node.move_to_robot_tf.call_args.kwargs['label'] == 'observe'
         assert node._zone_token_held
         assert node.control_gripper.call_count == 2
         return original(t)
-    node.verify_place_target = verify
+    node.observe_previous_layer = verify
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=300 + delta[0], y=170 + delta[1], z=60, yaw=0)
     moves = node.move_to_robot_tf.call_args_list[8:]
@@ -210,7 +214,7 @@ def test_failure_stops_before_place_release_and_home(agent, monkeypatch, failure
 
 def test_timeout_never_reuses_latest_poses(agent, monkeypatch):
     node, task = agent
-    node.place_vision_config['timeout_sec'] = 0.01
+    node.stack_vision_config['timeout_sec'] = 0.01
     node.latest_poses = {'빵_1': (300, 170, 30, 0)}
     node.latest_poses_stamp = math.inf
     monkeypatch.setattr(time, 'sleep', lambda _: None)
@@ -263,6 +267,7 @@ def test_long_token_wait_precedes_fresh_observation(agent, monkeypatch):
         node._zone_token_held = True
         start = time.monotonic()
         node.now_sec = lambda: 200.0 + time.monotonic() - start
+        node.get_extra_perception_snapshot = lambda: dict(handling.perception(), stamp_sec=node.now_sec())
         return True
     node.acquire_zone_token = Mock(side_effect=acquire)
     assert node.execute_task(task)
@@ -271,32 +276,33 @@ def test_long_token_wait_precedes_fresh_observation(agent, monkeypatch):
 
 def test_disabled_and_other_materials_bypass_verification(agent):
     node, task = agent
-    node.verify_place_target = Mock(side_effect=AssertionError('must not verify'))
-    node.place_vision_config['enabled'] = False
+    node.observe_previous_layer = Mock(side_effect=AssertionError('must not verify'))
+    node.stack_vision_config['enabled'] = False
     assert node.execute_task(task)
     assert task['reference_place_pose']['y'] == 170
-    node.place_vision_config['enabled'] = True
+    node.stack_vision_config['enabled'] = True
     for material in ('빵', '햄'):
-        assert not node.needs_place_verification(dict(assembly=dict(container='basket', material=material)))
-    assert not node.needs_place_verification(dict(target='양상추'))
+        assert not node.needs_stack_place(dict(assembly=dict(container='basket', material=material)))
+    assert not node.needs_stack_place(dict(target='양상추'))
 
 
-def test_unset_baseline_is_rejected():
+def test_unset_geometry_is_rejected():
     with pytest.raises(ValueError):
         vision.validate_config(vision.DEFAULTS)
 
 
+@pytest.mark.parametrize('material, model_class', [('빵', 'bread'), ('양상추', 'lettuce'), ('햄', 'ham')])
 @pytest.mark.parametrize('failure', [None, 'depth', 'tf'])
-def test_actual_yolo_loop_emits_only_current_stamped_observation(failure):
+def test_actual_yolo_loop_emits_only_current_stamped_observation(failure, material, model_class):
     case = memory_tests.PerceptionIntegrationTest()
     case.setUp()
     node = case.node
     cfg = config()
-    node.run_perception.__globals__['place_verification'] = vision
-    node.place_vision_config = cfg
+    node.run_perception.__globals__['stack_place'] = vision
+    node.stack_vision_config = cfg
     node.workspace_frame = 'workspace_0'
     node.now_sec = lambda: 100.5
-    node.place_verification_request = dict(since_ros=100., since_mono=41., last_stamps=(0., 0.))
+    node.place_verification_request = dict(since_ros=100., since_mono=41., last_stamps=(0., 0.), target_material=material)
     node.place_observations = []
     meta = metadata(100.1, 42.)
     node.get_latest_perception_frames = lambda: (np.zeros((100, 200, 3)), None, {}, meta)
@@ -307,7 +313,7 @@ def test_actual_yolo_loop_emits_only_current_stamped_observation(failure):
     node.camera_point_to_workspace = Mock(return_value=(300, 170, 30))
     if failure == 'depth':
         node.median_depth_m = lambda *a: None
-    model = SimpleNamespace(names={0: 'bread'}, predict=Mock(return_value=case.result([20])))
+    model = SimpleNamespace(names={0: model_class}, predict=Mock(return_value=case.result([20])))
     node.models = [('existing_model.pt', model)]
     case.drawing.waitKey.side_effect = [ord('q')]
     node.run_perception()
@@ -315,14 +321,14 @@ def test_actual_yolo_loop_emits_only_current_stamped_observation(failure):
     obs = node.place_observations[0]
     assert obs['meta'] is meta
     assert obs['visibility']['image_size'] == [100, 200]
-    assert obs['visibility']['objects'][0]['material'] == '빵'
+    assert obs['visibility']['objects'][0]['material'] == material
     if failure == 'depth':
         assert obs['visibility']['objects'][0]['depth_m'] is None
     if failure:
         assert obs['error']
         assert not obs['detections']
     else:
-        assert obs['detections'] == [('빵', (300, 170, 30, 0.), 0.9)]
+        assert obs['detections'] == [(material, (300, 170, 30, 0.), 0.9)]
         assert all(c.kwargs['transform'] is transform for c in node.camera_point_to_workspace.call_args_list)
 
 
@@ -363,27 +369,25 @@ def test_tf_queries_capture_time_and_rejects_invalid_rotation():
 
 def test_observation_uses_basket_and_rotated_camera_mount():
     cfg = config(observation_validated=True,
-                 observation_camera_offset_mm=[20., -40., 250.],
-                 observation_tcp_to_camera_mm=[10., 20., 30.],
-                 observation_transit_clearance_mm=25.)
+                 observation_camera_xy_offset_mm=[20., -40.], observation_camera_z_mm=320.)
     rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
     basket = dict(x=300., y=200., z=70.)
-    pose = vision.observation_pose(basket, cfg, rotation)
+    pose = vision.observation_pose(basket, cfg, rotation, [10., 20., 30.])
     assert pose == dict(x=340., y=150., z=290.)
-    shifted = vision.observation_pose(dict(basket, x=400., z=90.), cfg, rotation)
-    assert shifted == dict(pose, x=440., z=310.)
+    shifted = vision.observation_pose(dict(basket, x=400., z=900.), cfg, rotation, [10., 20., 30.])
+    assert shifted == dict(pose, x=440.)  # handle Z is never a camera/Place height
 
 
 @pytest.mark.parametrize('overrides', [
     dict(observation_validated=False),
-    dict(observation_camera_offset_mm=[1., 2.]),
-    dict(observation_tcp_to_camera_mm=[0., math.nan, 0.]),
-    dict(observation_transit_clearance_mm=0.),
+    dict(observation_camera_xy_offset_mm=[1.]),
+    dict(tcp_frame=''),
+    dict(observation_transit_z_mm=math.nan),
     dict(observation_speed_mm_s=-1.),
 ])
 def test_unmeasured_or_invalid_observation_blocks_before_sdk(agent, overrides):
     node, task = agent
-    node.place_vision_config.update(overrides)
+    node.stack_vision_config.update(overrides)
     assert not node.execute_task(task)
     node.arm.clean_error.assert_not_called()
     node.move_to_robot_tf.assert_not_called()
@@ -414,13 +418,13 @@ def test_corrected_transfer_and_descent_never_mix_horizontal_and_vertical_motion
         events.append('token')
         return original_acquire(t)
     node.acquire_zone_token.side_effect = acquire
-    original_verify = node.verify_place_target
+    original_verify = node.observe_previous_layer
     def verify(t):
         assert events == ['predecessors', 'token']
         assert node.move_to_robot_tf.call_count == 6
         assert node.place_verification_request is None
         return original_verify(t)
-    node.verify_place_target = verify
+    node.observe_previous_layer = verify
     assert node.execute_task(task)
     # Invert the fixture's robot <- workspace transform.
     points = [(-c.args[2], c.args[1], c.args[0])
@@ -518,3 +522,214 @@ def test_stale_frames_after_transfer_preflight_abort_before_motion(agent, monkey
     assert node.move_to_robot_tf.call_count == 6
     assert node.control_gripper.call_count == 2
     node.return_to_home_joint_pose.assert_not_called()
+
+
+def sandwich():
+    tasks = []
+    for i, material in enumerate(('빵', '양상추', '햄', '빵')):
+        tasks.append(dict(task_id=f'layer_{i}', depends_on=[] if i == 0 else [f'layer_{i-1}'],
+                          assembly=dict(id='sandwich_1', container='basket', layer_index=i,
+                                        material=material)))
+    return tasks
+
+
+@pytest.mark.parametrize('layer, expected', [(1, '빵'), (2, '양상추'), (3, '햄')])
+def test_target_is_immediate_layer_not_any_prior_bread(layer, expected):
+    tasks = sandwich()
+    statuses = {t['task_id']: 'SUCCEEDED' for t in tasks}
+    assert vision.get_previous_layer_target(tasks[layer], tasks, statuses)['material'] == expected
+    statuses[f'layer_{layer-1}'] = 'FAILED'
+    with pytest.raises(ValueError):
+        vision.get_previous_layer_target(tasks[layer], tasks, statuses)
+
+
+def test_repeated_previous_material_layers_fail_closed():
+    tasks = sandwich()
+    tasks[2]['assembly']['material'] = '빵'
+    with pytest.raises(ValueError, match='높이 구분'):
+        vision.get_previous_layer_target(tasks[3], tasks, {t['task_id']: 'SUCCEEDED' for t in tasks})
+
+
+@pytest.mark.parametrize('failure', ['missing', 'duplicate', 'other_assembly'])
+def test_previous_layer_must_be_unique_in_same_assembly(failure):
+    tasks = sandwich()
+    if failure == 'missing':
+        del tasks[0]
+    elif failure == 'duplicate':
+        tasks.append(copy.deepcopy(tasks[0]))
+    else:
+        tasks[0]['assembly']['id'] = 'other'
+    with pytest.raises(ValueError):
+        vision.get_previous_layer_target(sandwich()[1], tasks, {t['task_id']: 'SUCCEEDED' for t in tasks})
+
+
+@pytest.mark.parametrize('material', ['햄', '빵'])
+def test_real_uncalibrated_profiles_reject_offsets(material):
+    assert object_profiles.OBJECT_PROFILES[material]['stack_tcp_to_material_center_mm'] is None
+    with pytest.raises(ValueError):
+        vision.material_center_offset(material, 'agent1')
+
+
+@pytest.mark.parametrize('agent_id, expected', [('agent1', [1., 2., 3.]), ('agent2', [-1., 4., 5.])])
+def test_agent_specific_center_offset(monkeypatch, agent_id, expected):
+    profile = dict(object_profiles.OBJECT_PROFILES['햄'], stack_tcp_to_material_center_mm={
+        'agent1': [1., 2., 3.], 'agent2': [-1., 4., 5.]})
+    monkeypatch.setitem(object_profiles.OBJECT_PROFILES, '햄', profile)
+    assert vision.material_center_offset('햄', agent_id) == expected
+    with pytest.raises(ValueError):
+        vision.material_center_offset('햄', 'agent3')
+
+
+def test_local_offset_rotates_all_xyz_components_and_preserves_pose():
+    nominal = dict(x=999., y=-999., z=90., yaw=0.4, roll=1.2, pitch=0.3)
+    rotation = handling.rpy_to_matrix(0., math.pi / 2, math.pi / 2)
+    pose = vision.calculate_stack_tcp_pose([300., 200., 30.], [10., 20., 30.], rotation, nominal)
+    assert pose == pytest.approx(dict(nominal, x=320., y=170.))
+
+
+def set_layer(node, task, layer, calibrated=True):
+    tasks = sandwich()
+    node.guidebook_tasks = {t['task_id']: t for t in tasks}
+    node.guidebook_task_status = {t['task_id']: ('SUCCEEDED' if i < layer else 'READY')
+                                for i, t in enumerate(tasks)}
+    object_profiles.OBJECT_PROFILES['햄'] = dict(
+        grip_position=30., thickness_mm=5., place_tcp_offset_mm=100.,
+        place_roll_offset_deg={'agent1': 30., 'agent2': -30.}, place_tilt_speed=75.)
+    material = tasks[layer]['assembly']['material']
+    object_profiles.OBJECT_PROFILES[material]['stack_tcp_to_material_center_mm'] = (
+        [10., 20., 5.] if calibrated else None)
+    task.update(target=material, guidebook_task_id=f'layer_{layer}',
+                assembly=copy.deepcopy(tasks[layer]['assembly']))
+    node.stack_vision_config.update(materials=[material], max_correction_mm=100.)
+    return material
+
+
+@pytest.mark.parametrize('layer', [2, 3])
+def test_uncalibrated_enabled_material_rejected_before_sdk(agent, layer):
+    node, task = agent
+    set_layer(node, task, layer, calibrated=False)
+    assert not node.execute_task(task)
+    node.arm.clean_error.assert_not_called()
+    node.control_gripper.assert_not_called()
+
+
+@pytest.mark.parametrize('layer', [2, 3])
+@pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
+def test_ham_and_final_bread_share_api_and_keep_release_attitude(agent, monkeypatch, layer, agent_id):
+    node, task = agent
+    node.agent_id = task['assignee_id'] = agent_id
+    material = set_layer(node, task, layer)
+    previous = sandwich()[layer - 1]['assembly']['material']
+    obs = dict(frame_id='workspace_0', error=None,
+               detections=[(previous + '_88', (310., 200., 30., 0.), 0.9)])
+    feed(monkeypatch, node, [obs] * 3)
+    assert node.execute_task(task)
+    rotation = node.stack_release_rotation(task)
+    offset = rotation @ np.array([10., 20., 5.])
+    assert task['reference_place_pose']['x'] == pytest.approx(310. - offset[0])
+    assert task['reference_place_pose']['y'] == pytest.approx(200. - offset[1])
+    expected_z = 10. + 20. + (5. if layer == 3 else 0.) + object_profiles.OBJECT_PROFILES[material]['place_tcp_offset_mm']
+    assert task['reference_place_pose']['z'] == expected_z
+    place_moves = node.move_to_robot_tf.call_args_list[8:]
+    assert len(place_moves) == 5  # high, tilt, lower, retreat, restore
+    assert all(c.args[1:3] == pytest.approx((200. - offset[1], -310. + offset[0])) for c in place_moves)
+    assert place_moves[2].kwargs['roll_deg'] == pytest.approx(210. if layer == 2 and agent_id == 'agent1'
+                                                              else 150. if layer == 2 else 180.)
+
+
+@pytest.mark.parametrize('after_move', [9, 10, 11, 12])
+def test_token_loss_between_tilt_submoves_stops_immediately(agent, monkeypatch, after_move):
+    node, task = agent
+    set_layer(node, task, 2)
+    feed(monkeypatch, node, [dict(frame_id='workspace_0', error=None,
+                                detections=[('양상추', (300., 200., 30., 0.), 0.9)])] * 3)
+    def move(*args, **kwargs):
+        if node.move_to_robot_tf.call_count == after_move:
+            node._zone_token_held = False
+        return True
+    node.move_to_robot_tf.side_effect = move
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == after_move
+    node.release_zone_token.assert_not_called()
+    node.return_to_home_joint_pose.assert_not_called()
+    assert node.control_gripper.call_count == (3 if after_move == 12 else 2)
+
+
+def test_first_bread_bypasses_vision_even_with_unset_offset(agent):
+    node, task = agent
+    set_layer(node, task, 0, calibrated=False)
+    node.prepare_stack_place = Mock(side_effect=AssertionError('first layer cannot observe'))
+    assert node.execute_task(task)
+    assert task['reference_place_pose']['x'] == 300.
+    assert task['reference_place_pose']['y'] == 200.
+
+
+def test_stale_blue_handles_after_long_wait_fail_without_observation_motion(agent):
+    node, task = agent
+    def acquire(_):
+        node._zone_token_held = True
+        node.now_sec = lambda: 200.
+        return True
+    node.acquire_zone_token.side_effect = acquire
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3
+    assert node.control_gripper.call_count == 2
+    node.release_zone_token.assert_not_called()
+
+
+def test_observation_uses_only_real_tcp_camera_tf():
+    node = load_agent_methods()()
+    node.stack_vision_config = config()
+    node.camera_frame = 'camera_optical'
+    node.tf_lookup_timeout_sec = 1.
+    transform = SimpleNamespace(translation=SimpleNamespace(x=.01, y=.02, z=.03),
+                                rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))
+    node.tf_buffer = Mock()
+    node.tf_buffer.lookup_transform.return_value = SimpleNamespace(
+        header=SimpleNamespace(frame_id='test_tcp'), child_frame_id='camera_optical', transform=transform)
+    assert node.stack_camera_mount() == [10., 20., 30.]
+    assert node.tf_buffer.lookup_transform.call_args.args[:2] == ('test_tcp', 'camera_optical')
+    node.tf_buffer.lookup_transform.side_effect = RuntimeError('missing active TCP')
+    with pytest.raises(RuntimeError):
+        node.stack_camera_mount()
+
+
+@pytest.mark.parametrize('height', [0., 100., math.nan])
+def test_unvalidated_transit_height_never_creates_low_horizontal_path(height):
+    with pytest.raises(ValueError):
+        vision.transit_waypoints(dict(x=0., y=0., z=200.), dict(x=300., y=200., z=300.), height, 220.)
+
+
+def test_predecessor_failure_during_observation_segment_stops_next_move(agent):
+    node, task = agent
+    def move(*args, **kwargs):
+        if node.move_to_robot_tf.call_count == 4:
+            node.guidebook_task_status['layer_0'] = 'FAILED'
+        return True
+    node.move_to_robot_tf.side_effect = move
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 4
+    assert node.control_gripper.call_count == 2
+    node.release_zone_token.assert_not_called()
+
+
+@pytest.mark.parametrize('attitude_mode', ['default', 'workspace_tilt', 'base_taught'])
+def test_offset_rotation_matches_actual_release_command(agent, attitude_mode):
+    node, task = agent
+    node.stack_vision_config['enabled'] = False
+    profile = object_profiles.OBJECT_PROFILES['양상추']
+    if attitude_mode == 'workspace_tilt':
+        profile.update(place_roll_offset_deg=30., place_pitch_offset_deg=15.)
+    elif attitude_mode == 'base_taught':
+        profile.update(pick_rpy_robot_deg=[178., 1., 2.], place_rpy_robot_deg=[170., 20., 35.])
+    assert node.validate_received_task(task)
+    node.workspace_rpy_to_robot = lambda *args: type(node).workspace_rpy_to_robot(node, *args)
+    state = dict(started=False, released=False)
+    assert node.execute_place_action(task, dict(z_offset=200., speed=100.), state)
+    assert node.execute_place_action(task, dict(z_offset=40., speed=100.), state)
+    actual = node.move_to_robot_tf.call_args.kwargs
+    base_from_tcp = handling.rpy_to_matrix(math.radians(actual.get('roll_deg', 180.)),
+                                          math.radians(actual.get('pitch_deg', 0.)), actual['yaw'])
+    base_from_workspace = node.quaternion_to_rotation_matrix(0., 0., 0., 1.)
+    np.testing.assert_allclose(node.stack_release_rotation(task), base_from_workspace.T @ base_from_tcp,
+                               atol=1e-10)
