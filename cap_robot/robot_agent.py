@@ -3284,6 +3284,10 @@ class RobotAgentNode(Node):
             task['reference_place_pose'], centers,
             stack_place.material_center_offset(task['assembly']['material'], self.agent_id),
             self.stack_release_rotation(task), config)
+        mean = np.mean(centers, axis=0).tolist()
+        delta = {a: corrected[a] - task['reference_place_pose'][a] for a in ('x', 'y')}
+        self.get_logger().info(
+            f"[{task['task_id']}] 최종 평균 빵 중심 XYZ(mm)={mean}, XY 보정량(mm)={delta}")
         high = assembly_move_pose(corrected, action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM)
         # Both endpoints have exactly the existing high approach Z. Correct XY
         # here, then let the unchanged Place actions descend vertically.
@@ -3312,6 +3316,9 @@ class RobotAgentNode(Node):
                        target_material=target['material'])
         deadline = request['since_mono'] + config['timeout_sec']
         centers, observations = [], []
+        last_observation = None
+        last_stamps = (0.0, 0.0)
+        frame_number = 0
         was_moving = self.is_moving
         with self.perception_lock:
             self.place_observations = []
@@ -3324,37 +3331,87 @@ class RobotAgentNode(Node):
                     batch = self.place_observations
                     self.place_observations = []
                 for observation in batch:
+                    last_observation = observation
+                    frame_number += 1
+                    observation.setdefault('frame_number', frame_number)
                     self.get_logger().info(
-                        f"[{task['task_id']}] 관측 RGB/Depth={observation['meta']}, "
+                        f"[{task['task_id']}] 프레임={observation['frame_number']}, "
+                        f"관측 RGB/Depth={observation['meta']}, "
+                        f"raw YOLO={observation.get('raw_detections', [])}, "
                         f"detections={observation['detections']}, "
                         f"시야/가림 진단={observation.get('visibility', '미제공')}; "
                         '미검출 시 파지 재료와 이전 층의 영상 중첩 확인 필요')
+                    self.require_observation_token()
+                    if time.monotonic() >= deadline:
+                        raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
                     stack_place.validate_frames(
                         observation['meta'], request, config, self.now_sec(), time.monotonic())
-                    if observations and any(
-                        observation['meta'][f'{kind}_stamp'] <= observations[-1]['meta'][f'{kind}_stamp']
-                        for kind in ('color', 'depth')
-                    ):
+                    stamps = tuple(observation['meta'][f'{kind}_stamp'] for kind in ('color', 'depth'))
+                    if any(new <= old for new, old in zip(stamps, last_stamps)):
                         raise ValueError('중복 또는 역순 RGB/Depth 관측입니다.')
-                    centers.append(stack_place.previous_layer_center(
-                        observation, task['basket_center_workspace'], target['material'], config))
+                    # Track every consumed frame, including frames with no bread.
+                    last_stamps = stamps
+                    observation['checks'] = []
+                    try:
+                        center = stack_place.previous_layer_center(
+                            observation, task['basket_center_workspace'], target['material'], config,
+                            diagnostics=observation['checks'])
+                    except stack_place.NoPreviousLayerCandidate as error:
+                        self.get_logger().info(
+                            f"[{task['task_id']}] 프레임={observation['frame_number']}: {error}; "
+                            f"다음 새 프레임 대기, 유효 표본={len(centers)}/{config['samples']}")
+                        continue
+                    finally:
+                        self.get_logger().info(
+                            f"[{task['task_id']}] 프레임={observation['frame_number']} "
+                            f"바구니 XY/Z/confidence 검사={observation['checks']}")
+                    distances = [math.dist(center, previous) for previous in centers]
+                    if any(distance > config['stability_mm'] for distance in distances):
+                        self.get_logger().info(
+                            f"[{task['task_id']}] 안정성 거부: 거리(mm)={distances}, "
+                            f"한도={config['stability_mm']}; 이전 표본 폐기 후 재수집")
+                        centers.clear()
+                        observations.clear()
+                    centers.append(center)
                     observations.append(observation)
+                    if len(centers) > config['samples']:
+                        centers.pop(0)
+                        observations.pop(0)
+                    self.get_logger().info(
+                        f"[{task['task_id']}] 유효 표본={len(centers)}/{config['samples']}, "
+                        f"XYZ={center}, 안정성 통과 (한도={config['stability_mm']}mm)")
                 if len(centers) >= config['samples']:
                     break
                 time.sleep(0.02)
             else:
                 raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
+            self.require_observation_token()
+            if time.monotonic() >= deadline:
+                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
+            # Recheck freshness and mission after inference/wait; no cached pose fallback.
+            for observation in observations:
+                stack_place.validate_frames(
+                    observation['meta'], request, config, self.now_sec(), time.monotonic())
+            self.get_previous_layer_target(task)
+            return request, observations, centers
+        except Exception as error:
+            try:
+                with self.perception_lock:
+                    debug = request.get('last_observation', last_observation)
+                if debug is None:
+                    frames = self.get_latest_perception_frames()
+                    debug = (dict(rgb=frames[0], meta=frames[3], detections=[],
+                                  note='관측 완료 프레임 없음') if frames is not None else {})
+                path = stack_place.save_observation_debug(task['task_id'], error, debug)
+                self.get_logger().error(f"[{task['task_id']}] 관측 실패 디버그 저장: {path}")
+            except Exception as debug_error:
+                self.get_logger().error(f'관측 디버그 저장 실패: {debug_error}; 원래 실패 유지')
+            raise
         finally:
             with self.perception_lock:
                 self.is_moving = was_moving
                 self.place_verification_request = None
                 self.place_observations = []
-        # Recheck freshness and mission after inference/wait; no cached pose fallback.
-        for observation in observations:
-            stack_place.validate_frames(
-                observation['meta'], request, config, self.now_sec(), time.monotonic())
-        self.get_previous_layer_target(task)
-        return request, observations, centers
 
     def verify_pick_target(self, task):
         """홈 자세에서 새 프레임으로 target이 계획 위치에 남아 있는지 확인합니다.
@@ -3724,6 +3781,7 @@ class RobotAgentNode(Node):
                 inference_image = img.copy()
                 detections, annotations = [], []
                 visibility = []
+                raw_detections = []
                 candidates = []
                 collect_detections = not self.is_moving
 
@@ -3743,6 +3801,22 @@ class RobotAgentNode(Node):
                             continue
                         masks = result.masks.xy if result.masks is not None else None
                         for index, detected_box in enumerate(result.boxes):
+                            raw = None
+                            if place_request is not None:
+                                bounds = detected_box.xyxy[0].cpu().numpy().tolist()
+                                raw = dict(
+                                    model=model_filename, class_id=int(detected_box.cls[0]),
+                                    class_name=str(model.names[int(detected_box.cls[0])]),
+                                    confidence=float(detected_box.conf[0]), bbox_xyxy=bounds,
+                                    depth_valid=None, status='invalid contour')
+                                raw_detections.append(raw)
+                                x1, y1, x2, y2 = map(int, bounds)
+                                # Draw raw boxes before Depth/TF validation; never add them to candidates.
+                                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 165, 255), 2)
+                                cv2.putText(
+                                    img, f"raw {raw['class_name']} {raw['confidence']:.2f}",
+                                    (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5, (0, 165, 255), 1)
                             if masks is not None:
                                 mask_np = masks[index].astype(np.float32)
                             else:
@@ -3778,6 +3852,9 @@ class RobotAgentNode(Node):
                             front_pt = pt1 if np.linalg.norm(center_px - pt1) > np.linalg.norm(center_px - pt2) else pt2
 
                             dist_z = self.median_depth_m(depth_img, cx, cy)
+                            if raw is not None:
+                                raw.update(depth_valid=dist_z is not None, depth_m=dist_z,
+                                           center_px=[cx, cy], status='invalid depth' if dist_z is None else 'depth passed')
                             if place_request is not None:
                                 visibility.append(dict(
                                     material=name_ko, center_px=[cx, cy],
@@ -3799,15 +3876,21 @@ class RobotAgentNode(Node):
                                 wx_front, wy_front, _ = self.camera_point_to_workspace(
                                     *p3d_front, transform=strict_transform)
                             except Exception as error:
+                                if raw is not None:
+                                    raw.update(status='TF rejected', error=str(error))
                                 if place_request is not None and name_ko == place_request['target_material']:
                                     observation_error = str(error)
                                 continue
                             yaw = np.arctan2(wy_front - wy, wx_front - wx)
                             pose = (wx, wy, wz, yaw)
                             if not all(math.isfinite(value) for value in pose):
+                                if raw is not None:
+                                    raw.update(status='TF rejected', error='nonfinite workspace pose')
                                 if place_request is not None and name_ko == place_request['target_material']:
                                     observation_error = '이전 층 TF 좌표가 유한하지 않습니다.'
                                 continue
+                            if raw is not None:
+                                raw.update(status='Depth/TF passed', workspace_xyz_mm=[wx, wy, wz])
                             candidates.append({
                                 'model_index': model_index,
                                 'bounds': (*mask_np.min(axis=0), *mask_np.max(axis=0)),
@@ -3836,8 +3919,11 @@ class RobotAgentNode(Node):
                     )
                 if collect_detections and not self.is_moving:
                     if place_request is not None:
+                        place_request['frame_number'] = place_request.get('frame_number', 0) + 1
                         observation = dict(
                             frame_id=self.workspace_frame, meta=frame_meta, error=observation_error,
+                            frame_number=place_request['frame_number'], raw_detections=raw_detections,
+                            rgb=inference_image, annotated_rgb=img.copy(),
                             visibility=dict(image_size=list(img.shape[:2]), objects=visibility,
                                             camera_transform=str(strict_transform)),
                             detections=[(*candidates[i]['detection'], candidates[i]['confidence'])
@@ -3848,6 +3934,7 @@ class RobotAgentNode(Node):
                                 if len(self.place_observations) >= 8:
                                     observation['error'] = '관측 처리 큐가 초과되었습니다.'
                                     self.place_observations.clear()
+                                place_request['last_observation'] = observation
                                 self.place_observations.append(observation)
                     current_poses = self.object_memory.update(detections)
                     with self.perception_lock:

@@ -1,5 +1,6 @@
 """No ROS node, SDK connection, live camera, or robot motion is created."""
 import copy
+import json
 import math
 import threading
 import time
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
+import cv2
 import pytest
 
 from cap_robot import object_profiles, stack_place as vision
@@ -87,10 +89,13 @@ def test_class_and_position_choose_candidate_without_id_dependency():
 
 
 @pytest.fixture
-def agent():
+def agent(monkeypatch, tmp_path):
     case = handling.AgentAssemblyTest()
     case.setUp()
     node = case.node
+    save_debug = vision.save_observation_debug
+    monkeypatch.setattr(vision, 'save_observation_debug',
+                        lambda *args: save_debug(*args, directory=tmp_path))
     node.stack_vision_config = config(
         enabled=True, observation_validated=True)
     node.zone_token_enabled = node.enable_sdk_safety_box = True
@@ -132,11 +137,13 @@ def agent():
     case.doCleanups()
 
 
-def feed(monkeypatch, node, observations):
+def feed(monkeypatch, node, observations, clock=None):
     iterator = iter(observations)
     previous_meta = None
-    def deliver(_):
+    def deliver(seconds):
         nonlocal previous_meta
+        if clock is not None:
+            clock.now += seconds
         try:
             obs = copy.deepcopy(next(iterator))
         except StopIteration:
@@ -148,6 +155,195 @@ def feed(monkeypatch, node, observations):
         with node.perception_lock:
             node.place_observations.append(obs)
     monkeypatch.setattr(time, 'sleep', deliver)
+
+
+def use_observation_clock(monkeypatch, node):
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+    node.now_sec = lambda: 100.1 + clock.now - 10.0
+    return clock
+
+
+def test_first_empty_frame_then_three_stable_frames_allows_correction(agent, monkeypatch):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    empty = observation()
+    empty['detections'] = []
+    feed(monkeypatch, node, [empty, observation(309, 180), observation(310, 180),
+                             observation(311, 180)], clock)
+    original_move = node.move_to_robot_tf.side_effect
+
+    def move(*args, **kwargs):
+        if kwargs.get('label') == 'corrected approach':
+            # Four distinct post-stop frames have been consumed before correction.
+            assert clock.now == pytest.approx(10.08)
+        return original_move(*args, **kwargs) if callable(original_move) else True
+
+    node.move_to_robot_tf.side_effect = move
+    assert node.execute_task(task)
+    assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
+    assert [c.kwargs['label'] for c in node.move_to_robot_tf.call_args_list].count('corrected approach') == 1
+    node.return_to_home_joint_pose.assert_called_once()
+    node.release_zone_token.assert_called_once()
+
+
+@pytest.mark.parametrize('points', [
+    [observation(300, 170), observation(301, 170), observation(310, 180),
+     observation(311, 180), observation(309, 180)],
+    # Adjacent points are close, but the full XYZ cluster exceeds stability_mm.
+    [observation(300, 170), observation(302, 170), observation(304, 170),
+     observation(305, 170), observation(306, 170)],
+])
+def test_outlier_restarts_cluster_without_mixing_old_samples(agent, monkeypatch, points):
+    node, task = agent
+    assert node.validate_received_task(task)
+    node._zone_token_held = True
+    clock = use_observation_clock(monkeypatch, node)
+    feed(monkeypatch, node, points, clock)
+    _, accepted, centers = node.observe_previous_layer(task)
+    expected = [p['detections'][0][1][:3] for p in points[-3:]]
+    assert centers == expected
+    assert [p['frame_number'] for p in accepted] == [3, 4, 5]
+    assert len({p['meta']['color_stamp'] for p in accepted}) == 3
+    assert len({p['meta']['depth_stamp'] for p in accepted}) == 3
+    nominal = task['reference_place_pose']
+    corrected = vision.corrected_place(nominal, centers, [0., 0., 0.], np.eye(3), config())
+    assert corrected['x'] == pytest.approx(sum(p[0] for p in expected) / 3)
+    assert clock.now == pytest.approx(10.1)
+
+
+@pytest.mark.parametrize('mode', ['empty', 'two_samples', 'unstable'])
+def test_retry_deadline_is_five_seconds_without_place_or_recovery(agent, monkeypatch, mode):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    empty = observation()
+    empty['detections'] = []
+    points = ([empty] * 300 if mode == 'empty' else
+              [observation()] * 2 if mode == 'two_samples' else
+              [observation(300 + (i % 2) * 10, 170) for i in range(300)])
+    feed(monkeypatch, node, points, clock)
+    assert node.stack_vision_config['timeout_sec'] == 5.0
+    assert not node.execute_task(task)
+    assert 5.0 <= clock.now - 10.0 <= 5.021
+    assert node.move_to_robot_tf.call_count == 6
+    assert node.control_gripper.call_count == 2
+    node.return_to_home_joint_pose.assert_not_called()
+    node.release_zone_token.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['color', 'depth'])
+def test_empty_frame_cannot_be_reused_as_a_new_sample(agent, monkeypatch, kind):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    empty = observation(meta=metadata(100.12, 10.02))
+    empty['detections'] = []
+    meta = metadata(100.14, 10.04)
+    meta[f'{kind}_stamp'] = 100.12
+    feed(monkeypatch, node, [empty, observation(meta=meta)] + [observation()] * 3, clock)
+    assert not node.execute_task(task)
+    assert clock.now < 10.1
+    assert node.move_to_robot_tf.call_count == 6
+    assert node.control_gripper.call_count == 2
+
+
+def test_settle_barrier_precedes_observation_timeout(agent, monkeypatch):
+    node, task = agent
+    assert node.validate_received_task(task)
+    node._zone_token_held = True
+    node.perception_settle_sec = 0.5
+    clock = use_observation_clock(monkeypatch, node)
+    stamps = iter([10.51, 10.53, 10.55])
+
+    def deliver(_):
+        clock.now = next(stamps)
+        node.place_observations.append(observation(meta=metadata(node.now_sec(), clock.now)))
+
+    monkeypatch.setattr(time, 'sleep', deliver)
+    request, accepted, _ = node.observe_previous_layer(task)
+    assert request['since_mono'] == 10.5
+    assert request['since_ros'] == pytest.approx(100.6)
+    assert all(p['meta']['color_received'] > 10.5 and p['meta']['depth_received'] > 10.5
+               for p in accepted)
+
+
+def test_checks_report_each_rejection_without_relaxing_thresholds():
+    obs = observation()
+    obs['detections'] = [('빵_1', (500, 200, 90, 0), 0.5)]
+    checks = []
+    with pytest.raises(vision.NoPreviousLayerCandidate):
+        vision.previous_layer_center(obs, dict(x=300, y=200), '빵', config(), checks)
+    assert len(checks) == 1
+    assert checks[0]['workspace_xyz_mm'] == [500, 200, 90]
+    assert checks[0]['basket_xy']['passed'] is False
+    assert checks[0]['z_range']['passed'] is False
+    assert checks[0]['confidence_check'] == dict(passed=False, minimum=0.6)
+
+
+@pytest.mark.parametrize('error', ['invalid depth', 'invalid TF'])
+def test_empty_error_frame_is_fatal_instead_of_retryable(error):
+    obs = observation()
+    obs.update(error=error, detections=[])
+    with pytest.raises(ValueError) as caught:
+        vision.previous_layer_center(obs, dict(x=300, y=200), '빵', config())
+    assert not isinstance(caught.value, vision.NoPreviousLayerCandidate)
+
+
+def test_observation_failure_saves_last_matching_rgb_and_raw_results(agent, monkeypatch, tmp_path):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    first = observation(rgb=np.zeros((20, 30, 3), dtype=np.uint8))
+    first['detections'] = []
+    last = observation(rgb=np.full((20, 30, 3), 42, dtype=np.uint8),
+                       annotated_rgb=np.full((20, 30, 3), 84, dtype=np.uint8),
+                       raw_detections=[dict(class_name='Bread', confidence=0.9,
+                                            bbox_xyxy=[1, 2, 10, 12], depth_valid=False)])
+    last.update(error='invalid depth', detections=[])
+    feed(monkeypatch, node, [first, last], clock)
+    assert not node.execute_task(task)
+    files = list(tmp_path.glob('*.json'))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload['frame_number'] == 2
+    assert 'invalid depth' in payload['failure']
+    assert payload['raw_detections'] == last['raw_detections']
+    assert payload['meta']['color_received'] == pytest.approx(10.04)
+    np.testing.assert_array_equal(cv2.imread(str(tmp_path / payload['rgb_file'])), last['rgb'])
+    np.testing.assert_array_equal(cv2.imread(str(tmp_path / payload['annotated_rgb_file'])), last['annotated_rgb'])
+    assert node.move_to_robot_tf.call_count == 6
+    assert node.control_gripper.call_count == 2
+
+
+def test_debug_write_error_preserves_original_observation_failure(agent, monkeypatch):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    monkeypatch.setattr(vision, 'save_observation_debug', Mock(side_effect=OSError('disk full')))
+    obs = observation()
+    obs['error'] = 'TF unavailable'
+    feed(monkeypatch, node, [obs], clock)
+    assert node.validate_received_task(task)
+    node._zone_token_held = True
+    with pytest.raises(ValueError, match='TF unavailable'):
+        node.observe_previous_layer(task)
+    assert node.is_moving and node.place_verification_request is None
+
+
+def test_late_error_in_same_batch_cannot_be_hidden_by_three_good_samples(agent, monkeypatch):
+    node, task = agent
+    assert node.validate_received_task(task)
+    node._zone_token_held = True
+    clock = use_observation_clock(monkeypatch, node)
+
+    def deliver(_):
+        for i in range(4):
+            clock.now += 0.02
+            obs = observation(meta=metadata(node.now_sec(), clock.now))
+            if i == 3:
+                obs['error'] = 'TF unavailable'
+            node.place_observations.append(obs)
+
+    monkeypatch.setattr(time, 'sleep', deliver)
+    with pytest.raises(ValueError, match='TF unavailable'):
+        node.observe_previous_layer(task)
 
 
 @pytest.mark.parametrize('agent_id', ['agent1'])
@@ -187,6 +383,7 @@ def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, m
                                       'excessive', 'tf', 'depth', 'safety'])
 def test_failure_stops_before_place_release_and_home(agent, monkeypatch, failure):
     node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
     observations = [observation() for _ in range(3)]
     if failure == 'missing':
         observations[0]['detections'] = []
@@ -204,7 +401,7 @@ def test_failure_stops_before_place_release_and_home(agent, monkeypatch, failure
         observations[0]['error'] = failure
     elif failure == 'safety':
         node.check_sdk_pose_or_raise.side_effect = ValueError('outside safety box')
-    feed(monkeypatch, node, observations)
+    feed(monkeypatch, node, observations, clock)
     assert not node.execute_task(task)
     assert node.move_to_robot_tf.call_count == (3 if failure == 'safety' else 6)
     assert node.control_gripper.call_count == 2
@@ -325,14 +522,53 @@ def test_actual_yolo_loop_emits_only_current_stamped_observation(failure, materi
     assert obs['meta'] is meta
     assert obs['visibility']['image_size'] == [100, 200]
     assert obs['visibility']['objects'][0]['material'] == material
+    raw = obs['raw_detections'][0]
+    assert raw['class_name'] == model_class
+    assert raw['confidence'] == 0.9
+    assert raw['bbox_xyxy'] == [15, 10, 25, 30]
+    assert raw['depth_valid'] is (failure != 'depth')
+    case.drawing.rectangle.assert_called_once()
+    assert np.any(obs['annotated_rgb'])
+    assert not np.any(obs['rgb'])
+    assert not np.any(model.predict.call_args.kwargs['source'])
     if failure == 'depth':
         assert obs['visibility']['objects'][0]['depth_m'] is None
     if failure:
         assert obs['error']
         assert not obs['detections']
+        assert node.latest_poses == {}
+        assert raw['status'] == ('invalid depth' if failure == 'depth' else 'TF rejected')
     else:
         assert obs['detections'] == [(material, (300, 170, 30, 0.), 0.9)]
         assert all(c.kwargs['transform'] is transform for c in node.camera_point_to_workspace.call_args_list)
+        assert raw['workspace_xyz_mm'] == [300, 170, 30]
+
+
+def test_yolo_observation_waits_for_post_settle_and_both_new_acquisition_stamps():
+    case = memory_tests.PerceptionIntegrationTest()
+    case.setUp()
+    node = case.node
+    node.run_perception.__globals__['stack_place'] = vision
+    node.stack_vision_config = config()
+    node.workspace_frame = 'workspace_0'
+    node.now_sec = lambda: 100.5
+    node.place_verification_request = dict(
+        since_ros=100., since_mono=41., last_stamps=(0., 0.), target_material='빵')
+    node.place_observations = []
+    metas = [metadata(99.99, 40.99), metadata(100.1, 42.), metadata(100.1, 42.),
+             dict(metadata(100.12, 42.), depth_stamp=100.1),
+             dict(metadata(100.1, 42.), depth_stamp=100.12), metadata(100.14, 42.)]
+    frames = iter((np.zeros((100, 200, 3), dtype=np.uint8), None, {}, m) for m in metas)
+    node.get_latest_perception_frames = lambda: next(frames)
+    node.place_camera_transform = Mock(return_value=object())
+    node.camera_point_to_workspace = Mock(return_value=(300, 170, 30))
+    model = SimpleNamespace(names={0: 'bread'}, predict=Mock(return_value=case.result([20])))
+    node.models = [('bread.pt', model)]
+    node.run_perception()
+    assert model.predict.call_count == 2
+    assert [o['meta']['color_stamp'] for o in node.place_observations] == [100.1, 100.14]
+    assert [o['frame_number'] for o in node.place_observations] == [1, 2]
+    assert all(o['error'] is None for o in node.place_observations)
 
 
 def test_callbacks_preserve_acquisition_and_receipt_stamps():
@@ -496,9 +732,10 @@ def test_observation_tf_failure_prevents_observation_motion(agent):
 
 def test_fault_blocks_next_task_without_releasing_or_moving(agent, monkeypatch):
     node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
     obs = observation()
     obs['detections'] = []
-    feed(monkeypatch, node, [obs])
+    feed(monkeypatch, node, [obs], clock)
     assert not node.execute_task(task)
     node.arm.clean_error.reset_mock()
     node.move_to_robot_tf.reset_mock()

@@ -1,6 +1,8 @@
 # Agent1 양상추 Place 비전 보정
 
-두 Agent의 `stack_place_vision.enabled` 기본값은 `false`입니다.
+코드의 `stack_place_vision.enabled` 기본값은 `false`입니다.
+현재 Agent1 YAML은 현장 설정으로 `enabled=true`, `observation_validated=true`이며,
+이번 수정은 YAML 및 실측 제한값을 변경하지 않습니다.
 활성화 대상은 **Agent1, basket, 양상추, layer_index=1**이며,
 동일 assembly의 layer 0 빵 Task가 `SUCCEEDED`여야 합니다.
 Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행합니다.
@@ -26,7 +28,15 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
    기존 SDK TCP와 Hand-eye TF를 사용합니다. 카메라와 TCP의 상대 XYZ/회전은 TF에서 구하며
    별도의 사용자 카메라 XY Offset, 카메라 Z, 관측 transit 높이/속도를 받지 않습니다.
 6. 바구니 내부 XY 범위, 빵 중심 Z 범위, 신뢰도를 만족하는 빵 후보가 정확히 하나여야 합니다.
-   서로 다른 RGB/Depth 표본들의 XYZ 안정성을 확인합니다.
+   후보가 0개인 정상 프레임은 건너뛰고 다음 새 RGB/Depth를 기다립니다.
+   후보가 없는 프레임도 처리 시각을 기록하므로 같은 영상이나 한쪽 영상만 바뀐 것을
+   다음 관측 표본으로 재사용하지 않습니다. confidence 부족, 복수 후보, Depth/TF 오류는
+   기존대로 실패합니다.
+   서로 다른 최신 RGB/Depth에서 유효 XYZ 표본 `samples`개(기본 3개)를 모으며,
+   새 표본과 기존 모든 표본 사이의 XYZ 거리가 `stability_mm` 이하여야 합니다.
+   초과하면 이전 묶음을 모두 버리고 새 표본부터 안정성 검사를 다시 시작합니다.
+   평균에는 마지막 안정 표본 묶음만 사용합니다. 재시도 시에도 settle 이후
+   `timeout_sec=5.0`의 원래 마감 시각을 연장하지 않습니다.
 7. 기존 중앙 파지 가정 `stack_tcp_to_material_center_mm=[0,0,0]`에서 최종 TCP XY는
    관측한 빵 중심 XY의 평균입니다. 기존 양상추 `place_xy_offset_mm=[0,-30]`를 다시 더하지 않습니다.
    nominal Place XY는 허용 보정량 검사 기준으로만 사용합니다.
@@ -47,8 +57,9 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
   지원 SDK와 펌웨어 **1.11.100 이상**이 없거나 검사 실패/오류이면 실행을 거부합니다.
 - 기존 Token 보호를 유지하고 경유점 사이와 해제 전에 Token·선행 Task 상태를 재확인합니다.
 - 경로 검사 후 보정 이동 직전에 관측값의 신선도를 다시 확인합니다.
-- 정지 실패, 빵 미검출/복수 후보, Depth/TF 오류, 오래된/중복 영상, XYZ 불안정,
-  허용 범위 초과, 경로 거부 시 원래 XY로 임의 Place하지 않습니다.
+- 정지 실패, 복수 후보, Depth/TF 오류, 오래된/중복 영상, 허용 범위 초과,
+  경로 거부 시 원래 XY로 임의 Place하지 않습니다. 빵 미검출 또는 XYZ 불안정이
+  이어져 마감 시각까지 안정 표본을 모으지 못한 경우에도 실패합니다.
 - 관측 보호 진입 후 실패하면 현재 그리퍼를 유지하고 자동 Home·Token 반납을 하지 않습니다.
   기존 `_place_observation_fault`가 후속 단독/협동 Task를 차단합니다.
 
@@ -81,6 +92,23 @@ SDK의 자체 충돌 검사는 외부 바구니·파지한 양상추·카메라�
 기존 안전 접근 높이, action 속도, settle 시간, Token, Safety Box 설정을 재사용합니다.
 수동 카메라 XY/Z와 별도 관측 transit 높이/속도 설정 및 관측 위치 역산 코드는 제거했습니다.
 
+## 관측 디버깅
+
+관측 프레임마다 번호, RGB/Depth 촬영·수신 시각, 원시 YOLO 모델/클래스/confidence/
+Bounding Box, 각 객체의 Depth 유효 여부와 TF 결과, 빵의 workspace XYZ를 로그에 남깁니다.
+후보별 바구니 XY·Z·confidence 검사 결과와 기준값, 유효 표본 수, 안정성 결과 및 재수집 이유,
+최종 평균 빵 XYZ와 nominal TCP 대비 XY 보정량도 기록합니다.
+
+관측 실패 시 실행 작업 디렉터리의 `log/stack_place_vision/`에 고유 ID별로
+`*_rgb.png`(원본 RGB), `*_annotated_rgb.png`(원시 Box 포함), `.json`(검출·시각·실패 이유)을
+저장하고 JSON 경로를 오류 로그에 출력합니다. 완료된 YOLO 관측이 없으면 최신 RGB와
+메타데이터를 저장하고 검출 미완료를 명시합니다. 영상이 아예 없으면 JSON만 남깁니다.
+디버그 파일 저장 자체가 실패해도 원래 관측 실패를 유지합니다.
+
+원시 Bounding Box는 이 관측 중 Depth/TF 검사 전에 주황색 `raw` 라벨로 표시하므로
+검증에 실패한 객체도 화면에서 볼 수 있습니다. 원본 추론 영상은 별도로 유지하며,
+원시 Box를 객체 선택·ObjectMemory·제어 후보에 추가하지 않습니다.
+
 ## 검증
 
 ```bash
@@ -95,6 +123,12 @@ mock SDK/TF/영상으로 검사합니다. 일반 PnP·다른 Agent·Token·Guide
 추가 검증에는 높은 관측 좌표, 수평 보정 후 수직 하강, 촬영 시각 TF 합성, XYZ 변환,
 Offset 중복 방지, 정지 확인, 전체 경로 무동작 검사, 인식/Depth/TF/경로 실패 중단이 포함됩니다.
 
-검증 결과: **282 passed, 95 subtests passed**. compileall 및 `git diff --check` 통과.
-기존 실행/SDK 이동/인식 루프/협동 실행 메서드의 AST와 비전 설정 외 Agent YAML 값도 원본과 동일합니다.
-환경에 기존 NumPy/SciPy 버전 호환 경고 1개가 있으며 테스트 실패는 없습니다.
+이번 검증 결과: **297 passed, 95 subtests passed, 1 failed**.
+실패한 기존 `test_config_cleanup_keeps_feature_disabled_and_has_no_manual_camera_geometry`는
+두 Agent의 YAML이 모두 비활성이라고 가정하지만 현재 Agent1 설정은 활성입니다.
+수정 전 HEAD의 별도 사본에서도 동일하게 **281 passed, 95 subtests passed, 1 failed**를
+확인했습니다. 해당 설정과 기존 테스트 기대값은 이번 수정에서 바꾸지 않았습니다.
+첫 프레임 후보 0개 후 3회 안정 검출·보정, 이상 좌표 후 표본 재수집, 5초 마감,
+RGB/Depth 중복 거부, settle 이후 촬영, 실패 영상 저장, Depth/TF 실패 시 원시 Box 표시를
+검사했습니다. compileall 및 `git diff --check` 통과.
+환경에 기존 NumPy/SciPy 버전 호환 경고 1개가 있습니다.

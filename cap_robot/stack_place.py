@@ -1,7 +1,10 @@
 """ROS-free stack placement geometry and fail-closed observation checks (mm)."""
 
 import copy
+import json
 import math
+from pathlib import Path
+import uuid
 import numpy as np
 
 try:
@@ -138,7 +141,32 @@ def validate_frames(meta, request, config, now_ros, now_mono):
         raise ValueError('Depth는 color optical frame에 정렬되어야 합니다.')
 
 
-def previous_layer_center(observation, basket, target_material, config):
+class NoPreviousLayerCandidate(ValueError):
+    """A valid frame with zero eligible candidates may be observed again."""
+
+
+def save_observation_debug(task_id, reason, observation, directory=None):
+    """Persist a matching RGB/detection pair without changing the failure policy."""
+    import cv2
+
+    folder = Path(directory) if directory is not None else Path.cwd() / 'log' / 'stack_place_vision'
+    folder.mkdir(parents=True, exist_ok=True)
+    # Do not use external task identifiers as filenames.
+    stem = folder / uuid.uuid4().hex
+    payload = {k: v for k, v in observation.items() if k not in ('rgb', 'annotated_rgb')}
+    payload.update(task_id=task_id, failure=str(reason))
+    for key in ('rgb', 'annotated_rgb'):
+        if observation.get(key) is not None:
+            path = stem.with_name(f'{stem.name}_{key}.png')
+            if not cv2.imwrite(str(path), observation[key]):
+                raise OSError(f'관측 디버그 영상 저장 실패: {path}')
+            payload[f'{key}_file'] = path.name
+    path = stem.with_suffix('.json')
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return path
+
+
+def previous_layer_center(observation, basket, target_material, config, diagnostics=None):
     if observation.get('frame_id') != 'workspace_0' or observation.get('error'):
         raise ValueError(f"이전 층 관측 실패: {observation.get('error', '좌표계 오류')}")
     candidates = []
@@ -148,8 +176,20 @@ def previous_layer_center(observation, basket, target_material, config):
         if object_class(name) != target_material:
             continue
         x, y, z = (number(v, 'previous layer xyz') for v in pose[:3])
-        if abs(x - basket['x']) <= hx and abs(y - basket['y']) <= hy and zmin <= z <= zmax:
+        in_xy = abs(x - basket['x']) <= hx and abs(y - basket['y']) <= hy
+        in_z = zmin <= z <= zmax
+        confidence = number(confidence, 'confidence', 0, 1)
+        if diagnostics is not None:
+            diagnostics.append(dict(
+                name=name, workspace_xyz_mm=[x, y, z], confidence=confidence,
+                basket_xy=dict(passed=in_xy, center=[basket['x'], basket['y']], half_extent=[hx, hy]),
+                z_range=dict(passed=in_z, limits=[zmin, zmax]),
+                confidence_check=dict(passed=confidence >= config['min_confidence'],
+                                      minimum=config['min_confidence'])))
+        if in_xy and in_z:
             candidates.append((x, y, z, confidence))
+    if not candidates:
+        raise NoPreviousLayerCandidate('바구니 내부 이전 층 후보가 없습니다: 0')
     if len(candidates) != 1:
         raise ValueError(f'바구니 내부 이전 층 후보가 정확히 하나여야 합니다: {len(candidates)}')
     x, y, z, confidence = candidates[0]

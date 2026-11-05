@@ -163,7 +163,11 @@ class PerceptionIntegrationTest(unittest.TestCase):
     def result(centers):
         masks = [np.array([[x - 5, 10], [x + 5, 10], [x + 5, 30], [x - 5, 30]],
                           dtype=np.float32) for x in centers]
-        return [SimpleNamespace(boxes=[SimpleNamespace(cls=[0], conf=[0.9]) for _ in centers],
+        return [SimpleNamespace(boxes=[SimpleNamespace(
+                                    cls=[0], conf=[0.9],
+                                    xyxy=[SimpleNamespace(cpu=lambda x=x: SimpleNamespace(
+                                        numpy=lambda: np.array([x - 5, 10, x + 5, 30], dtype=float)))])
+                                    for x in centers],
                                 masks=SimpleNamespace(xy=masks))]
 
     def test_yolo_loop_exposes_every_instance_to_prompt(self):
