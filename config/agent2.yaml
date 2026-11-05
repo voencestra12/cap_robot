@@ -15,7 +15,7 @@
     stack_place_vision.materials: ["양상추"]  # 햄/빵은 파지 중심 Offset 실측 후 추가
     # 파지 자세를 유지한 카메라 시야/경로/높이 검증 후에만 true
     stack_place_vision.observation_validated: false
-    stack_place_vision.tcp_frame: ""  # SDK 활성 TCP와 일치하는 실제 TF 프레임; link6로 추정 금지
+    stack_place_vision.tcp_frame: "agent2_tcp"  # 실측 SDK TCP: link6 로컬 Z +172 mm
     # 바구니 파란 점 XY 평균 → 카메라 optical 원점 XY (workspace 축, mm)
     stack_place_vision.observation_camera_xy_offset_mm: [.nan, .nan]
     # 카메라 원점의 workspace_0 절대 Z. 손잡이 Z를 더하지 않음

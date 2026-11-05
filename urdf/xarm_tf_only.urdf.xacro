@@ -30,4 +30,14 @@
       attach_rpy="0 0 0"
       create_attach_link="false"
       load_gazebo_plugin="false"/>
+
+  <!-- xArm6 link6 -> link_eef is identity in xarm_device_macro.
+       Measured SDK TCP offset: [0, 0, 172, 0, 0, 0] (mm, degrees).
+       The existing robot_state_publisher publishes this fixed joint on /tf_static. -->
+  <link name="$(arg prefix)tcp"/>
+  <joint name="$(arg prefix)joint_tcp" type="fixed">
+    <parent link="$(arg prefix)link6"/>
+    <child link="$(arg prefix)tcp"/>
+    <origin xyz="0 0 0.172" rpy="0 0 0"/>
+  </joint>
 </robot>
