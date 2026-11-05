@@ -74,7 +74,10 @@ ready 출력 형식:
 * material은 빵, 양상추, 바나나, 햄 중 해당 재료의 정확한 이름이다.
 * 각 층의 depends_on에는 직전 층 task_id를 반드시 넣는다. 앞 재료 배치가 완료되어야 다음 층을 시작한다.
 * 그리퍼 위치값, 두께, 적층 Z는 생성하지 않는다. 실행 코드가 object_profiles.py의 측정값으로 결정한다.
-* 현재 적층 기능은 바구니 양옆 파란 점 두 개의 workspace 좌표 평균을 조립 X/Y로 사용한다. 하나의 미션에는 하나의 assembly만 작성한다.
+* 현재 적층 기능은 바구니 양옆 파란 점 두 개의 workspace 좌표 평균을 기본 조립 X/Y로 사용한다. 하나의 미션에는 하나의 assembly만 작성한다.
+* Agent1의 양상추(layer_index 1) 비전 보정이 설정으로 활성화된 경우, 첫 빵 Task 완료 후 높은 Place 접근 위치에서 정지하고 최신 YOLO/Depth와 TF로 바구니 안 빵 중심을 재인식하여 XY를 보정한다. 재인식과 추가 Move, 보정 XY에서의 하강/해제/후퇴는 Agent 실행 함수가 자동 처리한다. 현재 stack_place_vision.enabled=false는 유지하며 첫 빵, 햄, 마지막 빵은 기존 방식을 따른다.
+* 양상추도 기존 single_agent Task 하나와 assembly/depends_on을 유지한다. Agent LLM은 destination={"type":"basket_stack"}과 기존 9단계 Pick & Place JSON만 생성한다. Workstation은 재인식/보정을 별도 Task나 actions로 분리하지 않는다.
+* 두 LLM 모두 카메라 Offset, 빵 중심 보정 좌표, 새로운 이동 API, 보정용 추가 JSON action/필드를 생성하지 않는다.
 * 단순히 재료를 다른 곳으로 옮기는 작업에는 assembly를 붙이지 않는다.
 * 성공 조건에는 해당 층의 재료를 바구니 안의 앞 재료 위에 놓는다는 의미를 보존한다.
   - 위 빵 예시: "두 번째 빵을 바구니 안의 양상추 위에 덮어 샌드위치를 완성한다."

@@ -1,5 +1,6 @@
 """ROS-free stack placement geometry and fail-closed observation checks (mm)."""
 
+import copy
 import math
 import numpy as np
 
@@ -28,10 +29,6 @@ DEFAULTS = {
     'samples': 3,
     'observation_validated': False,
     'tcp_frame': '',
-    'observation_camera_xy_offset_mm': [math.nan, math.nan],
-    'observation_camera_z_mm': math.nan,
-    'observation_transit_z_mm': math.nan,
-    'observation_speed_mm_s': math.nan,
 }
 
 
@@ -70,13 +67,8 @@ def validate_config(config):
 def validate_observation_config(config):
     if config.get('observation_validated') is not True:
         raise ValueError('관측 자세/높이/경로 실측 검증 필요: observation_validated=false')
-    if not isinstance(config['tcp_frame'], str) or not config['tcp_frame'].strip():
-        raise ValueError('실제 활성 TCP에 대응하는 TF tcp_frame이 필요합니다.')
-    vector(config['observation_camera_xy_offset_mm'], 2, 'observation_camera_xy_offset_mm')
-    for key in ('observation_camera_z_mm', 'observation_transit_z_mm'):
-        number(config[key], key)
-    if number(config['observation_speed_mm_s'], 'observation_speed_mm_s') <= 0:
-        raise ValueError('관측 속도는 실측 검증한 양수여야 합니다.')
+    if config['tcp_frame'] != 'agent1_tcp':
+        raise ValueError('Agent1 양상추 관측에는 agent1_tcp TF가 필요합니다.')
 
 
 def get_previous_layer_target(task, tasks, statuses):
@@ -97,22 +89,36 @@ def get_previous_layer_target(task, tasks, statuses):
     return dict(target['assembly'], task_id=target['task_id'])
 
 
-def observation_pose(basket, config, workspace_from_tcp, tcp_to_camera_mm):
-    validate_observation_config(config)
-    dx, dy = config['observation_camera_xy_offset_mm']
-    camera = np.array([number(basket['x'], 'basket.x') + dx,
-                       number(basket['y'], 'basket.y') + dy,
-                       config['observation_camera_z_mm']])
-    tcp = camera - workspace_from_tcp @ np.array(vector(tcp_to_camera_mm, 3, 'TCP camera TF'))
-    return dict(zip(('x', 'y', 'z'), (number(v, 'observation TCP') for v in tcp)))
-
-
-def transit_waypoints(start, end, height, minimum_z):
-    """Only travel horizontally at a measured, validated workspace transit height."""
-    height = number(height, 'observation_transit_z_mm')
-    if height < max(start['z'], end['z'], minimum_z):
-        raise ValueError('검증된 관측 이동 높이가 경유점보다 낮습니다.')
+def transit_waypoints(start, end):
+    """Reuse the existing high approach; separate vertical and horizontal segments."""
+    for point in (start, end):
+        vector([point[a] for a in ('x', 'y', 'z')], 3, 'high approach')
+    height = max(start['z'], end['z'])
     return [dict(start, z=height), dict(end, z=height), dict(end)]
+
+
+def compose_transforms(parent, child):
+    """Compose workspace<-TCP and TCP<-camera at the same acquisition time."""
+    def values(transform):
+        t, q = transform.translation, transform.rotation
+        xyz = vector([t.x, t.y, t.z], 3, 'TF translation')
+        quat = vector([q.x, q.y, q.z, q.w], 4, 'TF quaternion')
+        norm = sum(v * v for v in quat)
+        if abs(norm - 1.0) > 0.01:
+            raise ValueError('TF 회전이 유효하지 않습니다.')
+        return np.array(xyz), np.array(quat) / math.sqrt(norm)
+
+    pt, pq = values(parent)
+    ct, cq = values(child)
+    # Quaternion rotation of the camera translation, followed by composition.
+    xyz = pt + ct + 2 * np.cross(pq[:3], np.cross(pq[:3], ct) + pq[3] * ct)
+    qxyz = pq[3] * cq[:3] + cq[3] * pq[:3] + np.cross(pq[:3], cq[:3])
+    qw = pq[3] * cq[3] - np.dot(pq[:3], cq[:3])
+    result = copy.deepcopy(parent)
+    result.translation.x, result.translation.y, result.translation.z = map(float, xyz)
+    result.rotation.x, result.rotation.y, result.rotation.z = map(float, qxyz)
+    result.rotation.w = float(qw)
+    return result
 
 
 def validate_frames(meta, request, config, now_ros, now_mono):

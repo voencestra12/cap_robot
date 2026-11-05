@@ -10,19 +10,12 @@
     pick_verify_timeout_sec: 3.0     # 재확인용 새 프레임 대기 한도(초)
     basket_exclusion_radius_mm: 100.0  # 적층 시 바구니 중심 XY 반경 안 재료는 후보 제외(mm), 실측 필요
 
-    # 공통 적층 보정. .nan/빈 문자열은 미설정이며 enabled=true 실행을 차단합니다.
+    # Agent1 양상추(layer 1)만 지원. 기본 OFF; 안전 범위 미설정이면 실행을 차단합니다.
     stack_place_vision.enabled: false
-    stack_place_vision.materials: ["양상추"]  # 햄/빵은 파지 중심 Offset 실측 후 추가
-    # 파지 자세를 유지한 카메라 시야/경로/높이 검증 후에만 true
+    stack_place_vision.materials: ["양상추"]
+    # 기존 높은 Place 접근 위치에서 파지 상태 시야/바구니/도구 경로 검증 후에만 true
     stack_place_vision.observation_validated: false
-    stack_place_vision.tcp_frame: "agent2_tcp"  # 실측 SDK TCP: link6 로컬 Z +172 mm
-    # 바구니 파란 점 XY 평균 → 카메라 optical 원점 XY (workspace 축, mm)
-    stack_place_vision.observation_camera_xy_offset_mm: [.nan, .nan]
-    # 카메라 원점의 workspace_0 절대 Z. 손잡이 Z를 더하지 않음
-    stack_place_vision.observation_camera_z_mm: .nan
-    # 수평 이동 workspace TCP 높이: Pick 상승/관측/기존 높은 Place보다 높게 실측 검증
-    stack_place_vision.observation_transit_z_mm: .nan
-    stack_place_vision.observation_speed_mm_s: .nan  # 파지 상태에서 검증할 관측 이동 속도
+    stack_place_vision.tcp_frame: "agent2_tcp"  # 기존 SDK TCP/Hand-eye TF 사용
     stack_place_vision.basket_half_extent_mm: [.nan, .nan]  # 바구니 내부 XY 반폭 실측
     stack_place_vision.target_z_range_mm: [.nan, .nan]  # 이전 층 중심 workspace 절대 Z 범위 실측
     stack_place_vision.max_correction_mm: .nan  # 기존 TCP XY 대비 허용 이동 거리 실측

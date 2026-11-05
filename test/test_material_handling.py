@@ -235,7 +235,7 @@ def load_agent_methods():
         'validate_actions', 'resolve_task_assembly', 'refresh_execution_assembly',
         'validate_guidebook_policy_candidate', 'build_tasks', 'validate_received_task',
         'execute_task', 'execute_place_action', 'execute_cooperative_task', 'get_basket_center_workspace',
-        'workspace_rpy_to_robot', 'move_to_sdk', 'move_to_robot_tf',
+        'workspace_rpy_to_robot', 'move_to_sdk', 'move_to_robot_tf', 'quaternion_to_rotation_matrix',
         'normalize_angle_rad', 'tf_pose_to_sdk_pose',
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
@@ -243,8 +243,9 @@ def load_agent_methods():
         'verify_pick_target', 'needs_stack_place', 'observe_previous_layer',
         'require_observation_token', 'plan_stack_observation', 'move_stack_observation_path',
         'get_previous_layer_target', 'prepare_stack_place', 'stack_camera_mount', 'stack_release_rotation',
+        'require_stack_stopped', 'preflight_stack_commands', 'stack_motion_command', 'stack_place_commands',
         'image_frame_metadata', 'color_callback', 'depth_callback',
-        'get_latest_perception_frames', 'place_camera_transform',
+        'get_latest_perception_frames', 'place_camera_transform', 'camera_point_to_workspace',
         'workspace_place_to_robot_place', 'convert_place_pose',
     }
     original.bases = []
