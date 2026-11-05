@@ -102,14 +102,18 @@ def agent(monkeypatch, tmp_path):
     node._shared_zone_box = lambda: dict(x_min=150., x_max=450., y_min=-50., y_max=500.)
     node.lookup_workspace_transform = Mock(return_value=SimpleNamespace(transform=SimpleNamespace(
         translation=SimpleNamespace(x=0., y=0., z=0.),
-        rotation=SimpleNamespace(x=0., y=0.70710678, z=0., w=0.70710678))))
+        rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))))
     node.arm.version_number = (2, 4, 0)
     node.arm.get_state.return_value = (0, 2)
     node.arm.get_is_moving.return_value = False
     node.arm.error_code = 0
     node.arm.set_position.return_value = 0
     node.arm.only_check_result = 0
-    node.quaternion_to_rotation_matrix = lambda *a: np.array([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+    node.quaternion_to_rotation_matrix = lambda *a: np.eye(3)
+    node.convert_place_pose = lambda pose, agent: dict(pose)
+    # Blocking moves report their final measured TCP without connecting to hardware.
+    node.arm.get_position.side_effect = lambda **kw: (
+        0, [*node.move_to_robot_tf.call_args.args[:3], 180., 0., 0.])
     def acquire(_):
         node._zone_token_held = True
         return True
@@ -182,7 +186,7 @@ def test_first_empty_frame_then_three_stable_frames_allows_correction(agent, mon
     node.move_to_robot_tf.side_effect = move
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
-    assert [c.kwargs['label'] for c in node.move_to_robot_tf.call_args_list].count('corrected approach') == 1
+    assert [c.kwargs['label'] for c in node.move_to_robot_tf.call_args_list].count('corrected approach') == 2
     node.return_to_home_joint_pose.assert_called_once()
     node.release_zone_token.assert_called_once()
 
@@ -353,7 +357,7 @@ def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, m
     node.agent_id = task['assignee_id'] = agent_id
     node.stack_vision_config['max_correction_mm'] = 50.
     # Exercise the real convert_place_pose/workspace_place_to_robot_place methods.
-    node.workspace_point_to_robot = Mock(side_effect=lambda x, y, z, **kw: (z, y, -x))
+    node.workspace_point_to_robot = Mock(side_effect=lambda x, y, z, **kw: (x, y, z))
     node.workspace_yaw_to_robot = Mock(side_effect=lambda yaw, **kw: yaw + 0.2)
     node.convert_place_pose = lambda pose, agent: type(node).convert_place_pose(node, pose, agent)
     feed(monkeypatch, node, [observation(300 + delta[0], 170 + delta[1])] * 3)
@@ -367,15 +371,15 @@ def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, m
     node.observe_previous_layer = verify
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=300 + delta[0], y=170 + delta[1], z=60, yaw=0)
-    moves = node.move_to_robot_tf.call_args_list[7:]
+    moves = node.move_to_robot_tf.call_args_list[8:]
     assert [c.args[:3] for c in moves] == [
-        (220, 170 + delta[1], -300 - delta[0]),
-        (60, 170 + delta[1], -300 - delta[0]),
-        (220, 170 + delta[1], -300 - delta[0])]
+        (300 + delta[0], 170 + delta[1], 220),
+        (300 + delta[0], 170 + delta[1], 60),
+        (300 + delta[0], 170 + delta[1], 220)]
     assert all(c.kwargs['yaw'] == 0.2 for c in moves)
     assert all(c.kwargs['agent_id'] == agent_id for c in node.workspace_point_to_robot.call_args_list)
-    assert node.check_sdk_pose_or_raise.call_count == 9
-    assert node.check_sdk_pose_or_raise.call_args_list[4].args[2] == -300 - delta[0] - (10 if agent_id == 'agent2' else 0)
+    assert node.check_sdk_pose_or_raise.call_count == 10
+    assert node.check_sdk_pose_or_raise.call_args_list[-2].args[2] == 230.
     assert node.is_moving and node.place_verification_request is None
 
 
@@ -617,14 +621,121 @@ def test_tf_queries_capture_time_and_rejects_invalid_rotation():
 def test_observation_uses_blue_mean_xy_and_existing_high_place_z(agent):
     node, task = agent
     assert node.validate_received_task(task)
-    # SDK xyz corresponding to workspace (10, 20, 180), under the fixture TF.
-    start = dict(x=180., y=20., z=-10., yaw=0.)
+    start = dict(x=10., y=20., z=180., yaw=0.)
+    node.arm.get_position.side_effect = None
+    node.arm.get_position.return_value = (0, [10., 20., 180., 180., 0., 0.])
     view, _, path = node.plan_stack_observation(task, start, None, dict(z_offset=200., speed=100.))
     assert view == dict(x=300., y=200., z=220., yaw=0.)
     task['basket_center_workspace']['z'] = 900.
     assert node.plan_stack_observation(task, start, None, dict(z_offset=200., speed=100.))[0] == view
     assert path == [dict(x=10., y=20., z=180., yaw=0.),
                     dict(x=10., y=20., z=220., yaw=0.), view, view]
+
+
+@pytest.mark.parametrize('pick_z,base_z', [(314.2, 0.), (180., 0.), (314.2, 200.),
+                                         (180., -200.)])
+def test_observation_compares_workspace_heights_and_executes_up_then_level(agent, pick_z, base_z):
+    node, task = agent
+    assert node.validate_received_task(task)
+    # Base and workspace have different Z origins, plus a 90 degree XY rotation.
+    rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    translation = np.array([100., -50., base_z])
+    node.lookup_workspace_transform.return_value.transform = rigid_transform(
+        translation / 1000., (0., 0., math.sqrt(.5), math.sqrt(.5)))
+    node.quaternion_to_rotation_matrix = lambda *a: rotation
+    def convert(point, agent):
+        xyz = rotation @ np.array([point[a] for a in ('x', 'y', 'z')]) + translation
+        return dict(zip(('x', 'y', 'z'), xyz), yaw=point['yaw'])
+    node.convert_place_pose = convert
+    start = dict(x=10., y=20., z=pick_z, yaw=0.)  # Base, not workspace
+    node.move_to_robot_tf(start['x'], start['y'], start['z'])
+    view, attitude, path = node.plan_stack_observation(
+        task, start, None, dict(z_offset=200., speed=100.))
+    height = max(pick_z - base_z, 220.)
+    assert view['z'] == pytest.approx(height)
+    assert path[0]['z'] == pytest.approx(pick_z - base_z)
+    assert all(p['z'] >= pick_z - base_z for p in path)
+    node._zone_token_held = True
+    node.move_stack_observation_path(task, path, attitude, 'observe', 100.)
+    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
+    # First rise stays at the actual Pick XY. All later motion keeps SDK Z.
+    assert moves[1] == pytest.approx((10., 20., height + base_z))
+    assert all(p[2] == pytest.approx(height + base_z) for p in moves[1:])
+    assert min(p[2] for p in moves) >= pick_z
+    assert max(p[2] for p in moves) <= max(pick_z, 220. + base_z)
+    assert moves[-1][:2] == pytest.approx((-100., 250.))
+
+
+@pytest.mark.parametrize('tilt_deg', [-90., -5., 5., 180.])
+def test_tilted_or_inverted_workspace_cannot_lower_tcp_or_invent_extra_rise(agent, tilt_deg):
+    node, task = agent
+    angle = math.radians(tilt_deg)
+    rotation = handling.rpy_to_matrix(0., angle, 0.)
+    node.lookup_workspace_transform.return_value.transform = rigid_transform(
+        quat=(0., math.sin(angle / 2), 0., math.cos(angle / 2)))
+    node.quaternion_to_rotation_matrix = lambda *a: rotation
+    def convert(point, agent):
+        xyz = rotation @ np.array([point[a] for a in ('x', 'y', 'z')])
+        return dict(zip(('x', 'y', 'z'), xyz), yaw=point['yaw'])
+    node.convert_place_pose = convert
+    node.observe_previous_layer = Mock(side_effect=AssertionError('unsafe observation'))
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3  # unchanged Pick only
+    node.observe_previous_layer.assert_not_called()
+    node.arm.set_position.assert_not_called()  # no path or motion after Pick
+    assert node.control_gripper.call_count == 2
+    node.return_to_home_joint_pose.assert_not_called()
+    node.release_zone_token.assert_not_called()
+    assert node._place_observation_fault
+
+
+def test_inconsistent_tf_to_sdk_mapping_is_rejected_before_observation(agent):
+    node, task = agent
+    node.convert_place_pose = lambda p, agent: dict(p, z=p['z'] + 10.)
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3
+    node.arm.set_position.assert_not_called()
+    assert node.control_gripper.call_count == 2
+
+
+@pytest.mark.parametrize('stage', ['pick', 'entry', 'waypoint'])
+@pytest.mark.parametrize('failure', ['sdk_error', 'nan', 'below_lift'])
+def test_actual_tcp_feedback_failure_blocks_observation_and_place(agent, stage, failure):
+    node, task = agent
+    original = node.arm.get_position.side_effect
+    def position(**kwargs):
+        code, pose = original(**kwargs)
+        fail_at = {'pick': 1, 'entry': 2, 'waypoint': 3}[stage]
+        if node.arm.get_position.call_count == fail_at:
+            if failure == 'sdk_error':
+                code = -1
+            else:
+                pose[2] = math.nan if failure == 'nan' else pose[2] - 1.
+        return code, pose
+    node.arm.get_position.side_effect = position
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == (4 if stage == 'waypoint' else 3)
+    assert node.control_gripper.call_count == 2
+    node.return_to_home_joint_pose.assert_not_called()
+    node.release_zone_token.assert_not_called()
+    assert node._place_observation_fault
+
+
+def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
+    node, task = agent
+    feed(monkeypatch, node, [observation()] * 3)
+    observe = node.observe_previous_layer
+    def shifted(task):
+        result = observe(task)
+        node.convert_place_pose = lambda p, agent: dict(p, z=p['z'] - 1.)
+        return result
+    node.observe_previous_layer = shifted
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 6  # observation completed, no correction
+    assert node.control_gripper.call_count == 2
+    node.return_to_home_joint_pose.assert_not_called()
+    node.release_zone_token.assert_not_called()
+    assert node._place_observation_fault
 
 
 @pytest.mark.parametrize('overrides', [
@@ -673,15 +784,16 @@ def test_corrected_transfer_and_descent_never_mix_horizontal_and_vertical_motion
         return original_verify(t)
     node.observe_previous_layer = verify
     assert node.execute_task(task)
-    # Invert the fixture's robot <- workspace transform.
-    points = [(-c.args[2], c.args[1], c.args[0])
-              for c in node.move_to_robot_tf.call_args_list[2:]]
+    points = [c.args[:3] for c in node.move_to_robot_tf.call_args_list[2:]]
     for before, after in zip(points, points[1:]):
         if not math.isclose(before[2], after[2]):
             assert before[:2] == pytest.approx(after[:2])
     # Observe at the basket mean; correct horizontally at the same high Z.
-    assert points[3] == (300., 200., 220.)
-    assert points[4] == (310., 180., 220.)
+    assert points[0][2] == 230.  # existing Pick lift
+    assert all(p[2] >= points[0][2] for p in points[:5])
+    assert points[3] == (300., 200., 230.)
+    assert points[4] == (310., 180., 230.)
+    assert points[5] == (310., 180., 220.)  # descent only after XY correction
     assert all(p[:2] == (310., 180.) for p in points[4:])
     assert points[-3][2] == 220.  # original high approach
     assert points[-2][2] == 60.   # original release Z
@@ -973,16 +1085,16 @@ def test_controller_preflight_covers_whole_corrected_path_before_motion(agent, m
     feed(monkeypatch, node, [observation(310, 180)] * 3)
     assert node.execute_task(task)
     checked = [c.kwargs for c in node.arm.set_position.call_args_list]
-    assert [p['only_check_type'] for p in checked] == [1, 3, 3, 2, 1, 3, 3, 3, 2]
+    assert [p['only_check_type'] for p in checked] == [1, 3, 3, 2, 1, 3, 3, 3, 3, 2]
     assert all(p['wait'] is False and p['is_radian'] is False for p in checked)
     # Controller planning visits view -> corrected high -> approach -> release -> retreat.
     assert [(p['x'], p['y'], p['z']) for p in checked[4:]] == [
-        (220., 200., -300.), (220., 180., -310.), (220., 180., -310.),
-        (60., 180., -310.), (220., 180., -310.)]
+        (300., 200., 230.), (310., 180., 230.), (310., 180., 220.),
+        (310., 180., 220.), (310., 180., 60.), (310., 180., 220.)]
     node.arm.set_only_check_type.assert_not_called()  # no global SDK mode changes
 
 
-@pytest.mark.parametrize('check_index', [1, 3, 4, 5, 6, 8, 9])
+@pytest.mark.parametrize('check_index', [1, 3, 4, 5, 6, 8, 9, 10])
 @pytest.mark.parametrize('failure', ['return_code', 'collision_result', 'exception'])
 def test_controller_path_failure_never_executes_unchecked_path(agent, monkeypatch, check_index, failure):
     node, task = agent
@@ -1021,7 +1133,7 @@ def test_unsupported_firmware_cannot_skip_path_validation(agent, version):
 def test_capture_requires_successful_normal_stop(agent, stage, failure):
     node, task = agent
     def state():
-        if stage == 'observation' and node.arm.get_state.call_count == 1:
+        if stage == 'observation' and node.move_to_robot_tf.call_count < 6:
             return 0, 2
         if failure == 'moving':
             node.arm.get_is_moving.return_value = True
@@ -1109,8 +1221,8 @@ def test_preflight_release_attitude_exactly_matches_existing_place_moves(agent, 
         profile.update(pick_rpy_robot_deg=[178., 1., 2.], place_rpy_robot_deg=[170., 20., 35.])
     feed(monkeypatch, node, [observation()] * 3)
     assert node.execute_task(task)
-    plan = [c.kwargs for c in node.arm.set_position.call_args_list][6:]
-    actual = node.move_to_robot_tf.call_args_list[7:]
+    plan = [c.kwargs for c in node.arm.set_position.call_args_list][7:]
+    actual = node.move_to_robot_tf.call_args_list[8:]
     assert len(plan) == len(actual)
     for checked, move in zip(plan, actual):
         assert (checked['x'], checked['y'], checked['z']) == pytest.approx(move.args[:3])
@@ -1120,15 +1232,19 @@ def test_preflight_release_attitude_exactly_matches_existing_place_moves(agent, 
         assert checked['speed'] == move.kwargs['speed']
 
 
-def test_config_cleanup_keeps_feature_disabled_and_has_no_manual_camera_geometry():
+def test_config_cleanup_separates_default_off_from_field_settings_and_has_no_manual_geometry():
     from pathlib import Path
     import yaml
     removed = {'observation_camera_xy_offset_mm', 'observation_camera_z_mm',
-               'observation_transit_z_mm', 'observation_speed_mm_s'}
+               'observation_transit_z_mm', 'observation_speed_mm_s', 'observation_z_offset'}
+    assert vision.DEFAULTS['enabled'] is False
+    assert vision.DEFAULTS['observation_validated'] is False
     assert not removed.intersection(vision.DEFAULTS)
     for agent_id in ('agent1', 'agent2'):
         path = Path(__file__).resolve().parents[1] / 'config' / f'{agent_id}.yaml'
         config_values = yaml.safe_load(path.read_text())[f'/{agent_id}/robot_agent_node']['ros__parameters']
-        assert config_values['stack_place_vision.enabled'] is False
-        assert config_values['stack_place_vision.observation_validated'] is False
+        # Agent1 is the existing field experiment configuration; it is not the
+        # unconfigured runtime default. Keep Agent2 disabled.
+        assert config_values['stack_place_vision.enabled'] is (agent_id == 'agent1')
+        assert config_values['stack_place_vision.observation_validated'] is (agent_id == 'agent1')
         assert not {f'stack_place_vision.{key}' for key in removed}.intersection(config_values)
