@@ -371,14 +371,16 @@ def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, m
     node.observe_previous_layer = verify
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=300 + delta[0], y=170 + delta[1], z=60, yaw=0)
-    moves = node.move_to_robot_tf.call_args_list[8:]
+    # A correction straight below the view needs no separate zero-length level move.
+    moves = node.move_to_robot_tf.call_args_list[-3:]
+    assert node.move_to_robot_tf.call_count == (10 if delta == (0, 30) else 11)
     assert [c.args[:3] for c in moves] == [
         (300 + delta[0], 170 + delta[1], 220),
         (300 + delta[0], 170 + delta[1], 60),
         (300 + delta[0], 170 + delta[1], 220)]
     assert all(c.kwargs['yaw'] == 0.2 for c in moves)
     assert all(c.kwargs['agent_id'] == agent_id for c in node.workspace_point_to_robot.call_args_list)
-    assert node.check_sdk_pose_or_raise.call_count == 10
+    assert node.check_sdk_pose_or_raise.call_count == (9 if delta == (0, 30) else 10)
     assert node.check_sdk_pose_or_raise.call_args_list[-2].args[2] == 230.
     assert node.is_moving and node.place_verification_request is None
 
@@ -691,11 +693,15 @@ def test_field_workspace_tilt_keeps_sdk_level_and_descends_only_after_correction
     moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
     # Pick lift, observation and corrected approach, then the unchanged Place trio.
     lift, approach = moves[2], moves[2:-3]
+    # Level moves may absorb a sub-tolerance (< 1 mm) Z step; larger steps are vertical.
     for before, after in zip(approach, approach[1:]):
-        if not math.isclose(before[2], after[2], abs_tol=1e-6):
+        assert math.dist(before, after) >= vision.POSITION_TOLERANCE_MM or before == after
+        if not math.isclose(before[2], after[2], abs_tol=vision.POSITION_TOLERANCE_MM):
             assert before[:2] == pytest.approx(after[:2], abs=1e-6)
     assert all(p[2] >= lift[2] - 1e-6 for p in approach[:-1])
-    assert approach[-2][:2] == pytest.approx(approach[-1][:2], abs=1e-6)
+    final = approach[-2], approach[-1]
+    assert (final[0][:2] == pytest.approx(final[1][:2], abs=1e-6)
+            or abs(final[0][2] - final[1][2]) < vision.POSITION_TOLERANCE_MM)
     assert approach[-1] == pytest.approx(moves[-3])  # original high approach
     view = rotation.T @ np.array(moves[5])
     assert view[:2] == pytest.approx((300., 200.))  # blue-handle mean
@@ -764,9 +770,35 @@ def test_sub_millimetre_tcp_feedback_noise_does_not_block_observation(agent, mon
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
     moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
-    # Lowered actual reading rises back to the commanded lift, never below it.
-    assert moves[3] == pytest.approx((moves[2][0] + .3, moves[2][1] - .3, moves[2][2]))
+    # The path starts at the measured TCP; no sub-tolerance rise back to the command.
+    assert moves[3] == pytest.approx((moves[2][0] + .3, moves[2][1] - .3, moves[2][2] - .4))
     node.release_zone_token.assert_called_once()
+
+
+def test_field_c24_preflight_never_checks_near_zero_segments(agent, monkeypatch):
+    """2026-11-05: measured Z 316.874725 vs command 316.8748 produced a 0.00008 mm
+    rise and a zero-length final check; the controller rejected the path (C24)."""
+    node, task = agent
+    original = node.arm.get_position.side_effect
+    def measured(**kwargs):
+        code, pose = original(**kwargs)
+        return code, [pose[0], pose[1], pose[2] - 7.8e-5, *pose[3:]]
+    node.arm.get_position.side_effect = measured
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    sequences = []
+    preflight = node.preflight_stack_commands
+    def record(commands):
+        sequences.append([node.arm.get_position()[1][:6]] + [
+            [c[a] for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')] for c in commands])
+        return preflight(commands)
+    node.preflight_stack_commands = record
+    assert node.execute_task(task)
+    assert len(sequences) == 2
+    for sequence in sequences:  # each starts at the arm's measured pose
+        for before, after in zip(sequence, sequence[1:]):
+            moved = math.dist(before[:3], after[:3])
+            rotated = before[3:] != pytest.approx(after[3:])
+            assert moved >= vision.POSITION_TOLERANCE_MM or (moved == 0 and rotated)
 
 
 def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
@@ -1133,16 +1165,17 @@ def test_controller_preflight_covers_whole_corrected_path_before_motion(agent, m
     feed(monkeypatch, node, [observation(310, 180)] * 3)
     assert node.execute_task(task)
     checked = [c.kwargs for c in node.arm.set_position.call_args_list]
-    assert [p['only_check_type'] for p in checked] == [1, 3, 3, 2, 1, 3, 3, 3, 3, 2]
+    # Observation: one level move from the standing Pick lift. Correction: level XY,
+    # descent, then release and retreat; the repeated high approach is not re-checked.
+    assert [p['only_check_type'] for p in checked] == [1, 1, 3, 3, 2]
     assert all(p['wait'] is False and p['is_radian'] is False for p in checked)
-    # Controller planning visits view -> corrected high -> approach -> release -> retreat.
-    assert [(p['x'], p['y'], p['z']) for p in checked[4:]] == [
+    assert [(p['x'], p['y'], p['z']) for p in checked] == [
         (300., 200., 230.), (310., 180., 230.), (310., 180., 220.),
-        (310., 180., 220.), (310., 180., 60.), (310., 180., 220.)]
+        (310., 180., 60.), (310., 180., 220.)]
     node.arm.set_only_check_type.assert_not_called()  # no global SDK mode changes
 
 
-@pytest.mark.parametrize('check_index', [1, 3, 4, 5, 6, 8, 9, 10])
+@pytest.mark.parametrize('check_index', [1, 2, 3, 4, 5])
 @pytest.mark.parametrize('failure', ['return_code', 'collision_result', 'exception'])
 def test_controller_path_failure_never_executes_unchecked_path(agent, monkeypatch, check_index, failure):
     node, task = agent
@@ -1158,7 +1191,7 @@ def test_controller_path_failure_never_executes_unchecked_path(agent, monkeypatc
         return 0
     node.arm.set_position.side_effect = check
     assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (3 if check_index <= 4 else 6)
+    assert node.move_to_robot_tf.call_count == (3 if check_index == 1 else 6)
     assert node.control_gripper.call_count == 2
     assert task['reference_place_pose']['y'] == 170.
     assert node._place_observation_fault
@@ -1269,8 +1302,14 @@ def test_preflight_release_attitude_exactly_matches_existing_place_moves(agent, 
         profile.update(pick_rpy_robot_deg=[178., 1., 2.], place_rpy_robot_deg=[170., 20., 35.])
     feed(monkeypatch, node, [observation()] * 3)
     assert node.execute_task(task)
-    plan = [c.kwargs for c in node.arm.set_position.call_args_list][7:]
-    actual = node.move_to_robot_tf.call_args_list[8:]
+    def pose(move):
+        return (*move.args[:3], math.degrees(move.kwargs['yaw']),
+                move.kwargs.get('roll_deg', 180.), move.kwargs.get('pitch_deg', 0.))
+    # After the single observation check, preflight mirrors every correction/Place
+    # move except exact repeats of the pose the arm already holds.
+    plan = [c.kwargs for c in node.arm.set_position.call_args_list][1:]
+    moves = node.move_to_robot_tf.call_args_list[5:]
+    actual = [m for prev, m in zip(moves, moves[1:]) if pose(m) != pytest.approx(pose(prev))]
     assert len(plan) == len(actual)
     for checked, move in zip(plan, actual):
         assert (checked['x'], checked['y'], checked['z']) == pytest.approx(move.args[:3])

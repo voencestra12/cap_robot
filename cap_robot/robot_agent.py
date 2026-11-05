@@ -3121,8 +3121,9 @@ class RobotAgentNode(Node):
             **{a: last_pick_pose[a] for a in ('x', 'y', 'z')}, agent_id=self.agent_id)
         if sdk_pick.get('mode') != 'identity':
             raise ValueError('관측에는 검증된 Agent1 Base/SDK identity 변환이 필요합니다.')
+        tolerance = stack_place.POSITION_TOLERANCE_MM
         if not np.allclose(actual[:3], [sdk_pick[a] for a in ('x', 'y', 'z')],
-                           rtol=0, atol=stack_place.POSITION_TOLERANCE_MM):
+                           rtol=0, atol=tolerance):
             raise ValueError('Pick 상승 실제 TCP가 명령 위치와 다릅니다.')
         transform = self.lookup_workspace_transform(self.agent_id).transform
         q = transform.rotation
@@ -3139,8 +3140,12 @@ class RobotAgentNode(Node):
         basket = task['basket_center_workspace']
         high_view = dict(high, x=basket['x'], y=basket['y'])
         high_view_robot = self.convert_place_pose(high_view, self.agent_id)
-        # Keep the Pick lift SDK Z, or use the existing high Place SDK Z if higher.
-        height = max(actual[2], sdk_pick['z'], high_view_robot['z'])
+        # Keep the actual Pick lift SDK Z, or rise to the existing high Place SDK Z.
+        # A sub-tolerance rise is not commanded: the xArm planner rejected a
+        # near-zero segment with C24 (2026-11-05).
+        height = high_view_robot['z']
+        if height - actual[2] < tolerance:
+            height = actual[2]
         # Exact basket XY in workspace, at the workspace Z whose SDK Z is height.
         view = dict(high_view, z=(height - translation[2] - rotation[2, 0] * basket['x']
                                   - rotation[2, 1] * basket['y']) / rotation[2, 2])
@@ -3151,9 +3156,7 @@ class RobotAgentNode(Node):
                                            agent_id=self.agent_id)
             if not np.allclose(expected, [sdk[a] for a in ('x', 'y', 'z')], rtol=0, atol=1e-6):
                 raise ValueError('관측 경로의 workspace TF와 실제 TF→SDK 변환이 다릅니다.')
-        if view['z'] < high['z'] - 1e-6:
-            raise ValueError('관측 위치가 기존 높은 Place workspace Z보다 낮습니다.')
-        start = dict(zip(('x', 'y', 'z'), actual[:3]), yaw=view_robot['yaw'])
+        start =dict(zip(('x', 'y', 'z'), actual[:3]), yaw=view_robot['yaw'])
         path = [start] + stack_place.transit_waypoints(start, dict(view_robot, z=height))
         if any(not start['z'] - 1e-6 <= p['z'] <= height + 1e-6 for p in path):
             raise ValueError('관측 경로가 Pick 상승 SDK Z보다 낮거나 검증된 기존 높이를 초과합니다.')
@@ -3193,7 +3196,8 @@ class RobotAgentNode(Node):
                 **command, only_check_type=mode, wait=False, is_radian=False)
             if ret != 0 or self.arm.only_check_result != 0:
                 raise ValueError(f'적층 전체 경로 도달/충돌 검사 실패: ret={ret}, '
-                                 f'detail={self.arm.only_check_result}')
+                                 f'detail={self.arm.only_check_result}, '
+                                 f'구간={index + 1}/{len(commands)}, 명령={command}')
         self.require_observation_token()
 
     def stack_motion_command(self, point, attitude, speed, robot_pose=None):
@@ -3251,15 +3255,16 @@ class RobotAgentNode(Node):
         self.require_observation_token()
         commands = [self.stack_motion_command(point, attitude, speed, robot_pose=point)
                     for point in path]
+        tolerance = stack_place.POSITION_TOLERANCE_MM
         # Each segment either keeps SDK Z (horizontal) or keeps SDK XY (vertical).
+        # Sub-tolerance Z steps are merged into horizontal moves, never commanded alone.
         for first, second in zip(commands, commands[1:]):
             horizontal = not np.allclose([first[a] for a in ('x', 'y')],
                                         [second[a] for a in ('x', 'y')], rtol=0, atol=1e-6)
-            if horizontal and not math.isclose(first['z'], second['z'], abs_tol=1e-6, rel_tol=0):
+            if horizontal and not math.isclose(first['z'], second['z'], abs_tol=tolerance, rel_tol=0):
                 raise ValueError('관측/보정 경로의 SDK 수직·수평 분리를 검증할 수 없습니다.')
         if label == 'observe' and any(c['z'] < commands[0]['z'] - 1e-6 for c in commands):
             raise ValueError('관측 전 Pick 상승 SDK Z보다 낮은 경로입니다.')
-        tolerance = stack_place.POSITION_TOLERANCE_MM
         code, actual = self.arm.get_position(is_radian=False)
         if code != 0:
             raise ValueError('관측/보정 진입 전 실제 TCP 위치 확인 실패')
@@ -3268,7 +3273,15 @@ class RobotAgentNode(Node):
                            rtol=0, atol=tolerance):
             raise ValueError('관측/보정 진입 전 실제 TCP가 계획 시작 위치와 다릅니다.')
         self.get_logger().info(f"[{task['task_id']}] {label}: Base 경유점={path}, SDK={commands}")
-        self.preflight_stack_commands(commands + (place_commands or []))
+        # The arm already stands at path[0]: check only the moves it will make, and
+        # skip zero-length repeats, which the controller planner rejects (C24).
+        planned, previous = [], commands[0]
+        for command in commands[1:] + (place_commands or []):
+            if not all(math.isclose(command[a], previous[a], abs_tol=1e-6, rel_tol=0)
+                       for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')):
+                planned.append(command)
+            previous = command
+        self.preflight_stack_commands(planned)
         # TF preflight can itself take time; gate freshness after it, just before motion.
         self.get_previous_layer_target(task)
         if verification is not None:
@@ -3362,9 +3375,11 @@ class RobotAgentNode(Node):
         # Finish XY at the observation SDK Z (higher only if the tilted workspace
         # puts the approach above it), then descend vertically to the original
         # high approach. The unchanged Place actions retain Z, attitude and release.
-        approach = [start] + stack_place.transit_waypoints(start, target)
-        if approach[1]['z'] == start['z']:
-            del approach[1]
+        if abs(target['z'] - start['z']) < stack_place.POSITION_TOLERANCE_MM:
+            approach = [start, target]  # no sub-tolerance vertical step
+        else:
+            approach = [start] + stack_place.transit_waypoints(start, target)
+            approach = [p for p, q in zip(approach, [None] + approach) if p != q]
         self.move_stack_observation_path(
             task, approach, attitude, 'corrected approach', action['speed'],
             verification=(request, observations),
