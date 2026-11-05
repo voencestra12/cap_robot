@@ -34,6 +34,12 @@ DEFAULTS = {
     'tcp_frame': '',
 }
 
+# Fixed safety limits, intentionally not ROS parameters.
+# A blocking xArm move stops near, not exactly at, its command.
+POSITION_TOLERANCE_MM = 1.0
+# workspace_0 (ArUco) is not parallel to the robot Base; field runs measured 0.5-2.7 deg.
+MAX_WORKSPACE_TILT_DEG = 10.0
+
 
 def vector(value, size, label):
     if not isinstance(value, (list, tuple)) or len(value) != size:

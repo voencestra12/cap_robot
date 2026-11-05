@@ -12,8 +12,12 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 1. 기존 양상추 Pick 재확인, 파지, 안전 상승을 수행합니다.
 2. 기존 선행 Task 대기와 공용 구역 Token 확보 후 고정 카메라의 파란 점 두 개를 새로 읽습니다.
    두 점의 workspace XY 평균을 TCP 관측 XY로 사용합니다. 손잡이 Z는 사용하지 않습니다.
-3. 관측 Z는 기존 첫 높은 `move_to_place`의 `assembly_move_pose()` 결과를 재사용합니다.
-   Pick 상승 위치가 더 높으면 그 높이에서 수평 이동한 후 기존 높은 Place Z로 수직 이동합니다.
+3. 관측 높이는 로봇 Base(SDK) Z 기준으로 정합니다.
+   `max(Pick 상승 실제/명령 SDK Z, 바구니 XY의 기존 높은 Place SDK Z)`이며 그보다 더 올리지 않습니다.
+   workspace_0(ArUco)는 Base와 평행하지 않으므로(현장 측정 0.5~2.7°) workspace Z를 유지한
+   이동은 로봇 기준으로 오르내립니다. 따라서 수평 이동은 SDK Z를 고정하고, 수직 이동은 SDK XY를 고정합니다.
+   경로는 Pick 상승 위치 → (필요 시 수직 상승) → 관측 높이에서 수평 이동이며, 관측 전 하강은 없습니다.
+   관측점의 workspace XY는 정확히 파란 점 평균이고, workspace Z는 기존 높은 Place Z 이상입니다.
    낮은 위치에서 대각선으로 바구니에 진입하지 않습니다.
 4. blocking 이동 성공과 controller의 정상 정지를 확인한 뒤 `perception_settle_sec`를 적용합니다.
    촬영 시각과 callback 수신 시각이 모두 그 이후인 새 RGB/Depth만 YOLO 관측에 사용합니다.
@@ -40,7 +44,10 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 7. 기존 중앙 파지 가정 `stack_tcp_to_material_center_mm=[0,0,0]`에서 최종 TCP XY는
    관측한 빵 중심 XY의 평균입니다. 기존 양상추 `place_xy_offset_mm=[0,-30]`를 다시 더하지 않습니다.
    nominal Place XY는 허용 보정량 검사 기준으로만 사용합니다.
-8. 기존 높은 Place Z에서 보정 XY로 수평 이동합니다. 이후 원래 Place 접근·하강·해제·후퇴를 실행합니다.
+8. 관측 SDK Z에서 보정 XY로 수평 이동한 뒤 기존 높은 Place 접근 위치로 수직 하강합니다.
+   기울기 때문에 보정된 접근 위치가 관측 높이보다 높으면 먼저 수직 상승합니다.
+   관측 후 workspace TF가 바뀌었으면 보정 이동을 거부합니다.
+   이후 원래 Place 접근·하강·해제·후퇴를 실행합니다.
    기존 Place Z, Roll/Pitch/Yaw, 그리퍼 명령은 유지합니다.
    한 번 확정한 XY를 모든 후속 Place 동작에서 재사용합니다.
 
@@ -55,6 +62,11 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
   자체 충돌, 속도를 검사합니다. 첫 구간은 실제 상태에서 시작하고 중간 가상 상태를 연결합니다.
   검사 요청에 `only_check_type=1/3/2`, `wait=false`를 명시하며 전역 SDK 설정은 바꾸지 않습니다.
   지원 SDK와 펌웨어 **1.11.100 이상**이 없거나 검사 실패/오류이면 실행을 거부합니다.
+- 계획한 경로는 구간마다 SDK Z 또는 SDK XY 중 하나만 바뀌어야 합니다(계산값, 1e-6 mm).
+- 실제 TCP(`get_position`)는 Pick 상승 후, 경로 진입 전, 각 관측 경유점 도착 후에
+  명령 위치와 `stack_place.POSITION_TOLERANCE_MM`(1.0 mm) 이내여야 합니다.
+- workspace_0와 Base의 기울기가 `stack_place.MAX_WORKSPACE_TILT_DEG`(10°)를 넘으면
+  캘리브레이션 이상으로 보고 관측 전에 거부합니다. 두 값은 ROS 파라미터가 아닌 코드 상수입니다.
 - 기존 Token 보호를 유지하고 경유점 사이와 해제 전에 Token·선행 Task 상태를 재확인합니다.
 - 경로 검사 후 보정 이동 직전에 관측값의 신선도를 다시 확인합니다.
 - 정지 실패, 복수 후보, Depth/TF 오류, 오래된/중복 영상, 허용 범위 초과,
@@ -123,12 +135,12 @@ mock SDK/TF/영상으로 검사합니다. 일반 PnP·다른 Agent·Token·Guide
 추가 검증에는 높은 관측 좌표, 수평 보정 후 수직 하강, 촬영 시각 TF 합성, XYZ 변환,
 Offset 중복 방지, 정지 확인, 전체 경로 무동작 검사, 인식/Depth/TF/경로 실패 중단이 포함됩니다.
 
-이번 검증 결과: **297 passed, 95 subtests passed, 1 failed**.
-실패한 기존 `test_config_cleanup_keeps_feature_disabled_and_has_no_manual_camera_geometry`는
-두 Agent의 YAML이 모두 비활성이라고 가정하지만 현재 Agent1 설정은 활성입니다.
-수정 전 HEAD의 별도 사본에서도 동일하게 **281 passed, 95 subtests passed, 1 failed**를
-확인했습니다. 해당 설정과 기존 테스트 기대값은 이번 수정에서 바꾸지 않았습니다.
-첫 프레임 후보 0개 후 3회 안정 검출·보정, 이상 좌표 후 표본 재수집, 5초 마감,
-RGB/Depth 중복 거부, settle 이후 촬영, 실패 영상 저장, Depth/TF 실패 시 원시 Box 표시를
-검사했습니다. compileall 및 `git diff --check` 통과.
-환경에 기존 NumPy/SciPy 버전 호환 경고 1개가 있습니다.
+이번 검증 결과: **325 passed** (2026-11-05, SDK 기준 수평 경로 수정 후).
+workspace_0가 Base 대비 ±0.5°, ±2.7° 기울어진 경우의 전체 실행(관측 전 하강 없음,
+SDK 수직·수평 분리, 보정 후에만 하강), 1 mm 미만 TCP 피드백 오차 허용과
+2 mm 오차 거부, 15° 이상 기울기 거부를 검사합니다. 새 기울기·오차 테스트는 수정 전
+코드에서 실패함을 확인했습니다.
+기존 검증 항목인 첫 프레임 후보 0개 후 3회 안정 검출·보정, 이상 좌표 후 표본 재수집, 5초 마감,
+RGB/Depth 중복 거부, settle 이후 촬영, 실패 영상 저장, Depth/TF 실패 시 원시 Box 표시도
+계속 포함됩니다. compileall 및 `git diff --check` 통과.
+단위 테스트는 실환경 충돌·시야 검증을 대신하지 않습니다.

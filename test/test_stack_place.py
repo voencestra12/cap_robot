@@ -652,9 +652,9 @@ def test_observation_compares_workspace_heights_and_executes_up_then_level(agent
     view, attitude, path = node.plan_stack_observation(
         task, start, None, dict(z_offset=200., speed=100.))
     height = max(pick_z - base_z, 220.)
-    assert view['z'] == pytest.approx(height)
-    assert path[0]['z'] == pytest.approx(pick_z - base_z)
-    assert all(p['z'] >= pick_z - base_z for p in path)
+    assert view['z'] == pytest.approx(height)  # workspace view
+    assert path[0]['z'] == pytest.approx(pick_z)  # Base/SDK path
+    assert all(p['z'] >= pick_z for p in path)
     node._zone_token_held = True
     node.move_stack_observation_path(task, path, attitude, 'observe', 100.)
     moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
@@ -666,9 +666,7 @@ def test_observation_compares_workspace_heights_and_executes_up_then_level(agent
     assert moves[-1][:2] == pytest.approx((-100., 250.))
 
 
-@pytest.mark.parametrize('tilt_deg', [-90., -5., 5., 180.])
-def test_tilted_or_inverted_workspace_cannot_lower_tcp_or_invent_extra_rise(agent, tilt_deg):
-    node, task = agent
+def tilt_workspace(node, tilt_deg):
     angle = math.radians(tilt_deg)
     rotation = handling.rpy_to_matrix(0., angle, 0.)
     node.lookup_workspace_transform.return_value.transform = rigid_transform(
@@ -678,6 +676,39 @@ def test_tilted_or_inverted_workspace_cannot_lower_tcp_or_invent_extra_rise(agen
         xyz = rotation @ np.array([point[a] for a in ('x', 'y', 'z')])
         return dict(zip(('x', 'y', 'z'), xyz), yaw=point['yaw'])
     node.convert_place_pose = convert
+    return rotation
+
+
+# Field runs on 2026-11-05 measured roughly 0.5-2.7 deg between workspace_0 and Base.
+@pytest.mark.parametrize('tilt_deg', [-2.7, -0.5, 0.5, 2.7])
+def test_field_workspace_tilt_keeps_sdk_level_and_descends_only_after_correction(
+        agent, monkeypatch, tilt_deg):
+    node, task = agent
+    rotation = tilt_workspace(node, tilt_deg)
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    assert node.execute_task(task)
+    assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
+    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
+    # Pick lift, observation and corrected approach, then the unchanged Place trio.
+    lift, approach = moves[2], moves[2:-3]
+    for before, after in zip(approach, approach[1:]):
+        if not math.isclose(before[2], after[2], abs_tol=1e-6):
+            assert before[:2] == pytest.approx(after[:2], abs=1e-6)
+    assert all(p[2] >= lift[2] - 1e-6 for p in approach[:-1])
+    assert approach[-2][:2] == pytest.approx(approach[-1][:2], abs=1e-6)
+    assert approach[-1] == pytest.approx(moves[-3])  # original high approach
+    view = rotation.T @ np.array(moves[5])
+    assert view[:2] == pytest.approx((300., 200.))  # blue-handle mean
+    assert view[2] >= 220. - 1e-6  # not below the existing high Place Z
+    corrected = rotation.T @ np.array(approach[-1])
+    assert corrected == pytest.approx((310., 180., 220.))
+    node.release_zone_token.assert_called_once()
+
+
+@pytest.mark.parametrize('tilt_deg', [-90., -15., 15., 180.])
+def test_tilted_or_inverted_workspace_cannot_lower_tcp_or_invent_extra_rise(agent, tilt_deg):
+    node, task = agent
+    tilt_workspace(node, tilt_deg)
     node.observe_previous_layer = Mock(side_effect=AssertionError('unsafe observation'))
     assert not node.execute_task(task)
     assert node.move_to_robot_tf.call_count == 3  # unchanged Pick only
@@ -710,7 +741,8 @@ def test_actual_tcp_feedback_failure_blocks_observation_and_place(agent, stage, 
             if failure == 'sdk_error':
                 code = -1
             else:
-                pose[2] = math.nan if failure == 'nan' else pose[2] - 1.
+                # Beyond POSITION_TOLERANCE_MM (1.0 mm).
+                pose[2] = math.nan if failure == 'nan' else pose[2] - 2.
         return code, pose
     node.arm.get_position.side_effect = position
     assert not node.execute_task(task)
@@ -719,6 +751,22 @@ def test_actual_tcp_feedback_failure_blocks_observation_and_place(agent, stage, 
     node.return_to_home_joint_pose.assert_not_called()
     node.release_zone_token.assert_not_called()
     assert node._place_observation_fault
+
+
+def test_sub_millimetre_tcp_feedback_noise_does_not_block_observation(agent, monkeypatch):
+    node, task = agent
+    original = node.arm.get_position.side_effect
+    def noisy(**kwargs):
+        code, pose = original(**kwargs)
+        return code, [pose[0] + .3, pose[1] - .3, pose[2] - .4, *pose[3:]]
+    node.arm.get_position.side_effect = noisy
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    assert node.execute_task(task)
+    assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
+    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
+    # Lowered actual reading rises back to the commanded lift, never below it.
+    assert moves[3] == pytest.approx((moves[2][0] + .3, moves[2][1] - .3, moves[2][2]))
+    node.release_zone_token.assert_called_once()
 
 
 def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
