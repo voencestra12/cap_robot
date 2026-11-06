@@ -1416,7 +1416,6 @@ class RobotAgentNode(Node):
             yaw=float(np.degrees(yaw)), speed=float(speed), wait=True, is_radian=False
         )
         if ret == 0:
-            self._last_motion_done = time.monotonic()  # preflight diagnostics only
             time.sleep(0.5)
             return True
 
@@ -2954,7 +2953,6 @@ class RobotAgentNode(Node):
         grasped = lifted = False
         observation_entered = False
         completed = False
-        last_pick_pose = None
         try:
             self.arm.clean_error()
             self.arm.set_state(0)
@@ -2980,7 +2978,7 @@ class RobotAgentNode(Node):
                             acquired_here = True
                         self.require_observation_token()
                         observation_entered = True
-                        self.prepare_stack_place(task, last_pick_pose, pick_rpy, action)
+                        self.prepare_stack_place(task, action)
                         zone_plan = self.task_shared_zone_plan(task)
                     assembly_place_ready = True
 
@@ -3033,8 +3031,6 @@ class RobotAgentNode(Node):
                     )
                     if success and grasped:
                         lifted = action['z_offset'] >= 150
-                        last_pick_pose = dict(x=obj['x'], y=obj['y'],
-                                              z=obj['z'] + action['z_offset'], yaw=obj['yaw'])
                 elif api == 'move_to_place':
                     success = self.execute_place_action(task, action, placement_state)
                 elif api == 'wait':
@@ -3103,70 +3099,6 @@ class RobotAgentNode(Node):
         if not self.zone_token_enabled or not self._zone_token_held:
             raise RuntimeError('적층 관측/보정 이동 중 공용 구역 Token이 없습니다.')
 
-    def plan_stack_observation(self, task, last_pick_pose, pick_rpy, action):
-        """Observe above the blue-handle mean without lowering the Pick lift SDK Z.
-
-        workspace_0 is not parallel to the robot Base, so a workspace-level move
-        rises or descends on the controller. Level is therefore defined in the
-        Base/SDK frame. Returns the workspace view pose and the Base path.
-        """
-        stack_place.validate_observation_config(self.stack_vision_config)
-        self.require_stack_stopped()
-        code, actual = self.arm.get_position(is_radian=False)
-        if code != 0:
-            raise ValueError('Pick 상승 후 실제 TCP 위치를 확인할 수 없습니다.')
-        actual = stack_place.vector(actual, 6, 'Pick 상승 실제 SDK TCP')
-        # Agent1's existing Base -> SDK mapping is identity. Do not invert a
-        # guessed mapping if that contract ever changes.
-        sdk_pick = self.tf_pose_to_sdk_pose(
-            **{a: last_pick_pose[a] for a in ('x', 'y', 'z')}, agent_id=self.agent_id)
-        if sdk_pick.get('mode') != 'identity':
-            raise ValueError('관측에는 검증된 Agent1 Base/SDK identity 변환이 필요합니다.')
-        tolerance = stack_place.POSITION_TOLERANCE_MM
-        if not np.allclose(actual[:3], [sdk_pick[a] for a in ('x', 'y', 'z')],
-                           rtol=0, atol=tolerance):
-            raise ValueError('Pick 상승 실제 TCP가 명령 위치와 다릅니다.')
-        transform = self.lookup_workspace_transform(self.agent_id).transform
-        q = transform.rotation
-        rotation = self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
-        translation = np.array([transform.translation.x, transform.translation.y,
-                                transform.translation.z]) * 1000.0
-        if rotation[2, 2] < math.cos(math.radians(stack_place.MAX_WORKSPACE_TILT_DEG)):
-            raise ValueError('workspace_0와 robot Base의 기울기가 허용 범위를 초과합니다.')
-        attitude = (dict(roll_deg=pick_rpy[0], pitch_deg=pick_rpy[1],
-                         yaw=math.radians(pick_rpy[2])) if pick_rpy is not None else
-                    dict(roll_deg=180.0, pitch_deg=0.0, yaw=last_pick_pose['yaw']))
-        high = assembly_move_pose(task['reference_place_pose'], action['z_offset'],
-                                  self.PICK_PLACE_Z_OFFSET_MM)
-        basket = task['basket_center_workspace']
-        high_view = dict(high, x=basket['x'], y=basket['y'])
-        high_view_robot = self.convert_place_pose(high_view, self.agent_id)
-        # Keep the actual Pick lift SDK Z, or rise to the existing high Place SDK Z.
-        # A sub-tolerance rise is not commanded: the xArm planner rejected a
-        # near-zero segment with C24 (2026-11-05).
-        height = high_view_robot['z']
-        if height - actual[2] < tolerance:
-            height = actual[2]
-        # Exact basket XY in workspace, at the workspace Z whose SDK Z is height.
-        view = dict(high_view, z=(height - translation[2] - rotation[2, 0] * basket['x']
-                                  - rotation[2, 1] * basket['y']) / rotation[2, 2])
-        view_robot = self.convert_place_pose(view, self.agent_id)
-        for point, robot in ((high_view, high_view_robot), (view, view_robot)):
-            expected = rotation @ np.array([point[a] for a in ('x', 'y', 'z')]) + translation
-            sdk = self.tf_pose_to_sdk_pose(robot['x'], robot['y'], robot['z'],
-                                           agent_id=self.agent_id)
-            if not np.allclose(expected, [sdk[a] for a in ('x', 'y', 'z')], rtol=0, atol=1e-6):
-                raise ValueError('관측 경로의 workspace TF와 실제 TF→SDK 변환이 다릅니다.')
-        start =dict(zip(('x', 'y', 'z'), actual[:3]), yaw=view_robot['yaw'])
-        path = [start] + stack_place.transit_waypoints(start, dict(view_robot, z=height))
-        if any(not start['z'] - 1e-6 <= p['z'] <= height + 1e-6 for p in path):
-            raise ValueError('관측 경로가 Pick 상승 SDK Z보다 낮거나 검증된 기존 높이를 초과합니다.')
-        self.get_logger().info(
-            f"[{task['task_id']}] 관측 SDK Z: 실제 TCP={actual[2]:.3f}, Pick={sdk_pick['z']:.3f}, "
-            f"높은 Place={high_view_robot['z']:.3f}, 선택={height:.3f}; "
-            f"관측 workspace={view}, SDK 경유점={path}")
-        return view, attitude, path
-
     def require_stack_stopped(self):
         """A successful blocking move must also leave a healthy, stopped controller."""
         code, state = self.arm.get_state()
@@ -3174,199 +3106,6 @@ class RobotAgentNode(Node):
             raise RuntimeError('관측 전 로봇 정상 정지를 확인할 수 없습니다.')
         if self.arm.get_is_moving() is not False:
             raise RuntimeError('관측 전 로봇이 아직 이동 중입니다.')
-
-    def preflight_stack_commands(self, commands, start_attitude):
-        """Controller-only planning: validate every segment without executing it.
-
-        Firmware checks self-collision, joint/Cartesian limits and speed along the
-        continuous path. External basket/tool clearance still needs the existing
-        observation_validated field check; the SDK has no environment model.
-        start_attitude is the measured TCP roll/pitch/yaw (deg) the check starts from;
-        each command keeps the same RPY branch so +/-180 deg is not read as a turn.
-        """
-        version = self.arm.version_number
-        if (not isinstance(version, (tuple, list)) or len(version) != 3
-                or any(type(v) is not int for v in version) or tuple(version) < (1, 11, 100)
-                or not callable(getattr(self.arm, 'set_only_check_type', None))):
-            raise ValueError('경로 무동작 검증을 지원하는 SDK/펌웨어(>=1.11.100)가 필요합니다.')
-        done = getattr(self, '_last_motion_done', None)
-        if done is not None:
-            remaining = stack_place.PREFLIGHT_SETTLE_SEC - (time.monotonic() - done)
-            if remaining > 0:
-                self.get_logger().info(f'사전검사 전 정지 안정화 대기 {remaining:.2f}s')
-                time.sleep(remaining)
-        self.require_stack_stopped()
-        previous = start_attitude
-        checked = []
-        for command in commands:
-            checked.append(stack_place.continuous_attitude(previous, command))
-            previous = checked[-1]
-
-        def run(sequence):
-            for index, command in enumerate(sequence):
-                self.require_observation_token()
-                # Per-call mode avoids changing global SDK settings. 1 starts at actual
-                # state, 3 chains virtual segments, 2 finishes and resets virtual state.
-                mode = 1 if index == 0 else (2 if index == len(sequence) - 1 else 3)
-                ret = self.arm.set_position(
-                    **command, only_check_type=mode, wait=False, is_radian=False)
-                if ret != 0 or self.arm.only_check_result != 0:
-                    return index, ret, self.arm.only_check_result
-            return None
-
-        failure = run(checked)
-        if failure is not None:
-            index, ret, detail = failure
-            self.diagnose_stack_preflight(checked[:index + 1], run)
-            # Diagnostics never relax the decision: the original failure stops the task.
-            raise ValueError(f'적층 전체 경로 도달/충돌 검사 실패: ret={ret}, detail={detail}, '
-                             f'구간={index + 1}/{len(checked)}, 명령={checked[index]}')
-        self.require_observation_token()
-
-    def diagnose_stack_preflight(self, sequence, run):
-        """Log why a controller path check failed; results never allow motion.
-
-        2026-11-06: the identical failed check passed minutes later from a separate
-        SDK script. Distinguish settling time (retry after 0.5 s) from stale
-        controller virtual state (retry after a mode-2 check, which restores the
-        virtual state to the actual state).
-        """
-        log = self.get_logger()
-        try:
-            code, pose = self.arm.get_position(is_radian=False)
-            _, joints = self.arm.get_servo_angle(is_radian=False)
-            done = getattr(self, '_last_motion_done', None)
-            log.error(
-                f'[사전검사 진단] 측정 TCP={pose} (code={code}), 관절={list(joints)[:6]}, '
-                f'state={self.arm.get_state()}, error={self.arm.error_code}, '
-                f'warn={self.arm.warn_code}, 직전 이동 완료 후 '
-                f'{"알 수 없음" if done is None else f"{time.monotonic() - done:.2f}s"}')
-            time.sleep(0.5)
-            log.error(f'[사전검사 진단] 0.5초 후 같은 검사 재실행: {self.describe_check(run(sequence))}')
-            reset = dict(sequence[0], **dict(zip(('x', 'y', 'z', 'roll', 'pitch', 'yaw'), pose[:6])))
-            ret = self.arm.set_position(**reset, only_check_type=2, wait=False, is_radian=False)
-            log.error(f'[사전검사 진단] mode 2(가상 상태→실제 상태 복원) 검사: ret={ret}, '
-                      f'detail={self.arm.only_check_result}')
-            log.error(f'[사전검사 진단] 복원 후 같은 검사 재실행: {self.describe_check(run(sequence))}')
-        except Exception as error:
-            log.error(f'[사전검사 진단] 진단 중 오류(원래 실패 유지): {error}')
-
-    @staticmethod
-    def describe_check(failure):
-        if failure is None:
-            return '통과'
-        index, ret, detail = failure
-        return f'실패 구간={index + 1}, ret={ret}, detail={detail}'
-
-    def stack_motion_command(self, point, attitude, speed, robot_pose=None):
-        """Mirror the existing TF -> SDK mover, including its final attitude."""
-        pose = robot_pose if robot_pose is not None else self.convert_place_pose(point, self.agent_id)
-        sdk = self.tf_pose_to_sdk_pose(pose['x'], pose['y'], pose['z'],
-                                       yaw=attitude['yaw'], agent_id=self.agent_id)
-        command = dict(x=sdk['x'], y=sdk['y'], z=sdk['z'],
-                       roll=attitude['roll_deg'], pitch=attitude['pitch_deg'],
-                       yaw=math.degrees(sdk['yaw']), speed=speed)
-        if not all(math.isfinite(v) for v in command.values()):
-            raise ValueError('적층 경로 TF/SDK 좌표가 유한하지 않습니다.')
-        self.check_sdk_pose_or_raise(command['x'], command['y'], command['z'], label='stack vision')
-        return command
-
-    def stack_place_commands(self, task, corrected):
-        """Preflight approach, any existing tilt, descent and retreat in execution order."""
-        commands = []
-        tilt = placement_tilt(task['target'], self.agent_id)
-        yaw = self.convert_place_pose(corrected, self.agent_id)['yaw']
-        nominal = dict(roll_deg=180.0, pitch_deg=0.0, yaw=yaw)
-        if tilt is not None:
-            if 'place_rpy_robot_deg' in tilt:
-                nominal = dict(roll_deg=tilt['pick_rpy_robot_deg'][0],
-                               pitch_deg=tilt['pick_rpy_robot_deg'][1],
-                               yaw=math.radians(tilt['pick_rpy_robot_deg'][2]))
-                release = dict(roll_deg=tilt['place_rpy_robot_deg'][0],
-                               pitch_deg=tilt['place_rpy_robot_deg'][1],
-                               yaw=math.radians(tilt['place_rpy_robot_deg'][2]))
-            else:
-                def attitude(roll, pitch):
-                    rpy = self.workspace_rpy_to_robot(roll, pitch, corrected.get('yaw', 0.0))
-                    return dict(roll_deg=math.degrees(rpy['roll']),
-                                pitch_deg=math.degrees(rpy['pitch']), yaw=rpy['yaw'])
-                nominal = attitude(math.pi, 0.0)
-                release = attitude(math.radians(180.0 + tilt['place_roll_offset_deg']),
-                                   math.radians(tilt['place_pitch_offset_deg']))
-        started = released = False
-        for action in task['actions']:
-            if action['api'] == 'control_gripper' and action.get('mode') == 'release':
-                released = True
-            if action['api'] != 'move_to_place':
-                continue
-            point = assembly_move_pose(corrected, action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM)
-            speed = min(action['speed'], tilt['place_tilt_speed']) if tilt else action['speed']
-            attitudes = [nominal] if tilt is None else (
-                [nominal, release] if not started else [release, nominal] if released else [release])
-            commands.extend(self.stack_motion_command(point, a, speed) for a in attitudes)
-            started = True
-        return commands
-
-    def move_stack_observation_path(self, task, path, attitude, label, speed,
-                                    verification=None, place_commands=None):
-        """Preflight a Base/SDK path, then use the existing blocking TF/SDK mover."""
-        self.require_observation_token()
-        commands = [self.stack_motion_command(point, attitude, speed, robot_pose=point)
-                    for point in path]
-        tolerance = stack_place.POSITION_TOLERANCE_MM
-        # Each segment either keeps SDK Z (horizontal) or keeps SDK XY (vertical).
-        # Sub-tolerance Z steps are merged into horizontal moves, never commanded alone.
-        for first, second in zip(commands, commands[1:]):
-            horizontal = not np.allclose([first[a] for a in ('x', 'y')],
-                                        [second[a] for a in ('x', 'y')], rtol=0, atol=1e-6)
-            if horizontal and not math.isclose(first['z'], second['z'], abs_tol=tolerance, rel_tol=0):
-                raise ValueError('관측/보정 경로의 SDK 수직·수평 분리를 검증할 수 없습니다.')
-        if label == 'observe' and any(c['z'] < commands[0]['z'] - 1e-6 for c in commands):
-            raise ValueError('관측 전 Pick 상승 SDK Z보다 낮은 경로입니다.')
-        code, actual = self.arm.get_position(is_radian=False)
-        if code != 0:
-            raise ValueError('관측/보정 진입 전 실제 TCP 위치 확인 실패')
-        actual = stack_place.vector(actual, 6, '관측/보정 진입 실제 SDK TCP')
-        if not np.allclose(actual[:3], [commands[0][a] for a in ('x', 'y', 'z')],
-                           rtol=0, atol=tolerance):
-            raise ValueError('관측/보정 진입 전 실제 TCP가 계획 시작 위치와 다릅니다.')
-        self.get_logger().info(f"[{task['task_id']}] {label}: Base 경유점={path}, SDK={commands}")
-        # The arm already stands at path[0]: check only the moves it will make, and
-        # skip zero-length repeats, which the controller planner rejects (C24).
-        planned, previous = [], commands[0]
-        for command in commands[1:] + (place_commands or []):
-            same_branch = stack_place.continuous_attitude(previous, command)  # 180 == -180
-            if not all(math.isclose(same_branch[a], previous[a], abs_tol=1e-6, rel_tol=0)
-                       for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')):
-                planned.append(command)
-            previous = command
-        self.preflight_stack_commands(
-            planned, dict(zip(('roll', 'pitch', 'yaw'), actual[3:6])))
-        # TF preflight can itself take time; gate freshness after it, just before motion.
-        self.get_previous_layer_target(task)
-        if verification is not None:
-            request, observations = verification
-            for observation in observations:
-                stack_place.validate_frames(
-                    observation['meta'], request, self.stack_vision_config,
-                    self.now_sec(), time.monotonic())
-        for pose in path[1:]:
-            self.require_observation_token()
-            self.get_previous_layer_target(task)
-            if not self.move_to_robot_tf(
-                    pose['x'], pose['y'], pose['z'], **attitude,
-                    speed=speed, label=label):
-                raise RuntimeError(f'{label} 이동 실패')
-            self.require_observation_token()
-            if label == 'observe':
-                self.require_stack_stopped()
-                code, actual = self.arm.get_position(is_radian=False)
-                if code != 0:
-                    raise ValueError('관측 경유점의 실제 TCP 위치 확인 실패')
-                actual = stack_place.vector(actual, 6, '관측 실제 SDK TCP')
-                if not np.allclose(actual[:3], [pose[a] for a in ('x', 'y', 'z')],
-                                   rtol=0, atol=tolerance):
-                    raise ValueError('관측 경유점 실제 TCP가 명령 위치와 다릅니다.')
 
     def get_previous_layer_target(self, task):
         self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
@@ -3404,46 +3143,78 @@ class RobotAgentNode(Node):
         base_from_workspace = self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
         return base_from_workspace.T @ rpy_to_matrix(*rpy)
 
-    def prepare_stack_place(self, task, last_pick_pose, pick_rpy, action):
-        """Called once after predecessor wait, Pick lift and Token acquisition."""
+    def look_at_previous_layer(self, task, action):
+        """Turn the camera toward the basket in place after the Pick lift.
+
+        The TCP position is kept; only the attitude changes so the hand-eye camera
+        optical axis passes through the basket center at the previous-layer Z gate.
+        """
+        self.require_stack_stopped()
+        code, pose = self.arm.get_position(is_radian=False)
+        if code != 0:
+            raise ValueError('Pick 상승 후 실제 TCP 위치를 확인할 수 없습니다.')
+        pose = stack_place.vector(pose, 6, 'Pick 상승 실제 SDK TCP')
+        # Agent1's existing Base -> SDK mapping is identity. Do not invert a
+        # guessed mapping if that contract ever changes.
+        if self.tf_pose_to_sdk_pose(*pose[:3], agent_id=self.agent_id).get('mode') != 'identity':
+            raise ValueError('관측에는 검증된 Agent1 Base/SDK identity 변환이 필요합니다.')
+        config = self.stack_vision_config
+        basket = task['basket_center_workspace']
+        aim = self.convert_place_pose(
+            dict(x=basket['x'], y=basket['y'], z=float(np.mean(config['target_z_range_mm'])),
+                 yaw=0.0), self.agent_id)
+        if not self.camera_frame:
+            raise ValueError('CameraInfo optical 프레임이 아직 없습니다.')
+        stamped = self.tf_buffer.lookup_transform(
+            config['tcp_frame'], self.camera_frame, RclpyTime(seconds=0),
+            timeout=Duration(seconds=self.tf_lookup_timeout_sec))
+        if (stamped.header.frame_id != config['tcp_frame']
+                or stamped.child_frame_id != self.camera_frame):
+            raise ValueError('TCP/카메라 TF 프레임이 일치하지 않습니다.')
+        t, q = stamped.transform.translation, stamped.transform.rotation
+        rotation, tilt, clamped = stack_place.look_at_attitude(
+            rpy_to_matrix(*map(math.radians, pose[3:6])), pose[:3],
+            self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w),
+            np.array([t.x, t.y, t.z]) * 1000.0, [aim[a] for a in ('x', 'y', 'z')],
+            stack_place.MAX_LOOK_TILT_DEG)
+        roll, pitch, yaw = matrix_to_rpy(rotation)
+        speed = stack_place.look_speed(task['assembly']['material'], self.agent_id, action['speed'])
+        self.get_logger().info(
+            f"[{task['task_id']}] 제자리 관측 회전: TCP={pose[:3]}, 바구니 관측점(Base)="
+            f"{[round(aim[a], 1) for a in ('x', 'y', 'z')]}, 기울기={tilt:.1f}deg"
+            f"{' (상한 적용)' if clamped else ''}, rpy=({math.degrees(roll):.2f}, "
+            f"{math.degrees(pitch):.2f}, {math.degrees(yaw):.2f}), speed={speed}")
+        self.require_observation_token()
+        self.get_previous_layer_target(task)
+        if not self.move_to_robot_tf(
+                pose[0], pose[1], pose[2], yaw=yaw, roll_deg=math.degrees(roll),
+                pitch_deg=math.degrees(pitch), speed=speed, label='look at previous layer'):
+            raise RuntimeError('제자리 관측 회전 실패')
+        self.require_observation_token()
+
+    def prepare_stack_place(self, task, action):
+        """Called once after predecessor wait, Pick lift and Token acquisition.
+
+        Look at the previous layer in place, observe it, and commit the corrected XY.
+        The unchanged Place actions then move there (returning to the Place attitude),
+        descend and release.
+        """
         self.require_observation_token()
         self.get_previous_layer_target(task)
         # Refresh blue handles after predecessor completion / possible long token wait.
         basket = self.get_basket_center_workspace()
         task.update(self.resolve_task_assembly(task, basket_center=basket))
-        view, attitude, path = self.plan_stack_observation(task, last_pick_pose, pick_rpy, action)
-        self.move_stack_observation_path(task, path, attitude, 'observe', action['speed'])
-        request, observations, centers = self.observe_previous_layer(task)
+        self.look_at_previous_layer(task, action)
+        _, _, centers = self.observe_previous_layer(task)
         self.get_previous_layer_target(task)
-        config = self.stack_vision_config
         corrected = stack_place.corrected_place(
             task['reference_place_pose'], centers,
             stack_place.material_center_offset(task['assembly']['material'], self.agent_id),
-            self.stack_release_rotation(task), config)
+            self.stack_release_rotation(task), self.stack_vision_config)
         mean = np.mean(centers, axis=0).tolist()
         delta = {a: corrected[a] - task['reference_place_pose'][a] for a in ('x', 'y')}
         self.get_logger().info(
             f"[{task['task_id']}] 최종 평균 빵 중심 XYZ(mm)={mean}, XY 보정량(mm)={delta}")
-        start = path[-1]
-        observed = self.convert_place_pose(view, self.agent_id)
-        if not np.allclose([observed[a] for a in ('x', 'y', 'z')],
-                           [start[a] for a in ('x', 'y', 'z')], rtol=0, atol=1e-6):
-            raise ValueError('관측 후 workspace TF가 변경되어 보정 경로를 계산할 수 없습니다.')
-        target = self.convert_place_pose(
-            assembly_move_pose(corrected, action['z_offset'], self.PICK_PLACE_Z_OFFSET_MM),
-            self.agent_id)
-        # Finish XY at the observation SDK Z (higher only if the tilted workspace
-        # puts the approach above it), then descend vertically to the original
-        # high approach. The unchanged Place actions retain Z, attitude and release.
-        if abs(target['z'] - start['z']) < stack_place.POSITION_TOLERANCE_MM:
-            approach = [start, target]  # no sub-tolerance vertical step
-        else:
-            approach = [start] + stack_place.transit_waypoints(start, target)
-            approach = [p for p, q in zip(approach, [None] + approach) if p != q]
-        self.move_stack_observation_path(
-            task, approach, attitude, 'corrected approach', action['speed'],
-            verification=(request, observations),
-            place_commands=self.stack_place_commands(task, corrected))
         # Commit once; later actions only validate assembly and reuse this pose.
         task['reference_place_pose'] = corrected
         task['place_pose'] = self.convert_place_pose(corrected, self.agent_id)

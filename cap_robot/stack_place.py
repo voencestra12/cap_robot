@@ -8,11 +8,11 @@ import uuid
 import numpy as np
 
 try:
-    from .material_handling import number
+    from .material_handling import material_profile, number
     from .object_memory import object_class
     from . import object_profiles as profiles
 except ImportError:
-    from material_handling import number
+    from material_handling import material_profile, number
     from object_memory import object_class
     import object_profiles as profiles
 
@@ -34,15 +34,9 @@ DEFAULTS = {
     'tcp_frame': '',
 }
 
-# Fixed safety limits, intentionally not ROS parameters.
-# A blocking xArm move stops near, not exactly at, its command.
-POSITION_TOLERANCE_MM = 1.0
-# workspace_0 (ArUco) is not parallel to the robot Base; field runs measured 0.5-2.7 deg.
-MAX_WORKSPACE_TILT_DEG = 10.0
-# Controller path checks right after a blocking move can report C24 although the arm
-# reports stopped: 2026-11-06 the same check failed 0.51 s after the Pick lift and
-# passed about 1.0 s after it. Only the check is delayed; its verdict is unchanged.
-PREFLIGHT_SETTLE_SEC = 1.0
+# Fixed limits, intentionally not ROS parameters.
+# In-place look rotation: maximum tool tilt from straight down while holding material.
+MAX_LOOK_TILT_DEG = 45.0
 
 
 def vector(value, size, label):
@@ -102,35 +96,59 @@ def get_previous_layer_target(task, tasks, statuses):
     return dict(target['assembly'], task_id=target['task_id'])
 
 
-def transit_waypoints(start, end):
-    """Reuse the existing high approach; separate vertical and horizontal segments."""
-    for point in (start, end):
-        vector([point[a] for a in ('x', 'y', 'z')], 3, 'high approach')
-    height = max(start['z'], end['z'])
-    return [dict(start, z=height), dict(end, z=height), dict(end)]
+def _axis_rotation(axis, angle):
+    """Rodrigues rotation matrix about a unit axis."""
+    x, y, z = axis
+    k = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + math.sin(angle) * k + (1.0 - math.cos(angle)) * (k @ k)
 
 
-def continuous_attitude(previous, command):
-    """Re-express command roll/pitch/yaw (deg) on the same branch as previous.
+def look_at_attitude(tcp_rotation, tcp_position, camera_rotation, camera_translation,
+                     target, max_tilt_deg=MAX_LOOK_TILT_DEG):
+    """Rotate the TCP in place so the camera optical (+Z) axis passes through target.
 
-    Same physical attitude. The controller path check plans from the literal
-    RPY difference: measured roll -179.5 to commanded +180 was rejected as a
-    full wrist turn (C24, 2026-11-05/06), while the real move took 0.5 deg.
-    Controller angles live in [-180, 180], so only exactly +/-180 has two
-    spellings: results are snapped/kept inside that range. A float overshoot
-    such as -180.00000000000006 would be wrapped to +180 by the controller
-    (field C24 on 2026-11-06).
+    Robot Base frame, mm. camera_rotation/translation is TCP <- camera optical frame
+    (hand-eye TF, no manual offset). Each step applies the smallest rotation from the
+    current attitude, so the spin about the optical axis stays close to the Pick
+    attitude. The TCP position never changes. Tool tilt from straight down is limited
+    to max_tilt_deg; a clamped look keeps the same azimuth.
+    Returns (rotation, tilt_deg, clamped).
     """
-    result = dict(command)
-    for axis in ('roll', 'pitch', 'yaw'):
-        delta = (command[axis] - previous[axis] + 180.0) % 360.0 - 180.0
-        value = previous[axis] + delta
-        if abs(abs(value) - 180.0) < 1e-6:
-            value = math.copysign(180.0, value)
-        elif abs(value) > 180.0:
-            value -= math.copysign(360.0, value)
-        result[axis] = value
-    return result
+    rotation = np.array(tcp_rotation, dtype=float)
+    position = np.array(tcp_position, dtype=float)
+    goal = np.array(target, dtype=float)
+    offset = np.array(camera_translation, dtype=float)
+    optical = np.array(camera_rotation, dtype=float)[:, 2]
+    for _ in range(50):
+        camera = position + rotation @ offset
+        direction = rotation @ optical
+        wanted = goal - camera
+        if np.linalg.norm(wanted) < 1e-6:
+            raise ValueError('관측 대상이 카메라 위치와 겹칩니다.')
+        wanted /= np.linalg.norm(wanted)
+        axis = np.cross(direction, wanted)
+        angle = math.atan2(np.linalg.norm(axis), float(np.dot(direction, wanted)))
+        if angle < 1e-9:
+            break
+        rotation = _axis_rotation(axis / np.linalg.norm(axis), angle) @ rotation
+    else:
+        raise ValueError('관측 회전 자세가 수렴하지 않았습니다.')
+    tool = rotation[:, 2]
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, -tool[2]))))
+    clamped = tilt > max_tilt_deg
+    if clamped:
+        down = np.array([0.0, 0.0, -1.0])
+        axis = np.cross(tool, down)
+        rotation = _axis_rotation(axis / np.linalg.norm(axis),
+                                  math.radians(tilt - max_tilt_deg)) @ rotation
+        tilt = max_tilt_deg
+    return rotation, tilt, clamped
+
+
+def look_speed(material, agent_id, action_speed):
+    """Rotation speed while holding material: the material's existing tilt speed cap."""
+    return min(number(action_speed, 'action speed', 0),
+               material_profile(material, agent_id)['place_tilt_speed'])
 
 
 def compose_transforms(parent, child):

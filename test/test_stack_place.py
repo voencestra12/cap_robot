@@ -108,7 +108,6 @@ def agent(monkeypatch, tmp_path):
     node.arm.get_is_moving.return_value = False
     node.arm.error_code = 0
     node.arm.set_position.return_value = 0
-    node.arm.only_check_result = 0
     node.quaternion_to_rotation_matrix = lambda *a: np.eye(3)
     node.convert_place_pose = lambda pose, agent: dict(pose)
     # Blocking moves report their final measured TCP without connecting to hardware.
@@ -119,6 +118,15 @@ def agent(monkeypatch, tmp_path):
         return True
     node.acquire_zone_token = Mock(side_effect=acquire)
     node.enable_perception = True
+    # agent1_tcp <- camera optical: ~100 mm beside and 87 mm behind the TCP, optical
+    # axis along the tool axis (handeye_agent1.yaml + RealSense optical convention).
+    node.camera_frame = 'camera_optical'
+    node.tcp_camera_mount = rigid_transform((.1, 0., -.087))
+    node.tf_buffer = Mock()
+    node.tf_buffer.lookup_transform.side_effect = lambda parent, child, *a, **kw: SimpleNamespace(
+        header=SimpleNamespace(frame_id=parent), child_frame_id=child,
+        transform=node.tcp_camera_mount)
+    node.tf_lookup_timeout_sec = 0.1
     node.perception_settle_sec = 0.0
     node.is_moving = True
     node.perception_lock = threading.Lock()
@@ -178,15 +186,16 @@ def test_first_empty_frame_then_three_stable_frames_allows_correction(agent, mon
     original_move = node.move_to_robot_tf.side_effect
 
     def move(*args, **kwargs):
-        if kwargs.get('label') == 'corrected approach':
-            # Four distinct post-stop frames have been consumed before correction.
+        if kwargs.get('label', '').endswith('place'):
+            # Four distinct post-stop frames have been consumed before the corrected Place.
             assert clock.now == pytest.approx(10.08)
         return original_move(*args, **kwargs) if callable(original_move) else True
 
     node.move_to_robot_tf.side_effect = move
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
-    assert [c.kwargs['label'] for c in node.move_to_robot_tf.call_args_list].count('corrected approach') == 2
+    labels = [c.kwargs['label'] for c in node.move_to_robot_tf.call_args_list]
+    assert labels.count('look at previous layer') == 1
     node.return_to_home_joint_pose.assert_called_once()
     node.release_zone_token.assert_called_once()
 
@@ -229,7 +238,7 @@ def test_retry_deadline_is_five_seconds_without_place_or_recovery(agent, monkeyp
     assert node.stack_vision_config['timeout_sec'] == 5.0
     assert not node.execute_task(task)
     assert 5.0 <= clock.now - 10.0 <= 5.021
-    assert node.move_to_robot_tf.call_count == 6
+    assert node.move_to_robot_tf.call_count == 4
     assert node.control_gripper.call_count == 2
     node.return_to_home_joint_pose.assert_not_called()
     node.release_zone_token.assert_not_called()
@@ -246,7 +255,7 @@ def test_empty_frame_cannot_be_reused_as_a_new_sample(agent, monkeypatch, kind):
     feed(monkeypatch, node, [empty, observation(meta=meta)] + [observation()] * 3, clock)
     assert not node.execute_task(task)
     assert clock.now < 10.1
-    assert node.move_to_robot_tf.call_count == 6
+    assert node.move_to_robot_tf.call_count == 4
     assert node.control_gripper.call_count == 2
 
 
@@ -313,7 +322,7 @@ def test_observation_failure_saves_last_matching_rgb_and_raw_results(agent, monk
     assert payload['meta']['color_received'] == pytest.approx(10.04)
     np.testing.assert_array_equal(cv2.imread(str(tmp_path / payload['rgb_file'])), last['rgb'])
     np.testing.assert_array_equal(cv2.imread(str(tmp_path / payload['annotated_rgb_file'])), last['annotated_rgb'])
-    assert node.move_to_robot_tf.call_count == 6
+    assert node.move_to_robot_tf.call_count == 4
     assert node.control_gripper.call_count == 2
 
 
@@ -363,30 +372,28 @@ def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, m
     feed(monkeypatch, node, [observation(300 + delta[0], 170 + delta[1])] * 3)
     original = node.observe_previous_layer
     def verify(t):
-        assert node.move_to_robot_tf.call_count == 6  # pick trio + high approach
-        assert node.move_to_robot_tf.call_args.kwargs['label'] == 'observe'
+        assert node.move_to_robot_tf.call_count == 4  # pick trio + in-place look
+        assert node.move_to_robot_tf.call_args.kwargs['label'] == 'look at previous layer'
         assert node._zone_token_held
         assert node.control_gripper.call_count == 2
         return original(t)
     node.observe_previous_layer = verify
     assert node.execute_task(task)
     assert task['reference_place_pose'] == dict(x=300 + delta[0], y=170 + delta[1], z=60, yaw=0)
-    # A correction straight below the view needs no separate zero-length level move.
+    # Pick trio, in-place look, then the unchanged Place approach/release/retreat.
     moves = node.move_to_robot_tf.call_args_list[-3:]
-    assert node.move_to_robot_tf.call_count == (10 if delta == (0, 30) else 11)
+    assert node.move_to_robot_tf.call_count == 7
     assert [c.args[:3] for c in moves] == [
         (300 + delta[0], 170 + delta[1], 220),
         (300 + delta[0], 170 + delta[1], 60),
         (300 + delta[0], 170 + delta[1], 220)]
     assert all(c.kwargs['yaw'] == 0.2 for c in moves)
     assert all(c.kwargs['agent_id'] == agent_id for c in node.workspace_point_to_robot.call_args_list)
-    assert node.check_sdk_pose_or_raise.call_count == (9 if delta == (0, 30) else 10)
-    assert node.check_sdk_pose_or_raise.call_args_list[-2].args[2] == 230.
     assert node.is_moving and node.place_verification_request is None
 
 
 @pytest.mark.parametrize('failure', ['missing', 'multiple', 'stale', 'duplicate', 'unstable',
-                                      'excessive', 'tf', 'depth', 'safety'])
+                                      'excessive', 'tf', 'depth'])
 def test_failure_stops_before_place_release_and_home(agent, monkeypatch, failure):
     node, task = agent
     clock = use_observation_clock(monkeypatch, node)
@@ -405,11 +412,9 @@ def test_failure_stops_before_place_release_and_home(agent, monkeypatch, failure
         observations = [observation(325, 170)] * 3
     elif failure in ('tf', 'depth'):
         observations[0]['error'] = failure
-    elif failure == 'safety':
-        node.check_sdk_pose_or_raise.side_effect = ValueError('outside safety box')
     feed(monkeypatch, node, observations, clock)
     assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (3 if failure == 'safety' else 6)
+    assert node.move_to_robot_tf.call_count == 4  # Pick trio + look; no Place
     assert node.control_gripper.call_count == 2
     node.release_zone_token.assert_not_called()
     assert node._place_observation_fault
@@ -425,7 +430,7 @@ def test_timeout_never_reuses_latest_poses(agent, monkeypatch):
     node.latest_poses_stamp = math.inf
     monkeypatch.setattr(time, 'sleep', lambda _: None)
     assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 6
+    assert node.move_to_robot_tf.call_count == 4
 
 
 def test_bread_predecessor_must_have_succeeded(agent, monkeypatch):
@@ -620,323 +625,6 @@ def test_tf_queries_capture_time_and_rejects_invalid_rotation():
         node.place_camera_transform(*args)
 
 
-def test_observation_uses_blue_mean_xy_and_existing_high_place_z(agent):
-    node, task = agent
-    assert node.validate_received_task(task)
-    start = dict(x=10., y=20., z=180., yaw=0.)
-    node.arm.get_position.side_effect = None
-    node.arm.get_position.return_value = (0, [10., 20., 180., 180., 0., 0.])
-    view, _, path = node.plan_stack_observation(task, start, None, dict(z_offset=200., speed=100.))
-    assert view == dict(x=300., y=200., z=220., yaw=0.)
-    task['basket_center_workspace']['z'] = 900.
-    assert node.plan_stack_observation(task, start, None, dict(z_offset=200., speed=100.))[0] == view
-    assert path == [dict(x=10., y=20., z=180., yaw=0.),
-                    dict(x=10., y=20., z=220., yaw=0.), view, view]
-
-
-@pytest.mark.parametrize('pick_z,base_z', [(314.2, 0.), (180., 0.), (314.2, 200.),
-                                         (180., -200.)])
-def test_observation_compares_workspace_heights_and_executes_up_then_level(agent, pick_z, base_z):
-    node, task = agent
-    assert node.validate_received_task(task)
-    # Base and workspace have different Z origins, plus a 90 degree XY rotation.
-    rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
-    translation = np.array([100., -50., base_z])
-    node.lookup_workspace_transform.return_value.transform = rigid_transform(
-        translation / 1000., (0., 0., math.sqrt(.5), math.sqrt(.5)))
-    node.quaternion_to_rotation_matrix = lambda *a: rotation
-    def convert(point, agent):
-        xyz = rotation @ np.array([point[a] for a in ('x', 'y', 'z')]) + translation
-        return dict(zip(('x', 'y', 'z'), xyz), yaw=point['yaw'])
-    node.convert_place_pose = convert
-    start = dict(x=10., y=20., z=pick_z, yaw=0.)  # Base, not workspace
-    node.move_to_robot_tf(start['x'], start['y'], start['z'])
-    view, attitude, path = node.plan_stack_observation(
-        task, start, None, dict(z_offset=200., speed=100.))
-    height = max(pick_z - base_z, 220.)
-    assert view['z'] == pytest.approx(height)  # workspace view
-    assert path[0]['z'] == pytest.approx(pick_z)  # Base/SDK path
-    assert all(p['z'] >= pick_z for p in path)
-    node._zone_token_held = True
-    node.move_stack_observation_path(task, path, attitude, 'observe', 100.)
-    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
-    # First rise stays at the actual Pick XY. All later motion keeps SDK Z.
-    assert moves[1] == pytest.approx((10., 20., height + base_z))
-    assert all(p[2] == pytest.approx(height + base_z) for p in moves[1:])
-    assert min(p[2] for p in moves) >= pick_z
-    assert max(p[2] for p in moves) <= max(pick_z, 220. + base_z)
-    assert moves[-1][:2] == pytest.approx((-100., 250.))
-
-
-def tilt_workspace(node, tilt_deg):
-    angle = math.radians(tilt_deg)
-    rotation = handling.rpy_to_matrix(0., angle, 0.)
-    node.lookup_workspace_transform.return_value.transform = rigid_transform(
-        quat=(0., math.sin(angle / 2), 0., math.cos(angle / 2)))
-    node.quaternion_to_rotation_matrix = lambda *a: rotation
-    def convert(point, agent):
-        xyz = rotation @ np.array([point[a] for a in ('x', 'y', 'z')])
-        return dict(zip(('x', 'y', 'z'), xyz), yaw=point['yaw'])
-    node.convert_place_pose = convert
-    return rotation
-
-
-# Field runs on 2026-11-05 measured roughly 0.5-2.7 deg between workspace_0 and Base.
-@pytest.mark.parametrize('tilt_deg', [-2.7, -0.5, 0.5, 2.7])
-def test_field_workspace_tilt_keeps_sdk_level_and_descends_only_after_correction(
-        agent, monkeypatch, tilt_deg):
-    node, task = agent
-    rotation = tilt_workspace(node, tilt_deg)
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    assert node.execute_task(task)
-    assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
-    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
-    # Pick lift, observation and corrected approach, then the unchanged Place trio.
-    lift, approach = moves[2], moves[2:-3]
-    # Level moves may absorb a sub-tolerance (< 1 mm) Z step; larger steps are vertical.
-    for before, after in zip(approach, approach[1:]):
-        assert math.dist(before, after) >= vision.POSITION_TOLERANCE_MM or before == after
-        if not math.isclose(before[2], after[2], abs_tol=vision.POSITION_TOLERANCE_MM):
-            assert before[:2] == pytest.approx(after[:2], abs=1e-6)
-    assert all(p[2] >= lift[2] - 1e-6 for p in approach[:-1])
-    final = approach[-2], approach[-1]
-    assert (final[0][:2] == pytest.approx(final[1][:2], abs=1e-6)
-            or abs(final[0][2] - final[1][2]) < vision.POSITION_TOLERANCE_MM)
-    assert approach[-1] == pytest.approx(moves[-3])  # original high approach
-    view = rotation.T @ np.array(moves[5])
-    assert view[:2] == pytest.approx((300., 200.))  # blue-handle mean
-    assert view[2] >= 220. - 1e-6  # not below the existing high Place Z
-    corrected = rotation.T @ np.array(approach[-1])
-    assert corrected == pytest.approx((310., 180., 220.))
-    node.release_zone_token.assert_called_once()
-
-
-@pytest.mark.parametrize('tilt_deg', [-90., -15., 15., 180.])
-def test_tilted_or_inverted_workspace_cannot_lower_tcp_or_invent_extra_rise(agent, tilt_deg):
-    node, task = agent
-    tilt_workspace(node, tilt_deg)
-    node.observe_previous_layer = Mock(side_effect=AssertionError('unsafe observation'))
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3  # unchanged Pick only
-    node.observe_previous_layer.assert_not_called()
-    node.arm.set_position.assert_not_called()  # no path or motion after Pick
-    assert node.control_gripper.call_count == 2
-    node.return_to_home_joint_pose.assert_not_called()
-    node.release_zone_token.assert_not_called()
-    assert node._place_observation_fault
-
-
-def test_inconsistent_tf_to_sdk_mapping_is_rejected_before_observation(agent):
-    node, task = agent
-    node.convert_place_pose = lambda p, agent: dict(p, z=p['z'] + 10.)
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3
-    node.arm.set_position.assert_not_called()
-    assert node.control_gripper.call_count == 2
-
-
-@pytest.mark.parametrize('stage', ['pick', 'entry', 'waypoint'])
-@pytest.mark.parametrize('failure', ['sdk_error', 'nan', 'below_lift'])
-def test_actual_tcp_feedback_failure_blocks_observation_and_place(agent, stage, failure):
-    node, task = agent
-    original = node.arm.get_position.side_effect
-    def position(**kwargs):
-        code, pose = original(**kwargs)
-        fail_at = {'pick': 1, 'entry': 2, 'waypoint': 3}[stage]
-        if node.arm.get_position.call_count == fail_at:
-            if failure == 'sdk_error':
-                code = -1
-            else:
-                # Beyond POSITION_TOLERANCE_MM (1.0 mm).
-                pose[2] = math.nan if failure == 'nan' else pose[2] - 2.
-        return code, pose
-    node.arm.get_position.side_effect = position
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (4 if stage == 'waypoint' else 3)
-    assert node.control_gripper.call_count == 2
-    node.return_to_home_joint_pose.assert_not_called()
-    node.release_zone_token.assert_not_called()
-    assert node._place_observation_fault
-
-
-def test_sub_millimetre_tcp_feedback_noise_does_not_block_observation(agent, monkeypatch):
-    node, task = agent
-    original = node.arm.get_position.side_effect
-    def noisy(**kwargs):
-        code, pose = original(**kwargs)
-        return code, [pose[0] + .3, pose[1] - .3, pose[2] - .4, *pose[3:]]
-    node.arm.get_position.side_effect = noisy
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    assert node.execute_task(task)
-    assert task['reference_place_pose'] == dict(x=310, y=180, z=60, yaw=0)
-    moves = [c.args[:3] for c in node.move_to_robot_tf.call_args_list]
-    # The path starts at the measured TCP; no sub-tolerance rise back to the command.
-    assert moves[3] == pytest.approx((moves[2][0] + .3, moves[2][1] - .3, moves[2][2] - .4))
-    node.release_zone_token.assert_called_once()
-
-
-def test_field_c24_preflight_never_checks_near_zero_segments(agent, monkeypatch):
-    """2026-11-05: measured Z 316.874725 vs command 316.8748 produced a 0.00008 mm
-    rise and a zero-length final check; the controller rejected the path (C24)."""
-    node, task = agent
-    original = node.arm.get_position.side_effect
-    def measured(**kwargs):
-        code, pose = original(**kwargs)
-        return code, [pose[0], pose[1], pose[2] - 7.8e-5, *pose[3:]]
-    node.arm.get_position.side_effect = measured
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    sequences = []
-    preflight = node.preflight_stack_commands
-    def record(commands, start_attitude):
-        sequences.append([node.arm.get_position()[1][:6]] + [
-            [c[a] for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')] for c in commands])
-        return preflight(commands, start_attitude)
-    node.preflight_stack_commands = record
-    assert node.execute_task(task)
-    assert len(sequences) == 2
-    for sequence in sequences:  # each starts at the arm's measured pose
-        for before, after in zip(sequence, sequence[1:]):
-            moved = math.dist(before[:3], after[:3])
-            rotated = before[3:] != pytest.approx(after[3:])
-            assert moved >= vision.POSITION_TOLERANCE_MM or (moved == 0 and rotated)
-
-
-@pytest.mark.parametrize('previous,command,expected', [
-    ((-179.5, 0., -93.7), (180., 0., -93.7), (-180., 0., -93.7)),
-    ((179.5, 0., -93.7), (-180., 0., -93.7), (180., 0., -93.7)),
-    # 2026-11-06 field: float overshoot gave -180.00000000000006 (controller wraps to +180).
-    ((-179.98877, 0., -90.5), (180., 0., -90.5), (-180., 0., -90.5)),
-    # Only exactly +/-180 has two spellings; other angles stay inside [-180, 180].
-    ((180., 0., 179.), (180., 0., -178.), (180., 0., -178.)),
-    ((178., -1.9, -89.7), (-152., -1.9, -89.7), (-152., -1.9, -89.7)),
-    ((180., 0., -89.2), (180., 0., -89.7), (180., 0., -89.7)),
-])
-def test_continuous_attitude_keeps_same_physical_rpy_on_previous_branch(previous, command, expected):
-    keys = ('roll', 'pitch', 'yaw')
-    result = vision.continuous_attitude(dict(zip(keys, previous)), dict(zip(keys, command), x=1.))
-    assert [result[k] for k in keys] == pytest.approx(expected, abs=1e-9)
-    # The controller sees literal values: +/-180 must be exact and nothing may leave the range.
-    assert all(result[k] == e for k, e in zip(keys, expected) if abs(e) == 180.)
-    assert all(-180. <= result[k] <= 180. for k in keys)
-    assert result['x'] == 1.
-    for k in keys:  # same physical angle
-        assert math.isclose(math.cos(math.radians(result[k])), math.cos(math.radians(command[keys.index(k)])),
-                            abs_tol=1e-9)
-
-
-@pytest.mark.parametrize('measured', [-179.5, -179.98877])
-def test_field_roll_wrap_preflight_matches_controller_and_motion_is_unchanged(agent, monkeypatch, measured):
-    """2026-11-06 field tests: measured roll -179.5, target roll +180. The controller
-    path check returned C24 for +180 and passed -180; the real +180 move was normal.
-    Measured -179.98877 later produced -180.00000000000006, which the controller wraps."""
-    node, task = agent
-    original = node.arm.get_position.side_effect
-    node.arm.get_position.side_effect = lambda **kw: (0, [*original(**kw)[1][:3], measured, 0., 0.])
-    state = {}
-    def controller_check(**kwargs):
-        # Controller keeps angles in [-180, 180] and plans from the literal RPY difference
-        # to the measured state (mode 1) or the previous check.
-        angles = {a: (kwargs[a] + 180.) % 360. - 180. if abs(kwargs[a]) > 180. else kwargs[a]
-                  for a in ('roll', 'pitch', 'yaw')}
-        start = dict(roll=measured, pitch=0., yaw=0.) if kwargs['only_check_type'] == 1 else state
-        turn = max(abs(angles[a] - start[a]) for a in angles)
-        state.update(angles)
-        node.arm.only_check_result = 24 if turn > 90. else 0
-        return 1 if turn > 90. else 0
-    node.arm.set_position.side_effect = controller_check
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    assert node.execute_task(task)
-    assert all(c.kwargs['roll'] == -180. for c in node.arm.set_position.call_args_list)
-    # Executed moves keep the existing +180 command; only the check's notation changes.
-    assert all(c.kwargs.get('roll_deg', 180.) == 180. for c in node.move_to_robot_tf.call_args_list)
-    node.release_zone_token.assert_called_once()
-
-
-@pytest.mark.parametrize('retry', ['still_fails', 'passes_later'])
-def test_preflight_failure_logs_diagnostics_but_never_moves(agent, monkeypatch, retry):
-    """2026-11-06: a check that failed in robot_agent passed minutes later standalone."""
-    node, task = agent
-    calls = []
-    def controller_check(**kwargs):
-        calls.append(kwargs)
-        fail = len(calls) == 1 or (retry == 'still_fails' and kwargs['only_check_type'] != 2)
-        node.arm.only_check_result = 24 if fail else 0
-        return 1 if fail else 0
-    node.arm.set_position.side_effect = controller_check
-    node.arm.get_servo_angle.return_value = (0, [14.3, -40.7, -47.8, 1.3, 88.5, 105.8, 0.])
-    errors = []
-    node.get_logger = lambda: SimpleNamespace(error=errors.append, info=lambda *a: None,
-                                              warn=lambda *a: None, debug=lambda *a: None)
-    feed(monkeypatch, node, [observation()] * 3)
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3  # Pick only: diagnostics never move
-    assert all(c['only_check_type'] in (1, 2, 3) and c['wait'] is False for c in calls)
-    # original, retry after 0.5 s, mode-2 reset at the measured pose, retry after reset
-    assert [c['only_check_type'] for c in calls] == [1, 1, 2, 1]
-    assert (calls[2]['x'], calls[2]['y'], calls[2]['z']) == pytest.approx(node.move_to_robot_tf.call_args.args[:3])
-    text = '\n'.join(map(str, errors))
-    assert '관절=' in text and '직전 이동 완료 후' in text
-    expected = '실패 구간=1' if retry == 'still_fails' else '통과'
-    assert text.count(expected) == 2
-    assert '적층 전체 경로 도달/충돌 검사 실패' in text and 'detail=24' in text
-    assert node._place_observation_fault
-    node.release_zone_token.assert_not_called()
-
-
-@pytest.mark.parametrize('since_motion,expected_wait', [(0.51, 0.49), (1.2, None), (None, None)])
-def test_preflight_waits_for_settle_time_after_last_motion(agent, monkeypatch, since_motion, expected_wait):
-    """2026-11-06: the same check failed 0.51 s after the Pick lift and passed ~1.0 s after."""
-    node, _ = agent
-    clock = SimpleNamespace(now=100.0)
-    waits = []
-    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
-    def sleep(seconds):
-        waits.append(seconds)
-        clock.now += seconds
-    monkeypatch.setattr(time, 'sleep', sleep)
-    checked_at = []
-    node.arm.set_position.side_effect = lambda **kw: checked_at.append(clock.now) or 0
-    if since_motion is not None:
-        node._last_motion_done = clock.now - since_motion
-    node._zone_token_held = True
-    command = dict(x=1., y=2., z=3., roll=180., pitch=0., yaw=0., speed=100.)
-    node.preflight_stack_commands([command], dict(roll=180., pitch=0., yaw=0.))
-    if expected_wait is None:
-        assert waits == []
-    else:
-        assert waits == [pytest.approx(expected_wait)]
-        assert checked_at[0] - node._last_motion_done == pytest.approx(vision.PREFLIGHT_SETTLE_SEC)
-
-
-def test_preflight_diagnostic_error_keeps_original_failure(agent, monkeypatch):
-    node, task = agent
-    node.arm.set_position.return_value = 1
-    node.arm.only_check_result = 24
-    node.arm.get_servo_angle.side_effect = RuntimeError('report lost')
-    feed(monkeypatch, node, [observation()] * 3)
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3
-    assert node.arm.set_position.call_count == 1  # diagnostics aborted, no further checks
-    assert node._place_observation_fault
-
-
-def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
-    node, task = agent
-    feed(monkeypatch, node, [observation()] * 3)
-    observe = node.observe_previous_layer
-    def shifted(task):
-        result = observe(task)
-        node.convert_place_pose = lambda p, agent: dict(p, z=p['z'] - 1.)
-        return result
-    node.observe_previous_layer = shifted
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 6  # observation completed, no correction
-    assert node.control_gripper.call_count == 2
-    node.return_to_home_joint_pose.assert_not_called()
-    node.release_zone_token.assert_not_called()
-    assert node._place_observation_fault
-
-
 @pytest.mark.parametrize('overrides', [
     dict(observation_validated=False),
     dict(tcp_frame='agent2_tcp'),
@@ -959,65 +647,8 @@ def test_observation_requires_safety_gates(agent, disabled):
     node.arm.clean_error.assert_not_called()
 
 
-def test_corrected_transfer_and_descent_never_mix_horizontal_and_vertical_motion(agent, monkeypatch):
-    node, task = agent
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    events = []
-    original_wait = node.wait_for_assembly_predecessors
-    def wait(t):
-        events.append('predecessors')
-        assert node.move_to_robot_tf.call_count == 3
-        original_wait(t)
-    node.wait_for_assembly_predecessors = wait
-    original_acquire = node.acquire_zone_token.side_effect
-    def acquire(t):
-        assert events == ['predecessors']
-        events.append('token')
-        return original_acquire(t)
-    node.acquire_zone_token.side_effect = acquire
-    original_verify = node.observe_previous_layer
-    def verify(t):
-        assert events == ['predecessors', 'token']
-        assert node.move_to_robot_tf.call_count == 6
-        assert node.place_verification_request is None
-        return original_verify(t)
-    node.observe_previous_layer = verify
-    assert node.execute_task(task)
-    points = [c.args[:3] for c in node.move_to_robot_tf.call_args_list[2:]]
-    for before, after in zip(points, points[1:]):
-        if not math.isclose(before[2], after[2]):
-            assert before[:2] == pytest.approx(after[:2])
-    # Observe at the basket mean; correct horizontally at the same high Z.
-    assert points[0][2] == 230.  # existing Pick lift
-    assert all(p[2] >= points[0][2] for p in points[:5])
-    assert points[3] == (300., 200., 230.)
-    assert points[4] == (310., 180., 230.)
-    assert points[5] == (310., 180., 220.)  # descent only after XY correction
-    assert all(p[:2] == (310., 180.) for p in points[4:])
-    assert points[-3][2] == 220.  # original high approach
-    assert points[-2][2] == 60.   # original release Z
-    assert points[-1][2] == 220.  # original retreat
-    node.release_zone_token.assert_called_once()
-
-
-@pytest.mark.parametrize('stage', ['ingress_end', 'corrected', 'transfer'])
-def test_entire_path_is_preflighted_before_its_first_move(agent, monkeypatch, stage):
-    node, task = agent
-    feed(monkeypatch, node, [observation()] * 3)
-    calls = 0
-    def safety(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == {'ingress_end': 4, 'corrected': 6, 'transfer': 9}[stage]:
-            raise ValueError('outside safety box')
-    node.check_sdk_pose_or_raise.side_effect = safety
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (3 if stage == 'ingress_end' else 6)
-    assert node.control_gripper.call_count == 2
-    node.return_to_home_joint_pose.assert_not_called()
-
-
-@pytest.mark.parametrize('after_move', [4, 6, 7, 9])
+# 4: in-place look, 5: Place approach, 6: Place descent (before release), 7: retreat (before home)
+@pytest.mark.parametrize('after_move', [4, 5, 6, 7])
 def test_token_loss_stops_each_observation_segment_and_release(agent, monkeypatch, after_move):
     node, task = agent
     feed(monkeypatch, node, [observation()] * 3)
@@ -1028,14 +659,15 @@ def test_token_loss_stops_each_observation_segment_and_release(agent, monkeypatc
     node.move_to_robot_tf.side_effect = move
     assert not node.execute_task(task)
     assert node.move_to_robot_tf.call_count == after_move
-    assert node.control_gripper.call_count == 2
+    # open + grasp; the release precedes the retreat (move 7)
+    assert node.control_gripper.call_count == (3 if after_move == 7 else 2)
     node.return_to_home_joint_pose.assert_not_called()
     node.release_zone_token.assert_not_called()
 
 
 def test_observation_tf_failure_prevents_observation_motion(agent):
     node, task = agent
-    node.lookup_workspace_transform.side_effect = RuntimeError('TF unavailable')
+    node.tf_buffer.lookup_transform.side_effect = RuntimeError('TCP->camera TF unavailable')
     assert not node.execute_task(task)
     assert node.move_to_robot_tf.call_count == 3
     assert node.control_gripper.call_count == 2
@@ -1057,31 +689,6 @@ def test_fault_blocks_next_task_without_releasing_or_moving(agent, monkeypatch):
     node.move_to_robot_tf.assert_not_called()
     node.control_gripper.assert_not_called()
     node.release_zone_token.assert_not_called()
-
-
-def test_observation_keeps_measured_pick_attitude(agent, monkeypatch):
-    node, task = agent
-    object_profiles.OBJECT_PROFILES['양상추'].update(
-        pick_rpy_robot_deg=[178., 1., 2.], place_rpy_robot_deg=[170., 2., 3.])
-    feed(monkeypatch, node, [observation()] * 3)
-    assert node.execute_task(task)
-    for move in node.move_to_robot_tf.call_args_list[3:7]:
-        assert move.kwargs['roll_deg'] == 178.
-        assert move.kwargs['pitch_deg'] == 1.
-        assert move.kwargs['yaw'] == math.radians(2.)
-
-
-def test_stale_frames_after_transfer_preflight_abort_before_motion(agent, monkeypatch):
-    node, task = agent
-    feed(monkeypatch, node, [observation()] * 3)
-    def safety(*args, **kwargs):
-        if node.check_sdk_pose_or_raise.call_count == 9:
-            node.now_sec = lambda: 999.
-    node.check_sdk_pose_or_raise.side_effect = safety
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 6
-    assert node.control_gripper.call_count == 2
-    node.return_to_home_joint_pose.assert_not_called()
 
 
 def sandwich():
@@ -1177,10 +784,10 @@ def test_only_agent1_lettuce_layer_one_can_use_vision(agent, layer, agent_id):
     assert not node.needs_stack_place(task)
     assert node.execute_task(task)
     node.prepare_stack_place.assert_not_called()
-    node.arm.set_position.assert_not_called()  # no controller preflight for other Agents/materials
+    node.arm.set_position.assert_not_called()  # no extra stack-vision SDK commands
 
 
-@pytest.mark.parametrize('after_move', [7, 8, 9])
+@pytest.mark.parametrize('after_move', [5, 6, 7])
 def test_token_loss_before_place_or_release_stops_immediately(agent, monkeypatch, after_move):
     node, task = agent
     feed(monkeypatch, node, [observation()] * 3)
@@ -1193,7 +800,8 @@ def test_token_loss_before_place_or_release_stops_immediately(agent, monkeypatch
     assert node.move_to_robot_tf.call_count == after_move
     node.release_zone_token.assert_not_called()
     node.return_to_home_joint_pose.assert_not_called()
-    assert node.control_gripper.call_count == 2
+    # open + grasp; the release precedes the retreat (move 7)
+    assert node.control_gripper.call_count == (3 if after_move == 7 else 2)
 
 
 def test_first_bread_bypasses_vision_even_with_unset_offset(agent):
@@ -1235,15 +843,6 @@ def test_observation_uses_only_real_tcp_camera_tf():
         node.stack_camera_mount(metadata())
 
 
-@pytest.mark.parametrize('start_z,end_z', [(180., 220.), (300., 220.)])
-def test_transit_uses_higher_existing_height_without_low_horizontal_motion(start_z, end_z):
-    start, end = dict(x=10., y=20., z=start_z), dict(x=300., y=200., z=end_z)
-    path = [start] + vision.transit_waypoints(start, end)
-    for a, b in zip(path, path[1:]):
-        if (a['x'], a['y']) != (b['x'], b['y']):
-            assert a['z'] == b['z'] == max(start_z, end_z)
-
-
 def test_predecessor_failure_during_observation_segment_stops_next_move(agent):
     node, task = agent
     def move(*args, **kwargs):
@@ -1279,61 +878,12 @@ def test_offset_rotation_matches_actual_release_command(agent, attitude_mode):
                                atol=1e-10)
 
 
-def test_controller_preflight_covers_whole_corrected_path_before_motion(agent, monkeypatch):
-    node, task = agent
-    feed(monkeypatch, node, [observation(310, 180)] * 3)
-    assert node.execute_task(task)
-    checked = [c.kwargs for c in node.arm.set_position.call_args_list]
-    # Observation: one level move from the standing Pick lift. Correction: level XY,
-    # descent, then release and retreat; the repeated high approach is not re-checked.
-    assert [p['only_check_type'] for p in checked] == [1, 1, 3, 3, 2]
-    assert all(p['wait'] is False and p['is_radian'] is False for p in checked)
-    assert [(p['x'], p['y'], p['z']) for p in checked] == [
-        (300., 200., 230.), (310., 180., 230.), (310., 180., 220.),
-        (310., 180., 60.), (310., 180., 220.)]
-    node.arm.set_only_check_type.assert_not_called()  # no global SDK mode changes
-
-
-@pytest.mark.parametrize('check_index', [1, 2, 3, 4, 5])
-@pytest.mark.parametrize('failure', ['return_code', 'collision_result', 'exception'])
-def test_controller_path_failure_never_executes_unchecked_path(agent, monkeypatch, check_index, failure):
-    node, task = agent
-    feed(monkeypatch, node, [observation()] * 3)
-    def check(**kwargs):
-        if node.arm.set_position.call_count == check_index:
-            if failure == 'exception':
-                raise RuntimeError('controller offline')
-            if failure == 'collision_result':
-                node.arm.only_check_result = 1
-                return 0
-            return -7
-        return 0
-    node.arm.set_position.side_effect = check
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (3 if check_index == 1 else 6)
-    assert node.control_gripper.call_count == 2
-    assert task['reference_place_pose']['y'] == 170.
-    assert node._place_observation_fault
-    node.release_zone_token.assert_not_called()
-    node.return_to_home_joint_pose.assert_not_called()
-
-
-@pytest.mark.parametrize('version', [(1, 11, 99), (1, 10, 0), None, (2,), ('2', 4, 0)])
-def test_unsupported_firmware_cannot_skip_path_validation(agent, version):
-    node, task = agent
-    node.arm.version_number = version
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3
-    node.arm.set_position.assert_not_called()
-    node.release_zone_token.assert_not_called()
-
-
 @pytest.mark.parametrize('stage', ['ingress', 'observation'])
 @pytest.mark.parametrize('failure', ['moving', 'paused', 'error', 'state_query', 'disconnected'])
 def test_capture_requires_successful_normal_stop(agent, stage, failure):
     node, task = agent
     def state():
-        if stage == 'observation' and node.move_to_robot_tf.call_count < 6:
+        if stage == 'observation' and node.move_to_robot_tf.call_count < 4:
             return 0, 2
         if failure == 'moving':
             node.arm.get_is_moving.return_value = True
@@ -1344,14 +894,15 @@ def test_capture_requires_successful_normal_stop(agent, stage, failure):
         return (-1, 2) if failure == 'state_query' else (0, 3 if failure == 'paused' else 2)
     node.arm.get_state.side_effect = state
     assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == (3 if stage == 'ingress' else 6)
+    assert node.move_to_robot_tf.call_count == (3 if stage == 'ingress' else 4)
     assert node.place_verification_request is None
     assert node.control_gripper.call_count == 2
     node.release_zone_token.assert_not_called()
     node.return_to_home_joint_pose.assert_not_called()
 
 
-@pytest.mark.parametrize('after_move', [4, 5, 6, 7])
+# 4: in-place look, 5: Place approach, 6: Place descent; all before release
+@pytest.mark.parametrize('after_move', [4, 5, 6])
 def test_failed_motion_never_continues_to_capture_or_release(agent, monkeypatch, after_move):
     node, task = agent
     feed(monkeypatch, node, [observation()] * 3)
@@ -1411,35 +962,6 @@ def test_acquisition_tf_chain_produces_real_workspace_xyz_with_rotated_mount():
     assert (parent.translation.x, child.translation.x) == (.3, .01)  # inputs are unchanged
 
 
-@pytest.mark.parametrize('attitude_mode', ['default', 'workspace_tilt', 'base_taught'])
-def test_preflight_release_attitude_exactly_matches_existing_place_moves(agent, monkeypatch, attitude_mode):
-    node, task = agent
-    profile = object_profiles.OBJECT_PROFILES['양상추']
-    if attitude_mode == 'workspace_tilt':
-        profile.update(place_roll_offset_deg=30., place_pitch_offset_deg=15.)
-    elif attitude_mode == 'base_taught':
-        profile.update(pick_rpy_robot_deg=[178., 1., 2.], place_rpy_robot_deg=[170., 20., 35.])
-    feed(monkeypatch, node, [observation()] * 3)
-    assert node.execute_task(task)
-    def pose(move):
-        return (*move.args[:3], math.degrees(move.kwargs['yaw']),
-                move.kwargs.get('roll_deg', 180.), move.kwargs.get('pitch_deg', 0.))
-    # After the single observation check, preflight mirrors every correction/Place
-    # move except exact repeats of the pose the arm already holds.
-    plan = [c.kwargs for c in node.arm.set_position.call_args_list][1:]
-    moves = node.move_to_robot_tf.call_args_list[5:]
-    actual = [m for prev, m in zip(moves, moves[1:]) if pose(m) != pytest.approx(pose(prev))]
-    assert len(plan) == len(actual)
-    for checked, move in zip(plan, actual):
-        assert (checked['x'], checked['y'], checked['z']) == pytest.approx(move.args[:3])
-        # Same physical angle; the check may spell +/-180-equivalent angles differently.
-        for axis, executed in (('yaw', math.degrees(move.kwargs['yaw'])),
-                               ('roll', move.kwargs.get('roll_deg', 180.)),
-                               ('pitch', move.kwargs.get('pitch_deg', 0.))):
-            assert (checked[axis] - executed + 180.) % 360. - 180. == pytest.approx(0., abs=1e-9)
-        assert checked['speed'] == move.kwargs['speed']
-
-
 def test_config_cleanup_separates_default_off_from_field_settings_and_has_no_manual_geometry():
     from pathlib import Path
     import yaml
@@ -1456,3 +978,102 @@ def test_config_cleanup_separates_default_off_from_field_settings_and_has_no_man
         assert config_values['stack_place_vision.enabled'] is (agent_id == 'agent1')
         assert config_values['stack_place_vision.observation_validated'] is (agent_id == 'agent1')
         assert not {f'stack_place_vision.{key}' for key in removed}.intersection(config_values)
+
+
+def optical_ray_miss_mm(rotation, tcp, mount_rotation, mount_offset, target):
+    camera = np.array(tcp) + rotation @ np.array(mount_offset)
+    axis = rotation @ np.array(mount_rotation)[:, 2]
+    to_target = np.array(target) - camera
+    return float(np.linalg.norm(np.cross(axis, to_target))), float(np.dot(axis, to_target))
+
+
+VERTICAL = handling.rpy_to_matrix(math.pi, 0., math.radians(-93.1))  # Pick lift attitude
+MOUNT_R, MOUNT_T = np.eye(3), np.array([100., 0., -87.])            # TCP <- camera, mm
+
+
+@pytest.mark.parametrize('target', [(450., -180., 90.), (300., 150., 60.), (200., 40., 120.)])
+def test_look_at_points_camera_optical_axis_at_target_without_moving_tcp(target):
+    tcp = (260.4, 77.7, 316.7)
+    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, target, 89.)
+    assert not clamped
+    miss, ahead = optical_ray_miss_mm(rotation, tcp, MOUNT_R, MOUNT_T, target)
+    assert miss < 1e-6 and ahead > 0  # the target lies on the optical axis, in front
+    assert np.allclose(rotation.T @ rotation, np.eye(3)) and np.linalg.det(rotation) == pytest.approx(1.)
+    assert tilt == pytest.approx(math.degrees(math.acos(-rotation[2, 2])))
+
+
+def test_look_at_target_already_on_axis_keeps_pick_attitude():
+    tcp = np.array([260., 80., 316.])
+    below = tcp + VERTICAL @ MOUNT_T + VERTICAL @ np.array([0., 0., 250.])
+    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, below)
+    assert np.allclose(rotation, VERTICAL, atol=1e-9) and tilt == pytest.approx(0., abs=1e-6)
+    assert not clamped
+
+
+def test_look_at_clamps_tilt_but_keeps_direction_toward_target():
+    tcp, far = (260., 80., 316.), (700., -400., 0.)
+    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 30.)
+    assert clamped and tilt == pytest.approx(30.)
+    assert math.degrees(math.acos(-rotation[2, 2])) == pytest.approx(30.)
+    lean = rotation[:2, 2] / np.linalg.norm(rotation[:2, 2])
+    wanted = (np.array(far[:2]) - tcp[:2]) / np.linalg.norm(np.array(far[:2]) - tcp[:2])
+    assert float(np.dot(lean, wanted)) > 0.95  # leans toward the basket, only less
+
+
+@pytest.mark.parametrize('action_speed,expected', [(100., 20.), (10., 10.)])
+def test_look_rotation_uses_existing_material_tilt_speed_cap(action_speed, expected):
+    assert vision.look_speed('양상추', 'agent1', action_speed) == expected
+
+
+@pytest.mark.parametrize('max_tilt', [89., 45.])
+def test_lettuce_looks_in_place_then_runs_unchanged_place_actions(agent, monkeypatch, max_tilt):
+    node, task = agent
+    monkeypatch.setattr(vision, 'MAX_LOOK_TILT_DEG', max_tilt)  # fixture needs ~60 deg
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    order = []
+    observe = node.observe_previous_layer
+    def verify(t):
+        order.append('observe')
+        return observe(t)
+    node.observe_previous_layer = verify
+    original = node.move_to_robot_tf.side_effect
+    def move(*args, **kwargs):
+        order.append(kwargs.get('label'))
+        return original(*args, **kwargs) if callable(original) else True
+    node.move_to_robot_tf.side_effect = move
+    assert node.execute_task(task)
+    moves = node.move_to_robot_tf.call_args_list
+    lift, look = moves[2], moves[3]
+    assert look.kwargs['label'] == 'look at previous layer'
+    assert look.args[:3] == pytest.approx(lift.args[:3])  # rotation only, TCP stays
+    assert look.kwargs['speed'] == 20.  # lettuce place_tilt_speed cap
+    # Camera optical axis through the basket center at the previous-layer Z gate.
+    rotation = handling.rpy_to_matrix(math.radians(look.kwargs['roll_deg']),
+                                      math.radians(look.kwargs['pitch_deg']), look.kwargs['yaw'])
+    target = (300., 200., float(np.mean(node.stack_vision_config['target_z_range_mm'])))
+    miss, _ = optical_ray_miss_mm(rotation, lift.args[:3], MOUNT_R, MOUNT_T * 1., target)
+    tilt = math.degrees(math.acos(-rotation[2, 2]))
+    if max_tilt == 89.:
+        assert miss < 1e-6 and tilt < 89.
+    else:
+        assert tilt == pytest.approx(45.)  # limited lean toward the basket
+    assert order.index('look at previous layer') < order.index('observe')
+    # Then the existing Place actions at the corrected XY, back in the Place attitude.
+    assert [m.args[:3] for m in moves[4:]] == [(310., 180., 220.), (310., 180., 60.), (310., 180., 220.)]
+    assert all('roll_deg' not in m.kwargs for m in moves[4:])
+    node.release_zone_token.assert_called_once()
+
+
+@pytest.mark.parametrize('failure', ['sdk_error', 'nan'])
+def test_unreadable_tcp_blocks_look_and_place(agent, failure):
+    node, task = agent
+    original = node.arm.get_position.side_effect
+    def position(**kwargs):
+        code, pose = original(**kwargs)
+        return (-1, pose) if failure == 'sdk_error' else (0, [*pose[:2], math.nan, *pose[3:]])
+    node.arm.get_position.side_effect = position
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3  # Pick only
+    assert node.control_gripper.call_count == 2
+    node.release_zone_token.assert_not_called()
+    assert node._place_observation_fault
