@@ -883,6 +883,31 @@ def test_preflight_failure_logs_diagnostics_but_never_moves(agent, monkeypatch, 
     node.release_zone_token.assert_not_called()
 
 
+@pytest.mark.parametrize('since_motion,expected_wait', [(0.51, 0.49), (1.2, None), (None, None)])
+def test_preflight_waits_for_settle_time_after_last_motion(agent, monkeypatch, since_motion, expected_wait):
+    """2026-11-06: the same check failed 0.51 s after the Pick lift and passed ~1.0 s after."""
+    node, _ = agent
+    clock = SimpleNamespace(now=100.0)
+    waits = []
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+    def sleep(seconds):
+        waits.append(seconds)
+        clock.now += seconds
+    monkeypatch.setattr(time, 'sleep', sleep)
+    checked_at = []
+    node.arm.set_position.side_effect = lambda **kw: checked_at.append(clock.now) or 0
+    if since_motion is not None:
+        node._last_motion_done = clock.now - since_motion
+    node._zone_token_held = True
+    command = dict(x=1., y=2., z=3., roll=180., pitch=0., yaw=0., speed=100.)
+    node.preflight_stack_commands([command], dict(roll=180., pitch=0., yaw=0.))
+    if expected_wait is None:
+        assert waits == []
+    else:
+        assert waits == [pytest.approx(expected_wait)]
+        assert checked_at[0] - node._last_motion_done == pytest.approx(vision.PREFLIGHT_SETTLE_SEC)
+
+
 def test_preflight_diagnostic_error_keeps_original_failure(agent, monkeypatch):
     node, task = agent
     node.arm.set_position.return_value = 1

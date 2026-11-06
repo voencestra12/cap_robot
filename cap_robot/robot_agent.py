@@ -3189,6 +3189,12 @@ class RobotAgentNode(Node):
                 or any(type(v) is not int for v in version) or tuple(version) < (1, 11, 100)
                 or not callable(getattr(self.arm, 'set_only_check_type', None))):
             raise ValueError('경로 무동작 검증을 지원하는 SDK/펌웨어(>=1.11.100)가 필요합니다.')
+        done = getattr(self, '_last_motion_done', None)
+        if done is not None:
+            remaining = stack_place.PREFLIGHT_SETTLE_SEC - (time.monotonic() - done)
+            if remaining > 0:
+                self.get_logger().info(f'사전검사 전 정지 안정화 대기 {remaining:.2f}s')
+                time.sleep(remaining)
         self.require_stack_stopped()
         previous = start_attitude
         checked = []

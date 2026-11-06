@@ -39,6 +39,10 @@ DEFAULTS = {
 POSITION_TOLERANCE_MM = 1.0
 # workspace_0 (ArUco) is not parallel to the robot Base; field runs measured 0.5-2.7 deg.
 MAX_WORKSPACE_TILT_DEG = 10.0
+# Controller path checks right after a blocking move can report C24 although the arm
+# reports stopped: 2026-11-06 the same check failed 0.51 s after the Pick lift and
+# passed about 1.0 s after it. Only the check is delayed; its verdict is unchanged.
+PREFLIGHT_SETTLE_SEC = 1.0
 
 
 def vector(value, size, label):
