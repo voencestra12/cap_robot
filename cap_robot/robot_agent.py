@@ -2843,9 +2843,15 @@ class RobotAgentNode(Node):
         label = f"{task['task_id']} place"
         tilt = placement_tilt(task['target'], self.agent_id)
         if tilt is None:
+            # After the in-place look the first Place move also turns the wrist back
+            # while holding material; keep stack-vision Place moves at the same speed cap
+            # (2026-11-06: 93 mm/s here vs 23 mm/s effective for the bread approach).
+            speed = (stack_place.look_speed(task['assembly']['material'], self.agent_id,
+                                            action['speed'])
+                     if self.needs_stack_place(task) else action['speed'])
             return self.move_to_robot_tf(
                 target_pose['x'], target_pose['y'], target_pose['z'],
-                yaw=target_pose['yaw'], speed=action['speed'], label=label,
+                yaw=target_pose['yaw'], speed=speed, label=label,
             )
 
         if 'place_rpy_robot_deg' in tilt:
@@ -3047,6 +3053,13 @@ class RobotAgentNode(Node):
                 else:
                     success = False
 
+                if success and observation_entered and self.arm.error_code != 0:
+                    # A blocking move can return before a contact error (C31) is reported;
+                    # never continue to release/retreat on a faulted controller.
+                    self.get_logger().error(
+                        f"🚨 [{task['task_id']}] Action {index} 후 컨트롤러 오류 "
+                        f"C{self.arm.error_code}: 다음 동작 중단")
+                    return False
                 if not success:
                     return False
 
@@ -3160,9 +3173,10 @@ class RobotAgentNode(Node):
             raise ValueError('관측에는 검증된 Agent1 Base/SDK identity 변환이 필요합니다.')
         config = self.stack_vision_config
         basket = task['basket_center_workspace']
-        aim = self.convert_place_pose(
-            dict(x=basket['x'], y=basket['y'], z=float(np.mean(config['target_z_range_mm'])),
-                 yaw=0.0), self.agent_id)
+        # Basket center XY at the previous-layer Base Z gate center (target_z_range_mm is Base Z).
+        aim = dict(self.convert_place_pose(
+            dict(x=basket['x'], y=basket['y'], z=0.0, yaw=0.0), self.agent_id),
+            z=float(np.mean(config['target_z_range_mm'])))
         if not self.camera_frame:
             raise ValueError('CameraInfo optical 프레임이 아직 없습니다.')
         stamped = self.tf_buffer.lookup_transform(
@@ -3190,6 +3204,8 @@ class RobotAgentNode(Node):
                 pose[0], pose[1], pose[2], yaw=yaw, roll_deg=math.degrees(roll),
                 pitch_deg=math.degrees(pitch), speed=speed, label='look at previous layer'):
             raise RuntimeError('제자리 관측 회전 실패')
+        if self.arm.error_code != 0:
+            raise RuntimeError(f'제자리 관측 회전 후 컨트롤러 오류 C{self.arm.error_code}')
         self.require_observation_token()
 
     def prepare_stack_place(self, task, action):
@@ -3211,10 +3227,13 @@ class RobotAgentNode(Node):
             task['reference_place_pose'], centers,
             stack_place.material_center_offset(task['assembly']['material'], self.agent_id),
             self.stack_release_rotation(task), self.stack_vision_config)
+        corrected['z'] = stack_place.stack_release_z(
+            task['reference_place_pose']['z'], centers, task['assembly']['material'], self.agent_id)
         mean = np.mean(centers, axis=0).tolist()
-        delta = {a: corrected[a] - task['reference_place_pose'][a] for a in ('x', 'y')}
+        delta = {a: corrected[a] - task['reference_place_pose'][a] for a in ('x', 'y', 'z')}
         self.get_logger().info(
-            f"[{task['task_id']}] 최종 평균 빵 중심 XYZ(mm)={mean}, XY 보정량(mm)={delta}")
+            f"[{task['task_id']}] 최종 평균 빵 중심 XYZ(mm)={mean}, 보정량 XYZ(mm)={delta} "
+            f"(해제 Z: 계산 {task['reference_place_pose']['z']:.1f} → {corrected['z']:.1f})")
         # Commit once; later actions only validate assembly and reuse this pose.
         task['reference_place_pose'] = corrected
         task['place_pose'] = self.convert_place_pose(corrected, self.agent_id)
@@ -3263,7 +3282,8 @@ class RobotAgentNode(Node):
                         '미검출 시 파지 재료와 이전 층의 영상 중첩 확인 필요')
                     self.require_observation_token()
                     if time.monotonic() >= deadline:
-                        raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
+                        raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다. '
+                                 f"거부된 새 프레임={request.get('skipped', {})}")
                     stack_place.validate_frames(
                         observation['meta'], request, config, self.now_sec(), time.monotonic())
                     stamps = tuple(observation['meta'][f'{kind}_stamp'] for kind in ('color', 'depth'))
@@ -3275,7 +3295,9 @@ class RobotAgentNode(Node):
                     try:
                         center = stack_place.previous_layer_center(
                             observation, task['basket_center_workspace'], target['material'], config,
-                            diagnostics=observation['checks'])
+                            diagnostics=observation['checks'],
+                            base_z=lambda x, y, z: self.convert_place_pose(
+                                dict(x=x, y=y, z=z, yaw=0.0), self.agent_id)['z'])
                     except stack_place.NoPreviousLayerCandidate as error:
                         self.get_logger().info(
                             f"[{task['task_id']}] 프레임={observation['frame_number']}: {error}; "
@@ -3304,10 +3326,12 @@ class RobotAgentNode(Node):
                     break
                 time.sleep(0.02)
             else:
-                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
+                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다. '
+                                 f"거부된 새 프레임={request.get('skipped', {})}")
             self.require_observation_token()
             if time.monotonic() >= deadline:
-                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다.')
+                raise ValueError('적층 Place용 새 이전 층 관측 시간 초과입니다. '
+                                 f"거부된 새 프레임={request.get('skipped', {})}")
             # Recheck freshness and mission after inference/wait; no cached pose fallback.
             for observation in observations:
                 stack_place.validate_frames(
@@ -3685,7 +3709,13 @@ class RobotAgentNode(Node):
                             frame_meta, place_request, self.stack_vision_config,
                             self.now_sec(), time.monotonic(),
                         )
-                    except ValueError:
+                    except ValueError as error:
+                        # Count each rejected new frame once so a long gap shows its cause.
+                        stamp = (frame_meta['color_stamp'], frame_meta['depth_stamp'])
+                        if stamp != place_request.get('last_rejected'):
+                            place_request['last_rejected'] = stamp
+                            skipped = place_request.setdefault('skipped', {})
+                            skipped[str(error)] = skipped.get(str(error), 0) + 1
                         time.sleep(0.01)
                         continue
                     if any(frame_meta[f'{k}_stamp'] <= place_request['last_stamps'][i]

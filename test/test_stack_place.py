@@ -42,7 +42,7 @@ def test_real_profile_and_offset_are_preserved():
     assert {k: profile[k] for k in ('grip_position', 'thickness_mm',
                                   'place_tcp_offset_mm', 'place_xy_offset_mm')} == {
         'grip_position': 100.0, 'thickness_mm': 0.0,
-        'place_tcp_offset_mm': 30.0, 'place_xy_offset_mm': [0.0, -30.0]}
+        'place_tcp_offset_mm': 60.0, 'place_xy_offset_mm': [0.0, -30.0]}
     for agent in ('agent1', 'agent2'):
         task = recipe()[1]
         nominal = assembly_placement(task, recipe(), agent,
@@ -1075,5 +1075,115 @@ def test_unreadable_tcp_blocks_look_and_place(agent, failure):
     assert not node.execute_task(task)
     assert node.move_to_robot_tf.call_count == 3  # Pick only
     assert node.control_gripper.call_count == 2
+    node.release_zone_token.assert_not_called()
+    assert node._place_observation_fault
+
+
+@pytest.mark.parametrize('tops,expected', [
+    ([(0, 0, 37.3)] * 3, 97.3),              # 2026-11-06: measured top 12 mm above nominal
+    ([(0, 0, 36.), (0, 0, 37.), (0, 0, 38.)], 97.),  # mean of the stable samples
+    ([(0, 0, 20.)] * 3, 85.),                # lower than nominal: never descend further
+])
+def test_release_z_follows_measured_top_but_never_below_nominal(tops, expected):
+    # Lettuce place_tcp_offset_mm 60; nominal = floor 5 + bread 20 + 60 = 85.
+    assert vision.stack_release_z(85., tops, '양상추', 'agent1') == pytest.approx(expected)
+
+
+def test_measured_higher_bread_raises_the_whole_unchanged_place_sequence(agent, monkeypatch):
+    node, task = agent
+    high = [dict(observation(310, 180), detections=[('빵_99', (310, 180, 42., 0), 0.9)])] * 3
+    feed(monkeypatch, node, high)
+    assert node.execute_task(task)
+    # Fixture nominal release Z 60 (top 30 + 30); measured top 42 -> release 72.
+    assert task['reference_place_pose'] == dict(x=310, y=180, z=72., yaw=0)
+    place = [m.args[:3] for m in node.move_to_robot_tf.call_args_list[4:]]
+    assert place == [(310., 180., 232.), (310., 180., 72.), (310., 180., 232.)]
+    node.release_zone_token.assert_called_once()
+
+
+# 2026-11-06: the same bread in workspace Z under three ArUco locks, and each lock's
+# workspace -> Base Z offset (from the logged bread release ws 95 -> Base Z).
+FIELD_LOCKS = [(-58.2, 220.5 - 95.), (37.3, 127.9 - 95.), (15.0, 148.2 - 95.)]
+
+
+@pytest.mark.parametrize('ws_z,offset', FIELD_LOCKS)
+def test_base_z_gate_accepts_same_bread_under_every_aruco_lock(ws_z, offset):
+    obs = observation()
+    obs['detections'] = [('빵_3', (300, 170, ws_z, 0), 0.9)]
+    cfg = config(target_z_range_mm=[55., 85.])
+    checks = []
+    center = vision.previous_layer_center(obs, dict(x=300, y=200), '빵', cfg, diagnostics=checks,
+                                          base_z=lambda x, y, z: z + offset)
+    assert center == (300, 170, ws_z)  # workspace XYZ is still returned for the Place math
+    assert checks[0]['z_range'] == dict(passed=True, value=pytest.approx(ws_z + offset),
+                                        frame='robot_base', limits=[55., 85.])
+    # The old workspace gate rejected the -58 mm lock (and 14.2-15 mm frames at the edge).
+    if not 15.0 <= ws_z <= 45.0:
+        with pytest.raises(vision.NoPreviousLayerCandidate):
+            vision.previous_layer_center(obs, dict(x=300, y=200), '빵',
+                                         config(target_z_range_mm=[15., 45.]))
+
+
+def test_observation_gate_uses_base_z_from_the_workspace_transform(agent, monkeypatch):
+    node, task = agent
+    node.stack_vision_config['target_z_range_mm'] = [55., 85.]
+    identity = node.convert_place_pose
+    node.convert_place_pose = lambda pose, agent: dict(identity(pose, agent), z=pose.get('z', 0.) + 40.)
+    feed(monkeypatch, node, [observation(310, 180)] * 3)  # ws z 30 -> Base z 70
+    assert node.execute_task(task)
+    assert (task['reference_place_pose']['x'], task['reference_place_pose']['y']) == (310, 180)
+
+
+def test_timeout_reports_rejected_fresh_frames(agent, monkeypatch):
+    node, task = agent
+    assert node.validate_received_task(task)
+    clock = use_observation_clock(monkeypatch, node)
+    node._zone_token_held = True
+    def sleep(seconds):
+        clock.now += seconds
+        request = node.place_verification_request
+        skipped = request.setdefault('skipped', {})
+        skipped['정지 이후의 최신 RGB/Depth 프레임이 아닙니다.'] = skipped.get(
+            '정지 이후의 최신 RGB/Depth 프레임이 아닙니다.', 0) + 1
+    monkeypatch.setattr(time, 'sleep', sleep)
+    with pytest.raises(ValueError, match='거부된 새 프레임=.*최신 RGB/Depth'):
+        node.observe_previous_layer(task)
+
+
+def test_stack_vision_place_moves_use_the_material_speed_cap(agent, monkeypatch):
+    node, task = agent
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    assert node.execute_task(task)
+    moves = node.move_to_robot_tf.call_args_list
+    # Look rotation and the following approach/descent/retreat: lettuce place_tilt_speed 20.
+    assert [m.kwargs['speed'] for m in moves[3:]] == [20.] * 4
+    assert all(m.kwargs['speed'] > 20. for m in moves[:3])  # Pick moves unchanged
+
+
+def test_regular_place_keeps_action_speed(agent):
+    node, task = agent
+    node.stack_vision_config['enabled'] = False
+    state = dict(started=False, released=False)
+    assert node.validate_received_task(task)
+    assert node.execute_place_action(task, dict(z_offset=200., speed=100.), state)
+    assert node.move_to_robot_tf.call_args.kwargs['speed'] == 100.
+
+
+@pytest.mark.parametrize('fault_after_move', [4, 5, 6])  # look, Place approach, Place descent
+def test_controller_error_after_a_move_stops_before_release(agent, monkeypatch, fault_after_move):
+    """2026-11-06: C31 was reported after the descent returned; release and retreat followed."""
+    node, task = agent
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    original = node.move_to_robot_tf.side_effect
+    def move(*args, **kwargs):
+        result = original(*args, **kwargs) if callable(original) else True
+        if node.move_to_robot_tf.call_count == fault_after_move:
+            node.arm.error_code = 31
+        return result
+    node.move_to_robot_tf.side_effect = move
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == fault_after_move  # nothing after the fault
+    assert node.control_gripper.call_count == 2                  # no release attempt
+    node.return_to_home_joint_pose.assert_not_called()
     node.release_zone_token.assert_not_called()
     assert node._place_observation_fault

@@ -18,7 +18,7 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 1. 기존 양상추 Pick 재확인, 파지, 안전 상승을 수행합니다.
 2. 기존 선행 Task 대기와 공용 구역 Token 확보 후 고정 카메라의 파란 점 두 개를 새로 읽습니다.
 3. **제자리 관측 회전**: Pick 상승 위치(실제 TCP)를 그대로 두고 자세만 바꿉니다.
-   카메라 광축이 workspace의 바구니 중심 XY(파란 점 평균)와 빵 중심 Z 범위의 가운데를 지나도록
+   카메라 광축이 바구니 중심 XY(파란 점 평균)와 빵 Z 범위(로봇 Base 기준)의 가운데를 지나도록
    Hand-eye TF(`agent1_tcp` ← 카메라 optical frame)로 회전 자세를 계산합니다. 수동 카메라 Offset은 없습니다.
    현재 자세에서 가장 작은 회전을 사용하며, 도구 기울기(수직 아래 기준)는
    `stack_place.MAX_LOOK_TILT_DEG`(45°, 코드 상수)로 제한합니다. 제한되면 같은 방향으로 덜 기울입니다.
@@ -36,6 +36,9 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
    ```
 
 6. 바구니 내부 XY 범위, 빵 중심 Z 범위, 신뢰도를 만족하는 빵 후보가 정확히 하나여야 합니다.
+   Z 범위는 **robot_1_base 기준**입니다. 마운트 카메라 → TCP → Base 경로는 ArUco workspace lock과
+   무관하여, 2026-11-06 같은 빵이 lock마다 workspace Z −58/37/15 mm로 바뀌는 동안 Base Z는 67~70 mm로
+   일정했습니다. 정지 이후 검사에서 거부된 새 프레임은 이유별로 세어 관측 시간 초과 오류에 함께 기록합니다.
    후보가 0개인 정상 프레임은 건너뛰고 다음 새 RGB/Depth를 기다립니다.
    후보가 없는 프레임도 처리 시각을 기록하므로 같은 영상이나 한쪽 영상만 바뀐 것을
    다음 관측 표본으로 재사용하지 않습니다. confidence 부족, 복수 후보, Depth/TF 오류는 실패합니다.
@@ -46,9 +49,16 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 7. 기존 중앙 파지 가정 `stack_tcp_to_material_center_mm=[0,0,0]`에서 최종 TCP XY는
    관측한 빵 중심 XY의 평균입니다. 기존 양상추 `place_xy_offset_mm=[0,-30]`를 다시 더하지 않습니다.
    nominal Place XY는 허용 보정량(`max_correction_mm`) 검사 기준으로만 사용합니다.
-8. 보정 XY를 한 번 확정한 뒤 기존 Place Action 6~9를 그대로 실행합니다.
+   해제 TCP Z는 `max(계산값, 측정한 빵 윗면 Z 평균 + 재료 place_tcp_offset_mm)`입니다.
+   계산값(바닥 + 아래층 두께 + offset)보다 낮아지지 않으며, 상승 폭은 빵 Z 허용 범위
+   (`target_z_range_mm`, Base 기준)로 제한됩니다. 측정 지점과 해제 지점이 같은 XY라 workspace 캘리브레이션의
+   높이·기울기 오차가 상쇄됩니다. (2026-11-06: 계산 윗면 25 mm, 실측 37.3 mm → 여유 18 mm로 C31 접촉. 이후 여유 40 mm에서도
+   늘어진 양상추가 빵에 닿아 양상추 `place_tcp_offset_mm`를 30 → 60으로 조정)
+8. 보정 XY와 해제 Z를 한 번 확정한 뒤 기존 Place Action 6~9를 그대로 실행합니다.
    Action 6(높은 Place 접근)이 관측 자세에서 기존 Place 자세로 돌아오며 보정 XY로 이동하고,
    이후 수직 하강·해제·후퇴합니다. 기존 Place Z, Roll/Pitch/Yaw, 그리퍼 명령은 유지합니다.
+   이 Place 이동(접근·하강·후퇴)의 속도는 관측 회전과 같은 재료 `place_tilt_speed`(양상추 20)로 제한합니다.
+   (2026-11-06: 관측 후 접근이 93 mm/s로, 빵 접근의 실제 23 mm/s보다 4배 빨랐음)
 
 ## 안전과 실패 처리
 
@@ -59,6 +69,8 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 - 기존 Token 보호를 유지하고 관측 전후와 각 Place Action 전에 Token·선행 Task 상태를 재확인합니다.
 - 정지 실패, 복수 후보, Depth/TF 오류, 오래된/중복 영상, 허용 범위 초과 시 원래 XY로 임의 Place하지 않습니다.
   빵 미검출 또는 XYZ 불안정이 이어져 마감 시각까지 안정 표본을 모으지 못한 경우에도 실패합니다.
+- 관측 보호 진입 후에는 각 이동 뒤 컨트롤러 오류 코드를 확인하여, 오류(예: C31 접촉)가 보고되면
+  해제·후퇴 등 다음 동작을 보내지 않습니다. (2026-11-06: 하강 직후 C31 후에도 해제·후퇴를 시도했음)
 - 관측 보호 진입 후 실패하면 현재 그리퍼를 유지하고 자동 Home·Token 반납을 하지 않습니다.
   기존 `_place_observation_fault`가 후속 단독/협동 Task를 차단합니다.
 
@@ -76,7 +88,7 @@ Agent2, 다른 재료, 첫 빵 및 다른 층은 기존 Pick & Place를 수행�
 | `observation_validated` | `false` | 제자리 관측 회전의 시야·양상추 파지·간섭 현장 확인 |
 | `tcp_frame` | Agent1 YAML: `agent1_tcp` | 기존 활성 SDK TCP에 해당하는 TF |
 | `basket_half_extent_mm` | `[.nan,.nan]` | 빵 후보의 바구니 내부 XY 반폭 |
-| `target_z_range_mm` | `[.nan,.nan]` | 빵 중심 workspace 절대 Z 허용 범위 |
+| `target_z_range_mm` | `[.nan,.nan]` (Agent1: `[55,85]`) | 빵 윗면 **robot_1_base 기준** Z 허용 범위 |
 | `max_correction_mm` | `.nan` | nominal TCP XY 대비 최대 보정 거리 |
 | `stability_mm` | `3.0` | 표본 사이 최대 XYZ 거리 |
 | `samples` | `3` | 서로 다른 새 RGB/Depth 표본 수(2~8) |
@@ -119,7 +131,7 @@ git diff --check
 ROS Node 생성, SDK 연결, 실카메라, ROS launch, 실제 로봇 실행 없이 실제 메서드 본문과
 mock SDK/TF/영상으로 검사합니다. 일반 PnP·다른 Agent·Token·Guidebook 회귀 테스트도 함께 실행합니다.
 
-이번 검증 결과: **268 passed** (2026-11-06, 제자리 관측 회전으로 재구성 후).
+이번 검증 결과: **282 passed** (2026-11-06, 이동 후 컨트롤러 오류 중단·양상추 해제 여유 60 mm).
 제자리 회전 후 카메라 광축이 관측점을 지나는지, TCP 위치가 그대로인지, 기울기 제한 시 같은 방향을
 유지하는지, 회전 속도 제한, 회전 → 관측 → 기존 Place Action 순서와 보정 XY, 실제 TCP 읽기 실패 시
 회전 전 중단을 검사합니다. 기존 검증 항목인 첫 프레임 후보 0개 후 3회 안정 검출·보정, 이상 좌표 후

@@ -25,7 +25,9 @@ OBJECT_PROFILES = {
         "stack_tcp_to_material_center_mm": [0.0, 0.0, 0.0],  # 실측 필요 (중심 파지 가정)
         "grip_position": 100.0,
         "thickness_mm": 0.0,
-        "place_tcp_offset_mm": 30.0,
+        # 손가락 끝(TCP) 아래로 늘어진 양상추 때문에 30 mm(18 mm·40 mm 여유)에서 빵과 접촉(C31,
+        # 2026-11-06). 놓는 높이를 빵 윗면 위 60 mm로. 늘어짐을 실측하면 다시 조정.
+        "place_tcp_offset_mm": 60.0,
         # 빵은 가장자리, 양상추는 중앙을 잡으므로 빵 중심에 맞추도록 보정.
         "place_xy_offset_mm": [0.0, -30.0],
     },

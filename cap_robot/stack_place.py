@@ -217,7 +217,15 @@ def save_observation_debug(task_id, reason, observation, directory=None):
     return path
 
 
-def previous_layer_center(observation, basket, target_material, config, diagnostics=None):
+def previous_layer_center(observation, basket, target_material, config, diagnostics=None,
+                          base_z=None):
+    """One bread candidate inside the basket XY and the target_z_range_mm gate.
+
+    base_z(x, y, z) maps a workspace point to robot Base Z. The Z gate uses Base Z:
+    the mount camera -> TCP -> Base chain does not depend on the ArUco workspace lock,
+    which moved the same bread from -58 to 37 to 15 mm in workspace Z across locks
+    while Base Z stayed 67-70 mm (2026-11-06). Without base_z the workspace Z is used.
+    """
     if observation.get('frame_id') != 'workspace_0' or observation.get('error'):
         raise ValueError(f"이전 층 관측 실패: {observation.get('error', '좌표계 오류')}")
     candidates = []
@@ -228,13 +236,15 @@ def previous_layer_center(observation, basket, target_material, config, diagnost
             continue
         x, y, z = (number(v, 'previous layer xyz') for v in pose[:3])
         in_xy = abs(x - basket['x']) <= hx and abs(y - basket['y']) <= hy
-        in_z = zmin <= z <= zmax
+        height = number(base_z(x, y, z), 'previous layer base z') if base_z else z
+        in_z = zmin <= height <= zmax
         confidence = number(confidence, 'confidence', 0, 1)
         if diagnostics is not None:
             diagnostics.append(dict(
                 name=name, workspace_xyz_mm=[x, y, z], confidence=confidence,
                 basket_xy=dict(passed=in_xy, center=[basket['x'], basket['y']], half_extent=[hx, hy]),
-                z_range=dict(passed=in_z, limits=[zmin, zmax]),
+                z_range=dict(passed=in_z, value=height, frame='robot_base' if base_z else 'workspace_0',
+                             limits=[zmin, zmax]),
                 confidence_check=dict(passed=confidence >= config['min_confidence'],
                                       minimum=config['min_confidence'])))
         if in_xy and in_z:
@@ -261,6 +271,19 @@ def calculate_stack_tcp_pose(detected_center, material_center_offset, release_ro
         raise ValueError('배치 자세 회전행렬이 유효하지 않습니다.')
     rotated = rotation @ offset
     return dict(nominal_place_pose, x=center[0] - rotated[0], y=center[1] - rotated[1])
+
+
+def stack_release_z(nominal_z, centers, material, agent_id):
+    """Release TCP Z from the measured previous-layer top, never below the nominal Z.
+
+    The nominal Z assumes floor + layer thicknesses; the observed top and the release
+    point share the same XY, so workspace calibration offset/tilt cancels. The rise is
+    bounded by the target_z_range_mm gate the centers already passed.
+    (2026-11-06: nominal top 25 mm vs measured 37 mm -> 18 mm clearance -> C31 contact.)
+    """
+    measured_top = float(np.mean([c[2] for c in centers]))
+    offset = material_profile(material, agent_id, for_assembly=True)['place_tcp_offset_mm']
+    return max(number(nominal_z, 'nominal release z'), measured_top + offset)
 
 
 def corrected_place(nominal, centers, offset, rotation, config):
