@@ -852,6 +852,49 @@ def test_field_roll_wrap_preflight_matches_controller_and_motion_is_unchanged(ag
     node.release_zone_token.assert_called_once()
 
 
+@pytest.mark.parametrize('retry', ['still_fails', 'passes_later'])
+def test_preflight_failure_logs_diagnostics_but_never_moves(agent, monkeypatch, retry):
+    """2026-11-06: a check that failed in robot_agent passed minutes later standalone."""
+    node, task = agent
+    calls = []
+    def controller_check(**kwargs):
+        calls.append(kwargs)
+        fail = len(calls) == 1 or (retry == 'still_fails' and kwargs['only_check_type'] != 2)
+        node.arm.only_check_result = 24 if fail else 0
+        return 1 if fail else 0
+    node.arm.set_position.side_effect = controller_check
+    node.arm.get_servo_angle.return_value = (0, [14.3, -40.7, -47.8, 1.3, 88.5, 105.8, 0.])
+    errors = []
+    node.get_logger = lambda: SimpleNamespace(error=errors.append, info=lambda *a: None,
+                                              warn=lambda *a: None, debug=lambda *a: None)
+    feed(monkeypatch, node, [observation()] * 3)
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3  # Pick only: diagnostics never move
+    assert all(c['only_check_type'] in (1, 2, 3) and c['wait'] is False for c in calls)
+    # original, retry after 0.5 s, mode-2 reset at the measured pose, retry after reset
+    assert [c['only_check_type'] for c in calls] == [1, 1, 2, 1]
+    assert (calls[2]['x'], calls[2]['y'], calls[2]['z']) == pytest.approx(node.move_to_robot_tf.call_args.args[:3])
+    text = '\n'.join(map(str, errors))
+    assert '관절=' in text and '직전 이동 완료 후' in text
+    expected = '실패 구간=1' if retry == 'still_fails' else '통과'
+    assert text.count(expected) == 2
+    assert '적층 전체 경로 도달/충돌 검사 실패' in text and 'detail=24' in text
+    assert node._place_observation_fault
+    node.release_zone_token.assert_not_called()
+
+
+def test_preflight_diagnostic_error_keeps_original_failure(agent, monkeypatch):
+    node, task = agent
+    node.arm.set_position.return_value = 1
+    node.arm.only_check_result = 24
+    node.arm.get_servo_angle.side_effect = RuntimeError('report lost')
+    feed(monkeypatch, node, [observation()] * 3)
+    assert not node.execute_task(task)
+    assert node.move_to_robot_tf.call_count == 3
+    assert node.arm.set_position.call_count == 1  # diagnostics aborted, no further checks
+    assert node._place_observation_fault
+
+
 def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
     node, task = agent
     feed(monkeypatch, node, [observation()] * 3)

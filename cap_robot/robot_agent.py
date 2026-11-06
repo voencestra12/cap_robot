@@ -1416,6 +1416,7 @@ class RobotAgentNode(Node):
             yaw=float(np.degrees(yaw)), speed=float(speed), wait=True, is_radian=False
         )
         if ret == 0:
+            self._last_motion_done = time.monotonic()  # preflight diagnostics only
             time.sleep(0.5)
             return True
 
@@ -3190,19 +3191,66 @@ class RobotAgentNode(Node):
             raise ValueError('경로 무동작 검증을 지원하는 SDK/펌웨어(>=1.11.100)가 필요합니다.')
         self.require_stack_stopped()
         previous = start_attitude
-        for index, command in enumerate(commands):
-            command = previous = stack_place.continuous_attitude(previous, command)
-            self.require_observation_token()
-            # Per-call mode avoids changing global SDK settings. 1 starts at actual
-            # state, 3 chains virtual segments, 2 finishes and resets virtual state.
-            mode = 1 if index == 0 else (2 if index == len(commands) - 1 else 3)
-            ret = self.arm.set_position(
-                **command, only_check_type=mode, wait=False, is_radian=False)
-            if ret != 0 or self.arm.only_check_result != 0:
-                raise ValueError(f'적층 전체 경로 도달/충돌 검사 실패: ret={ret}, '
-                                 f'detail={self.arm.only_check_result}, '
-                                 f'구간={index + 1}/{len(commands)}, 명령={command}')
+        checked = []
+        for command in commands:
+            checked.append(stack_place.continuous_attitude(previous, command))
+            previous = checked[-1]
+
+        def run(sequence):
+            for index, command in enumerate(sequence):
+                self.require_observation_token()
+                # Per-call mode avoids changing global SDK settings. 1 starts at actual
+                # state, 3 chains virtual segments, 2 finishes and resets virtual state.
+                mode = 1 if index == 0 else (2 if index == len(sequence) - 1 else 3)
+                ret = self.arm.set_position(
+                    **command, only_check_type=mode, wait=False, is_radian=False)
+                if ret != 0 or self.arm.only_check_result != 0:
+                    return index, ret, self.arm.only_check_result
+            return None
+
+        failure = run(checked)
+        if failure is not None:
+            index, ret, detail = failure
+            self.diagnose_stack_preflight(checked[:index + 1], run)
+            # Diagnostics never relax the decision: the original failure stops the task.
+            raise ValueError(f'적층 전체 경로 도달/충돌 검사 실패: ret={ret}, detail={detail}, '
+                             f'구간={index + 1}/{len(checked)}, 명령={checked[index]}')
         self.require_observation_token()
+
+    def diagnose_stack_preflight(self, sequence, run):
+        """Log why a controller path check failed; results never allow motion.
+
+        2026-11-06: the identical failed check passed minutes later from a separate
+        SDK script. Distinguish settling time (retry after 0.5 s) from stale
+        controller virtual state (retry after a mode-2 check, which restores the
+        virtual state to the actual state).
+        """
+        log = self.get_logger()
+        try:
+            code, pose = self.arm.get_position(is_radian=False)
+            _, joints = self.arm.get_servo_angle(is_radian=False)
+            done = getattr(self, '_last_motion_done', None)
+            log.error(
+                f'[사전검사 진단] 측정 TCP={pose} (code={code}), 관절={list(joints)[:6]}, '
+                f'state={self.arm.get_state()}, error={self.arm.error_code}, '
+                f'warn={self.arm.warn_code}, 직전 이동 완료 후 '
+                f'{"알 수 없음" if done is None else f"{time.monotonic() - done:.2f}s"}')
+            time.sleep(0.5)
+            log.error(f'[사전검사 진단] 0.5초 후 같은 검사 재실행: {self.describe_check(run(sequence))}')
+            reset = dict(sequence[0], **dict(zip(('x', 'y', 'z', 'roll', 'pitch', 'yaw'), pose[:6])))
+            ret = self.arm.set_position(**reset, only_check_type=2, wait=False, is_radian=False)
+            log.error(f'[사전검사 진단] mode 2(가상 상태→실제 상태 복원) 검사: ret={ret}, '
+                      f'detail={self.arm.only_check_result}')
+            log.error(f'[사전검사 진단] 복원 후 같은 검사 재실행: {self.describe_check(run(sequence))}')
+        except Exception as error:
+            log.error(f'[사전검사 진단] 진단 중 오류(원래 실패 유지): {error}')
+
+    @staticmethod
+    def describe_check(failure):
+        if failure is None:
+            return '통과'
+        index, ret, detail = failure
+        return f'실패 구간={index + 1}, ret={ret}, detail={detail}'
 
     def stack_motion_command(self, point, attitude, speed, robot_pose=None):
         """Mirror the existing TF -> SDK mover, including its final attitude."""
