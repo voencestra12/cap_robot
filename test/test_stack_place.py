@@ -804,38 +804,49 @@ def test_field_c24_preflight_never_checks_near_zero_segments(agent, monkeypatch)
 @pytest.mark.parametrize('previous,command,expected', [
     ((-179.5, 0., -93.7), (180., 0., -93.7), (-180., 0., -93.7)),
     ((179.5, 0., -93.7), (-180., 0., -93.7), (180., 0., -93.7)),
-    ((180., 0., 179.), (180., 0., -178.), (180., 0., 182.)),
-    ((178., -1.9, -89.7), (-152., -1.9, -89.7), (208., -1.9, -89.7)),
+    # 2026-11-06 field: float overshoot gave -180.00000000000006 (controller wraps to +180).
+    ((-179.98877, 0., -90.5), (180., 0., -90.5), (-180., 0., -90.5)),
+    # Only exactly +/-180 has two spellings; other angles stay inside [-180, 180].
+    ((180., 0., 179.), (180., 0., -178.), (180., 0., -178.)),
+    ((178., -1.9, -89.7), (-152., -1.9, -89.7), (-152., -1.9, -89.7)),
     ((180., 0., -89.2), (180., 0., -89.7), (180., 0., -89.7)),
 ])
 def test_continuous_attitude_keeps_same_physical_rpy_on_previous_branch(previous, command, expected):
     keys = ('roll', 'pitch', 'yaw')
     result = vision.continuous_attitude(dict(zip(keys, previous)), dict(zip(keys, command), x=1.))
-    assert [result[k] for k in keys] == pytest.approx(expected)
+    assert [result[k] for k in keys] == pytest.approx(expected, abs=1e-9)
+    # The controller sees literal values: +/-180 must be exact and nothing may leave the range.
+    assert all(result[k] == e for k, e in zip(keys, expected) if abs(e) == 180.)
+    assert all(-180. <= result[k] <= 180. for k in keys)
     assert result['x'] == 1.
     for k in keys:  # same physical angle
         assert math.isclose(math.cos(math.radians(result[k])), math.cos(math.radians(command[keys.index(k)])),
                             abs_tol=1e-9)
 
 
-def test_field_roll_wrap_preflight_matches_controller_and_motion_is_unchanged(agent, monkeypatch):
-    """2026-11-06 field test: measured roll -179.5, target roll +180. The controller
-    path check returned C24 for +180 and passed -180; the real +180 move was normal."""
+@pytest.mark.parametrize('measured', [-179.5, -179.98877])
+def test_field_roll_wrap_preflight_matches_controller_and_motion_is_unchanged(agent, monkeypatch, measured):
+    """2026-11-06 field tests: measured roll -179.5, target roll +180. The controller
+    path check returned C24 for +180 and passed -180; the real +180 move was normal.
+    Measured -179.98877 later produced -180.00000000000006, which the controller wraps."""
     node, task = agent
     original = node.arm.get_position.side_effect
-    node.arm.get_position.side_effect = lambda **kw: (0, [*original(**kw)[1][:3], -179.5, 0., 0.])
+    node.arm.get_position.side_effect = lambda **kw: (0, [*original(**kw)[1][:3], measured, 0., 0.])
     state = {}
     def controller_check(**kwargs):
-        # Literal RPY difference from the measured state (mode 1) or previous check.
-        start = dict(roll=-179.5, pitch=0., yaw=0.) if kwargs['only_check_type'] == 1 else state
-        turn = max(abs(kwargs[a] - start[a]) for a in ('roll', 'pitch', 'yaw'))
-        state.update({a: kwargs[a] for a in ('roll', 'pitch', 'yaw')})
+        # Controller keeps angles in [-180, 180] and plans from the literal RPY difference
+        # to the measured state (mode 1) or the previous check.
+        angles = {a: (kwargs[a] + 180.) % 360. - 180. if abs(kwargs[a]) > 180. else kwargs[a]
+                  for a in ('roll', 'pitch', 'yaw')}
+        start = dict(roll=measured, pitch=0., yaw=0.) if kwargs['only_check_type'] == 1 else state
+        turn = max(abs(angles[a] - start[a]) for a in angles)
+        state.update(angles)
         node.arm.only_check_result = 24 if turn > 90. else 0
         return 1 if turn > 90. else 0
     node.arm.set_position.side_effect = controller_check
     feed(monkeypatch, node, [observation(310, 180)] * 3)
     assert node.execute_task(task)
-    assert all(c.kwargs['roll'] == pytest.approx(-180.) for c in node.arm.set_position.call_args_list)
+    assert all(c.kwargs['roll'] == -180. for c in node.arm.set_position.call_args_list)
     # Executed moves keep the existing +180 command; only the check's notation changes.
     assert all(c.kwargs.get('roll_deg', 180.) == 180. for c in node.move_to_robot_tf.call_args_list)
     node.release_zone_token.assert_called_once()
@@ -1353,9 +1364,11 @@ def test_preflight_release_attitude_exactly_matches_existing_place_moves(agent, 
     assert len(plan) == len(actual)
     for checked, move in zip(plan, actual):
         assert (checked['x'], checked['y'], checked['z']) == pytest.approx(move.args[:3])
-        assert checked['yaw'] == pytest.approx(math.degrees(move.kwargs['yaw']))
-        assert checked['roll'] == pytest.approx(move.kwargs.get('roll_deg', 180.))
-        assert checked['pitch'] == pytest.approx(move.kwargs.get('pitch_deg', 0.))
+        # Same physical angle; the check may spell +/-180-equivalent angles differently.
+        for axis, executed in (('yaw', math.degrees(move.kwargs['yaw'])),
+                               ('roll', move.kwargs.get('roll_deg', 180.)),
+                               ('pitch', move.kwargs.get('pitch_deg', 0.))):
+            assert (checked[axis] - executed + 180.) % 360. - 180. == pytest.approx(0., abs=1e-9)
         assert checked['speed'] == move.kwargs['speed']
 
 

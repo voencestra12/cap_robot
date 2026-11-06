@@ -112,11 +112,20 @@ def continuous_attitude(previous, command):
     Same physical attitude. The controller path check plans from the literal
     RPY difference: measured roll -179.5 to commanded +180 was rejected as a
     full wrist turn (C24, 2026-11-05/06), while the real move took 0.5 deg.
+    Controller angles live in [-180, 180], so only exactly +/-180 has two
+    spellings: results are snapped/kept inside that range. A float overshoot
+    such as -180.00000000000006 would be wrapped to +180 by the controller
+    (field C24 on 2026-11-06).
     """
     result = dict(command)
     for axis in ('roll', 'pitch', 'yaw'):
         delta = (command[axis] - previous[axis] + 180.0) % 360.0 - 180.0
-        result[axis] = previous[axis] + delta
+        value = previous[axis] + delta
+        if abs(abs(value) - 180.0) < 1e-6:
+            value = math.copysign(180.0, value)
+        elif abs(value) > 180.0:
+            value -= math.copysign(360.0, value)
+        result[axis] = value
     return result
 
 
