@@ -3174,12 +3174,14 @@ class RobotAgentNode(Node):
         if self.arm.get_is_moving() is not False:
             raise RuntimeError('관측 전 로봇이 아직 이동 중입니다.')
 
-    def preflight_stack_commands(self, commands):
+    def preflight_stack_commands(self, commands, start_attitude):
         """Controller-only planning: validate every segment without executing it.
 
         Firmware checks self-collision, joint/Cartesian limits and speed along the
         continuous path. External basket/tool clearance still needs the existing
         observation_validated field check; the SDK has no environment model.
+        start_attitude is the measured TCP roll/pitch/yaw (deg) the check starts from;
+        each command keeps the same RPY branch so +/-180 deg is not read as a turn.
         """
         version = self.arm.version_number
         if (not isinstance(version, (tuple, list)) or len(version) != 3
@@ -3187,7 +3189,9 @@ class RobotAgentNode(Node):
                 or not callable(getattr(self.arm, 'set_only_check_type', None))):
             raise ValueError('경로 무동작 검증을 지원하는 SDK/펌웨어(>=1.11.100)가 필요합니다.')
         self.require_stack_stopped()
+        previous = start_attitude
         for index, command in enumerate(commands):
+            command = previous = stack_place.continuous_attitude(previous, command)
             self.require_observation_token()
             # Per-call mode avoids changing global SDK settings. 1 starts at actual
             # state, 3 chains virtual segments, 2 finishes and resets virtual state.
@@ -3277,11 +3281,13 @@ class RobotAgentNode(Node):
         # skip zero-length repeats, which the controller planner rejects (C24).
         planned, previous = [], commands[0]
         for command in commands[1:] + (place_commands or []):
-            if not all(math.isclose(command[a], previous[a], abs_tol=1e-6, rel_tol=0)
+            same_branch = stack_place.continuous_attitude(previous, command)  # 180 == -180
+            if not all(math.isclose(same_branch[a], previous[a], abs_tol=1e-6, rel_tol=0)
                        for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')):
                 planned.append(command)
             previous = command
-        self.preflight_stack_commands(planned)
+        self.preflight_stack_commands(
+            planned, dict(zip(('roll', 'pitch', 'yaw'), actual[3:6])))
         # TF preflight can itself take time; gate freshness after it, just before motion.
         self.get_previous_layer_target(task)
         if verification is not None:

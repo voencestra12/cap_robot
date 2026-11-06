@@ -106,6 +106,20 @@ def transit_waypoints(start, end):
     return [dict(start, z=height), dict(end, z=height), dict(end)]
 
 
+def continuous_attitude(previous, command):
+    """Re-express command roll/pitch/yaw (deg) on the same branch as previous.
+
+    Same physical attitude. The controller path check plans from the literal
+    RPY difference: measured roll -179.5 to commanded +180 was rejected as a
+    full wrist turn (C24, 2026-11-05/06), while the real move took 0.5 deg.
+    """
+    result = dict(command)
+    for axis in ('roll', 'pitch', 'yaw'):
+        delta = (command[axis] - previous[axis] + 180.0) % 360.0 - 180.0
+        result[axis] = previous[axis] + delta
+    return result
+
+
 def compose_transforms(parent, child):
     """Compose workspace<-TCP and TCP<-camera at the same acquisition time."""
     def values(transform):

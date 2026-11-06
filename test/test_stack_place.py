@@ -787,10 +787,10 @@ def test_field_c24_preflight_never_checks_near_zero_segments(agent, monkeypatch)
     feed(monkeypatch, node, [observation(310, 180)] * 3)
     sequences = []
     preflight = node.preflight_stack_commands
-    def record(commands):
+    def record(commands, start_attitude):
         sequences.append([node.arm.get_position()[1][:6]] + [
             [c[a] for a in ('x', 'y', 'z', 'roll', 'pitch', 'yaw')] for c in commands])
-        return preflight(commands)
+        return preflight(commands, start_attitude)
     node.preflight_stack_commands = record
     assert node.execute_task(task)
     assert len(sequences) == 2
@@ -799,6 +799,46 @@ def test_field_c24_preflight_never_checks_near_zero_segments(agent, monkeypatch)
             moved = math.dist(before[:3], after[:3])
             rotated = before[3:] != pytest.approx(after[3:])
             assert moved >= vision.POSITION_TOLERANCE_MM or (moved == 0 and rotated)
+
+
+@pytest.mark.parametrize('previous,command,expected', [
+    ((-179.5, 0., -93.7), (180., 0., -93.7), (-180., 0., -93.7)),
+    ((179.5, 0., -93.7), (-180., 0., -93.7), (180., 0., -93.7)),
+    ((180., 0., 179.), (180., 0., -178.), (180., 0., 182.)),
+    ((178., -1.9, -89.7), (-152., -1.9, -89.7), (208., -1.9, -89.7)),
+    ((180., 0., -89.2), (180., 0., -89.7), (180., 0., -89.7)),
+])
+def test_continuous_attitude_keeps_same_physical_rpy_on_previous_branch(previous, command, expected):
+    keys = ('roll', 'pitch', 'yaw')
+    result = vision.continuous_attitude(dict(zip(keys, previous)), dict(zip(keys, command), x=1.))
+    assert [result[k] for k in keys] == pytest.approx(expected)
+    assert result['x'] == 1.
+    for k in keys:  # same physical angle
+        assert math.isclose(math.cos(math.radians(result[k])), math.cos(math.radians(command[keys.index(k)])),
+                            abs_tol=1e-9)
+
+
+def test_field_roll_wrap_preflight_matches_controller_and_motion_is_unchanged(agent, monkeypatch):
+    """2026-11-06 field test: measured roll -179.5, target roll +180. The controller
+    path check returned C24 for +180 and passed -180; the real +180 move was normal."""
+    node, task = agent
+    original = node.arm.get_position.side_effect
+    node.arm.get_position.side_effect = lambda **kw: (0, [*original(**kw)[1][:3], -179.5, 0., 0.])
+    state = {}
+    def controller_check(**kwargs):
+        # Literal RPY difference from the measured state (mode 1) or previous check.
+        start = dict(roll=-179.5, pitch=0., yaw=0.) if kwargs['only_check_type'] == 1 else state
+        turn = max(abs(kwargs[a] - start[a]) for a in ('roll', 'pitch', 'yaw'))
+        state.update({a: kwargs[a] for a in ('roll', 'pitch', 'yaw')})
+        node.arm.only_check_result = 24 if turn > 90. else 0
+        return 1 if turn > 90. else 0
+    node.arm.set_position.side_effect = controller_check
+    feed(monkeypatch, node, [observation(310, 180)] * 3)
+    assert node.execute_task(task)
+    assert all(c.kwargs['roll'] == pytest.approx(-180.) for c in node.arm.set_position.call_args_list)
+    # Executed moves keep the existing +180 command; only the check's notation changes.
+    assert all(c.kwargs.get('roll_deg', 180.) == 180. for c in node.move_to_robot_tf.call_args_list)
+    node.release_zone_token.assert_called_once()
 
 
 def test_tf_shift_after_observation_cannot_turn_xy_correction_into_descent(agent, monkeypatch):
