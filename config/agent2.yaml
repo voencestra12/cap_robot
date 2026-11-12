@@ -15,15 +15,17 @@
     # 하나뿐인 경우(빵-양상추-햄-빵)만 지원합니다.
     # 재료 추가 전 object_profiles.py의 stack_tcp_to_material_center_mm 실측 필요
     # (None이면 그 재료의 Task는 로봇 이동 전에 거부됨).
-    stack_place_vision.enabled: false
+    stack_place_vision.enabled: true
     stack_place_vision.materials: ["양상추", "햄", "빵"]
-    # 기존 높은 Place 접근 위치에서 파지 상태 시야/바구니/도구 경로 검증 후에만 true
-    stack_place_vision.observation_validated: false
+    # 2026-11-12 사용자 요청으로 관측 경로 실기 확인 전에 true (첫 실행은 비상정지 대기)
+    stack_place_vision.observation_validated: true
     stack_place_vision.tcp_frame: "agent2_tcp"  # 기존 SDK TCP/Hand-eye TF 사용
-    stack_place_vision.basket_half_extent_mm: [.nan, .nan]  # 바구니 내부 XY 반폭 실측
-    # 첫 층(빵) 윗면의 robot_2_base 기준 Z 범위(mm) 실측. 위층은 thickness_mm 합만큼 자동 상승.
-    stack_place_vision.target_z_range_mm: [.nan, .nan]
-    stack_place_vision.max_correction_mm: .nan  # 기존 TCP XY 대비 허용 이동 거리 실측
+    # 같은 바구니·workspace_0 기준이라 Agent1 실측값 사용
+    stack_place_vision.basket_half_extent_mm: [165.0, 55.0]
+    # 첫 층(빵) 윗면의 robot_2_base 기준 Z 범위(mm). 위층은 thickness_mm 합만큼 자동 상승.
+    # 잠정값(미실측): 첫 실행 로그의 z_range value로 좁힐 것.
+    stack_place_vision.target_z_range_mm: [30.0, 150.0]
+    stack_place_vision.max_correction_mm: 70.0  # Agent1 값 사용
     # 아래는 기존 영상 검증 기준을 재사용; 현장 영상 품질 확인 필요
     stack_place_vision.stability_mm: 3.0
     stack_place_vision.samples: 3

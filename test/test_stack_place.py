@@ -1052,10 +1052,16 @@ def test_config_cleanup_separates_default_off_from_field_settings_and_has_no_man
     for agent_id in ('agent1', 'agent2'):
         path = Path(__file__).resolve().parents[1] / 'config' / f'{agent_id}.yaml'
         config_values = yaml.safe_load(path.read_text())[f'/{agent_id}/robot_agent_node']['ros__parameters']
-        # Agent1 is the existing field experiment configuration; it is not the
-        # unconfigured runtime default. Keep Agent2 disabled.
-        assert config_values['stack_place_vision.enabled'] is (agent_id == 'agent1')
-        assert config_values['stack_place_vision.observation_validated'] is (agent_id == 'agent1')
+        # Both Agents run the field experiment configuration; it is not the
+        # unconfigured runtime default.
+        assert config_values['stack_place_vision.enabled'] is True
+        assert config_values['stack_place_vision.observation_validated'] is True
+        assert config_values['stack_place_vision.tcp_frame'] == f'{agent_id}_tcp'
+        cfg = {key: config_values[f'stack_place_vision.{key}'] for key in vision.DEFAULTS}
+        vision.validate_config(cfg)
+        vision.validate_observation_config(cfg, agent_id)
+        for material in cfg['materials']:
+            vision.material_center_offset(material, agent_id)
         assert not {f'stack_place_vision.{key}' for key in removed}.intersection(config_values)
 
 
