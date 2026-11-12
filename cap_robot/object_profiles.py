@@ -30,6 +30,8 @@ OBJECT_PROFILES = {
         "place_tcp_offset_mm": 60.0,
         # 빵은 가장자리, 양상추는 중앙을 잡으므로 빵 중심에 맞추도록 보정.
         "place_xy_offset_mm": [0.0, -30.0],
+        # 미설정 시 기본 20 → 제자리 관측 회전과 적층 Place 이동이 느려짐. 빵/햄과 동일하게.
+        "place_tilt_speed": 75.0,
     },
     "햄": {
         "stack_tcp_to_material_center_mm": None,  # 실측 필요

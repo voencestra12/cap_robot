@@ -1020,7 +1020,7 @@ def test_look_at_clamps_tilt_but_keeps_direction_toward_target():
     assert float(np.dot(lean, wanted)) > 0.95  # leans toward the basket, only less
 
 
-@pytest.mark.parametrize('action_speed,expected', [(100., 20.), (10., 10.)])
+@pytest.mark.parametrize('action_speed,expected', [(100., 75.), (10., 10.)])
 def test_look_rotation_uses_existing_material_tilt_speed_cap(action_speed, expected):
     assert vision.look_speed('양상추', 'agent1', action_speed) == expected
 
