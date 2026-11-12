@@ -737,9 +737,9 @@ def test_real_profiles_have_agent1_offsets(material):
     assert vision.material_center_offset(material, 'agent1') == [0., 0., 0.]
 
 
-@pytest.mark.parametrize('material', ['햄', '빵'])
-def test_real_profiles_agent2_offsets(material):
-    assert vision.material_center_offset(material, 'agent2') == [0., 0., 50.]
+@pytest.mark.parametrize('material, expected', [('햄', [0., 0., 0.]), ('빵', [0., 0., 50.])])
+def test_real_profiles_agent2_offsets(material, expected):
+    assert vision.material_center_offset(material, 'agent2') == expected
 
 
 @pytest.mark.parametrize('agent_id, expected', [('agent1', [1., 2., 3.]), ('agent2', [-1., 4., 5.])])

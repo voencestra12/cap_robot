@@ -38,8 +38,9 @@ OBJECT_PROFILES = {
     },
     "햄": {
         # Agent1은 거의 중앙 파지(2026-11-12, Z 미측정).
-        # Agent2는 빵과 같게 햄 중심이 손가락 끝 아래(+Z) 약 50 mm(2026-11-12).
-        "stack_tcp_to_material_center_mm": {"agent1": [0.0, 0.0, 0.0], "agent2": [0.0, 0.0, 50.0]},
+        # Agent2는 [0, 0, 50]에서 workspace Y로 약 5 cm 어긋나 0으로 시험(2026-11-12).
+        # 흐물거리는 햄은 기울여도 TCP 바로 아래로 늘어진다고 가정.
+        "stack_tcp_to_material_center_mm": {"agent1": [0.0, 0.0, 0.0], "agent2": [0.0, 0.0, 0.0]},
         "grip_position": 30.0,
         "thickness_mm": 5.0,
         "place_tcp_offset_mm": 100.0,
