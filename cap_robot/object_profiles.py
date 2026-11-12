@@ -12,7 +12,9 @@ None은 미설정이며 해당 작업은 로봇 이동 전에 거부됩니다.
 
 OBJECT_PROFILES = {
     "빵": {
-        "stack_tcp_to_material_center_mm": None,  # 실측 필요
+        # Agent1은 거의 중앙 파지(2026-11-12, Z 미측정).
+        # Agent2는 빵 중심이 손가락 끝 아래(+Z) 약 50 mm(2026-11-12 실측).
+        "stack_tcp_to_material_center_mm": {"agent1": [0.0, 0.0, 0.0], "agent2": [0.0, 0.0, 50.0]},
         "grip_position": 150.0,
         "thickness_mm": 20.0,
         # 기울인 배치 자세에서 실측할 TCP 높이 보정값.
@@ -28,13 +30,16 @@ OBJECT_PROFILES = {
         # 손가락 끝(TCP) 아래로 늘어진 양상추 때문에 30 mm(18 mm·40 mm 여유)에서 빵과 접촉(C31,
         # 2026-11-06). 놓는 높이를 빵 윗면 위 60 mm로. 늘어짐을 실측하면 다시 조정.
         "place_tcp_offset_mm": 60.0,
-        # 빵은 가장자리, 양상추는 중앙을 잡으므로 빵 중심에 맞추도록 보정.
+        # 0층 빵이 바구니 중심에서 어긋나 놓이므로 공칭 위치를 빵 중심 쪽으로 보정.
+        # 적층 비전 보정 시에는 공칭값과 max_correction_mm 기준으로만 쓰입니다.
         "place_xy_offset_mm": [0.0, -30.0],
         # 미설정 시 기본 20 → 제자리 관측 회전과 적층 Place 이동이 느려짐. 빵/햄과 동일하게.
         "place_tilt_speed": 75.0,
     },
     "햄": {
-        "stack_tcp_to_material_center_mm": None,  # 실측 필요
+        # Agent1은 거의 중앙 파지(2026-11-12, Z 미측정).
+        # Agent2는 빵과 같게 햄 중심이 손가락 끝 아래(+Z) 약 50 mm(2026-11-12).
+        "stack_tcp_to_material_center_mm": {"agent1": [0.0, 0.0, 0.0], "agent2": [0.0, 0.0, 50.0]},
         "grip_position": 30.0,
         "thickness_mm": 5.0,
         "place_tcp_offset_mm": 100.0,

@@ -359,11 +359,12 @@ def test_late_error_in_same_batch_cannot_be_hidden_by_three_good_samples(agent, 
         node.observe_previous_layer(task)
 
 
-@pytest.mark.parametrize('agent_id', ['agent1'])
+@pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
 @pytest.mark.parametrize('delta', [(0, 30), (10, 35)])
 def test_execution_corrects_once_after_lift_and_uses_existing_transform(agent, monkeypatch, agent_id, delta):
     node, task = agent
     node.agent_id = task['assignee_id'] = agent_id
+    node.stack_vision_config['tcp_frame'] = f'{agent_id}_tcp'
     node.stack_vision_config['max_correction_mm'] = 50.
     # Exercise the real convert_place_pose/workspace_place_to_robot_place methods.
     node.workspace_point_to_robot = Mock(side_effect=lambda x, y, z, **kw: (x, y, z))
@@ -605,6 +606,7 @@ def rigid_transform(xyz=(0., 0., 0.), quat=(0., 0., 0., 1.)):
 
 def test_tf_queries_capture_time_and_rejects_invalid_rotation():
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = 0.1
     mount = rigid_transform((.01, .02, .03))
@@ -731,10 +733,13 @@ def test_previous_layer_must_be_unique_in_same_assembly(failure):
 
 
 @pytest.mark.parametrize('material', ['햄', '빵'])
-def test_real_uncalibrated_profiles_reject_offsets(material):
-    assert object_profiles.OBJECT_PROFILES[material]['stack_tcp_to_material_center_mm'] is None
-    with pytest.raises(ValueError):
-        vision.material_center_offset(material, 'agent1')
+def test_real_profiles_have_agent1_offsets(material):
+    assert vision.material_center_offset(material, 'agent1') == [0., 0., 0.]
+
+
+@pytest.mark.parametrize('material', ['햄', '빵'])
+def test_real_profiles_agent2_offsets(material):
+    assert vision.material_center_offset(material, 'agent2') == [0., 0., 50.]
 
 
 @pytest.mark.parametrize('agent_id, expected', [('agent1', [1., 2., 3.]), ('agent2', [-1., 4., 5.])])
@@ -773,13 +778,85 @@ def set_layer(node, task, layer, calibrated=True):
 
 @pytest.mark.parametrize('layer', [0, 1, 2, 3])
 @pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
-def test_only_agent1_lettuce_layer_one_can_use_vision(agent, layer, agent_id):
+def test_every_layer_above_the_first_uses_vision_on_both_agents(agent, layer, agent_id):
     node, task = agent
     node.agent_id = task['assignee_id'] = agent_id
     set_layer(node, task, layer)
-    if layer == 1 and agent_id == 'agent1':
-        assert node.needs_stack_place(task)
-        return
+    assert node.needs_stack_place(task) is (layer >= 1)
+
+
+def test_previous_layer_z_gate_rises_by_layers_above_the_first(monkeypatch):
+    profiles = dict(object_profiles.OBJECT_PROFILES)
+    for material, value in (('빵', 20.), ('양상추', 12.), ('햄', 5.)):
+        profiles[material] = dict(profiles.get(material, {}), thickness_mm=value)
+    monkeypatch.setattr(object_profiles, 'OBJECT_PROFILES', profiles)
+    tasks = sandwich()
+    # Layer 0 bread top keeps the measured range; lettuce and ham thicknesses shift it.
+    assert [vision.previous_layer_z_range(t, tasks, [55., 85.]) for t in tasks[1:]] == [
+        [55., 85.], [67., 97.], [72., 102.]]
+    other = copy.deepcopy(tasks)
+    other[1]['assembly']['id'] = 'other'
+    assert vision.previous_layer_z_range(tasks[3], other, [55., 85.]) == [60., 90.]
+
+
+@pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
+@pytest.mark.parametrize('layer, previous', [(2, '양상추'), (3, '햄')])
+def test_upper_layers_observe_the_previous_material_on_both_agents(
+        agent, monkeypatch, agent_id, layer, previous):
+    node, task = agent
+    node.agent_id = task['assignee_id'] = agent_id
+    node.stack_vision_config['tcp_frame'] = f'{agent_id}_tcp'
+    set_layer(node, task, layer)
+    shift = sum(object_profiles.OBJECT_PROFILES[m]['thickness_mm']
+                for m in ('양상추', '햄')[:layer - 1])
+    low, high = node.stack_vision_config['target_z_range_mm']
+    detections = [
+        # Lower layers stay visible around the top one and must be ignored by class.
+        ('빵_1', (300., 200., 30. + shift, 0.), 0.95),
+        ('양상추_1', (305., 195., 30. + shift, 0.), 0.9) if previous == '햄'
+        else ('햄_9', (500., 500., 30., 0.), 0.9),
+        (f'{previous}_1', (310., 180., low + shift + 1., 0.), 0.9),
+    ]
+    obs = dict(frame_id='workspace_0', error=None, detections=detections)
+    feed(monkeypatch, node, [obs] * 3)
+    targets = []
+    original = node.observe_previous_layer
+    def observe(t):
+        targets.append(node.get_previous_layer_target(t))
+        return original(t)
+    node.observe_previous_layer = observe
+    assert node.execute_task(task)
+    assert targets[0]['material'] == previous
+    assert targets[0]['z_range_mm'] == [low + shift, high + shift]
+    look = [c for c in node.move_to_robot_tf.call_args_list
+            if c.kwargs.get('label') == 'look at previous layer']
+    assert len(look) == 1
+    lookups = {c.args[0] for c in node.tf_buffer.lookup_transform.call_args_list}
+    assert lookups == {f'{agent_id}_tcp'}
+
+
+def test_shifted_gate_rejects_a_previous_layer_at_the_first_layer_height(agent, monkeypatch):
+    node, task = agent
+    clock = use_observation_clock(monkeypatch, node)
+    set_layer(node, task, 3)
+    object_profiles.OBJECT_PROFILES['양상추']['thickness_mm'] = 40.
+    low, _ = node.stack_vision_config['target_z_range_mm']
+    obs = dict(frame_id='workspace_0', error=None,
+               detections=[('햄_1', (310., 180., low + 1., 0.), 0.9)])
+    feed(monkeypatch, node, [obs] * 400, clock)
+    assert not node.execute_task(task)
+    assert not any(c.kwargs.get('label', '').endswith('approach')
+                   for c in node.move_to_robot_tf.call_args_list)
+    node.control_gripper.assert_called()
+    assert node.control_gripper.call_count == 2  # never released
+
+
+@pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
+def test_material_outside_the_configured_list_bypasses_vision(agent, agent_id):
+    node, task = agent
+    node.agent_id = task['assignee_id'] = agent_id
+    set_layer(node, task, 2)
+    node.stack_vision_config['materials'] = ['양상추']  # layer 2 is ham
     node.prepare_stack_place = Mock(side_effect=AssertionError('out-of-scope vision'))
     assert not node.needs_stack_place(task)
     assert node.execute_task(task)
@@ -828,6 +905,7 @@ def test_stale_blue_handles_after_long_wait_fail_without_observation_motion(agen
 
 def test_observation_uses_only_real_tcp_camera_tf():
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = 1.
     transform = rigid_transform((.01, .02, .03))
@@ -914,7 +992,7 @@ def test_failed_motion_never_continues_to_capture_or_release(agent, monkeypatch,
     node.release_zone_token.assert_not_called()
 
 
-def test_first_layer_must_be_bread_for_agent1_lettuce(agent):
+def test_previous_layer_must_be_a_detectable_material(agent):
     node, task = agent
     node.guidebook_tasks['layer_0']['assembly']['material'] = '바나나'
     assert not node.execute_task(task)
@@ -926,6 +1004,7 @@ def test_first_layer_must_be_bread_for_agent1_lettuce(agent):
 @pytest.mark.parametrize('failure', ['missing', 'wrong_parent', 'wrong_child', 'nan', 'zero_rotation'])
 def test_each_capture_tf_link_fails_closed(link, failure):
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = .1
     node.tf_buffer = Mock()

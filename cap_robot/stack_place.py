@@ -8,11 +8,11 @@ import uuid
 import numpy as np
 
 try:
-    from .material_handling import material_profile, number
+    from .material_handling import material_profile, number, thickness
     from .object_memory import object_class
     from . import object_profiles as profiles
 except ImportError:
-    from material_handling import material_profile, number
+    from material_handling import material_profile, number, thickness
     from object_memory import object_class
     import object_profiles as profiles
 
@@ -37,6 +37,8 @@ DEFAULTS = {
 # Fixed limits, intentionally not ROS parameters.
 # In-place look rotation: maximum tool tilt from straight down while holding material.
 MAX_LOOK_TILT_DEG = 45.0
+# Previous layers must be classes of the sandwich YOLO model (bread/lettuce/ham).
+LAYER_DETECTOR_MATERIALS = ('빵', '양상추', '햄')
 
 
 def vector(value, size, label):
@@ -71,11 +73,11 @@ def validate_config(config):
         raise ValueError('samples는 2~8 정수여야 합니다.')
 
 
-def validate_observation_config(config):
+def validate_observation_config(config, agent_id):
     if config.get('observation_validated') is not True:
         raise ValueError('관측 자세/높이/경로 실측 검증 필요: observation_validated=false')
-    if config['tcp_frame'] != 'agent1_tcp':
-        raise ValueError('Agent1 양상추 관측에는 agent1_tcp TF가 필요합니다.')
+    if config['tcp_frame'] != f'{agent_id}_tcp':
+        raise ValueError(f'{agent_id} 적층 관측에는 {agent_id}_tcp TF가 필요합니다.')
 
 
 def get_previous_layer_target(task, tasks, statuses):
@@ -93,7 +95,25 @@ def get_previous_layer_target(task, tasks, statuses):
            and t['assembly']['layer_index'] < index - 1
            and t['assembly']['material'] == target['assembly']['material'] for t in tasks):
         raise ValueError('동종 이전 층들의 높이 구분을 검증할 수 없습니다.')
+    if target['assembly']['material'] not in LAYER_DETECTOR_MATERIALS:
+        raise ValueError(f"이전 층 재료는 인식 가능한 재료여야 합니다: {target['assembly']['material']}")
     return dict(target['assembly'], task_id=target['task_id'])
+
+
+def previous_layer_z_range(task, tasks, base_range):
+    """Base Z gate for the layer directly below task.
+
+    base_range is the measured range of the first layer (layer 0) top. Each layer
+    placed on top of it after layer 0 raises the gate by its thickness_mm. With the
+    supported recipes (no repeated previous-layer material) the material name selects
+    the layer, so the gate is a sanity check and thickness_mm only shifts it.
+    """
+    assembly = task['assembly']
+    shift = sum(thickness(t['assembly']['material']) for t in tasks
+                if t.get('assembly', {}).get('id') == assembly['id']
+                and 1 <= t['assembly']['layer_index'] < assembly['layer_index'])
+    low, high = vector(base_range, 2, 'target_z_range_mm')
+    return [low + shift, high + shift]
 
 
 def _axis_rotation(axis, angle):
@@ -218,8 +238,10 @@ def save_observation_debug(task_id, reason, observation, directory=None):
 
 
 def previous_layer_center(observation, basket, target_material, config, diagnostics=None,
-                          base_z=None):
-    """One bread candidate inside the basket XY and the target_z_range_mm gate.
+                          base_z=None, z_range=None):
+    """One previous-layer candidate inside the basket XY and the Z gate.
+
+    z_range defaults to config['target_z_range_mm'] (see previous_layer_z_range).
 
     base_z(x, y, z) maps a workspace point to robot Base Z. The Z gate uses Base Z:
     the mount camera -> TCP -> Base chain does not depend on the ArUco workspace lock,
@@ -230,7 +252,7 @@ def previous_layer_center(observation, basket, target_material, config, diagnost
         raise ValueError(f"이전 층 관측 실패: {observation.get('error', '좌표계 오류')}")
     candidates = []
     hx, hy = config['basket_half_extent_mm']
-    zmin, zmax = config['target_z_range_mm']
+    zmin, zmax = z_range if z_range is not None else config['target_z_range_mm']
     for name, pose, confidence in observation['detections']:
         if object_class(name) != target_material:
             continue

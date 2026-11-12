@@ -173,15 +173,15 @@ class RobotAgentNode(Node):
         self.declare_parameter('shared_zone_y_max', 500.0)
         self.declare_parameter('shared_zone_margin_mm', 0.0)
 
+        self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.stack_vision_config = {
             name: self.get_parameter(f'stack_place_vision.{name}').value
             for name in stack_place.DEFAULTS
         }
         if self.stack_vision_config['enabled']:
             stack_place.validate_config(self.stack_vision_config)
-            stack_place.validate_observation_config(self.stack_vision_config)
+            stack_place.validate_observation_config(self.stack_vision_config, self.agent_id)
 
-        self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
         self.enable_perception = bool(self.get_parameter('enable_perception').value)
         self.perception_settle_sec = float(self.get_parameter('perception_settle_sec').value)
@@ -2912,7 +2912,7 @@ class RobotAgentNode(Node):
                 return False
             if self.needs_stack_place(task):
                 stack_place.validate_config(self.stack_vision_config)
-                stack_place.validate_observation_config(self.stack_vision_config)
+                stack_place.validate_observation_config(self.stack_vision_config, self.agent_id)
                 stack_place.material_center_offset(task['assembly']['material'], self.agent_id)
                 if not self.zone_token_enabled or not self.enable_sdk_safety_box:
                     raise ValueError('적층 관측에는 Token과 SDK Safety Box가 활성화되어야 합니다.')
@@ -3101,11 +3101,11 @@ class RobotAgentNode(Node):
 
     def needs_stack_place(self, task):
         assembly = task.get('assembly', {})
+        # Layer 0 goes into the empty basket: nothing below it to observe.
+        index = assembly.get('layer_index')
         return (getattr(self, 'stack_vision_config', {}).get('enabled', False)
-                and self.agent_id == 'agent1'
-                and assembly.get('material') == '양상추'
                 and assembly.get('container') == 'basket'
-                and assembly.get('layer_index') == 1
+                and type(index) is int and index >= 1
                 and assembly.get('material') in self.stack_vision_config['materials'])
 
     def require_observation_token(self):
@@ -3123,17 +3123,18 @@ class RobotAgentNode(Node):
     def get_previous_layer_target(self, task):
         self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
         with self.guidebook_lock:
+            tasks = list(self.guidebook_tasks.values())
             target = stack_place.get_previous_layer_target(
-                task, list(self.guidebook_tasks.values()), self.guidebook_task_status)
-        if self.needs_stack_place(task) and target['material'] != '빵':
-            raise ValueError('Agent1 양상추 관측 대상은 첫 번째 빵이어야 합니다.')
+                task, tasks, self.guidebook_task_status)
+        target['z_range_mm'] = stack_place.previous_layer_z_range(
+            task, tasks, self.stack_vision_config['target_z_range_mm'])
         return target
 
     def stack_camera_mount(self, meta):
         """Use the calibrated TCP -> camera TF at the RGB acquisition time."""
         tcp_frame = self.stack_vision_config['tcp_frame']
-        if tcp_frame != 'agent1_tcp' or not meta['camera_frame']:
-            raise ValueError('agent1_tcp 및 CameraInfo optical 프레임이 필요합니다.')
+        if tcp_frame != f'{self.agent_id}_tcp' or not meta['camera_frame']:
+            raise ValueError(f'{self.agent_id}_tcp 및 CameraInfo optical 프레임이 필요합니다.')
         stamped = self.tf_buffer.lookup_transform(
             tcp_frame, meta['camera_frame'], RclpyTime(seconds=meta['color_stamp']),
             timeout=Duration(seconds=self.tf_lookup_timeout_sec))
@@ -3167,16 +3168,17 @@ class RobotAgentNode(Node):
         if code != 0:
             raise ValueError('Pick 상승 후 실제 TCP 위치를 확인할 수 없습니다.')
         pose = stack_place.vector(pose, 6, 'Pick 상승 실제 SDK TCP')
-        # Agent1's existing Base -> SDK mapping is identity. Do not invert a
-        # guessed mapping if that contract ever changes.
+        # The existing Base -> SDK mapping is identity for both Agents. Do not invert
+        # a guessed mapping if that contract ever changes.
         if self.tf_pose_to_sdk_pose(*pose[:3], agent_id=self.agent_id).get('mode') != 'identity':
-            raise ValueError('관측에는 검증된 Agent1 Base/SDK identity 변환이 필요합니다.')
+            raise ValueError('관측에는 검증된 Base/SDK identity 변환이 필요합니다.')
         config = self.stack_vision_config
         basket = task['basket_center_workspace']
-        # Basket center XY at the previous-layer Base Z gate center (target_z_range_mm is Base Z).
+        target = self.get_previous_layer_target(task)
+        # Basket center XY at the previous-layer Base Z gate center (the gate is Base Z).
         aim = dict(self.convert_place_pose(
             dict(x=basket['x'], y=basket['y'], z=0.0, yaw=0.0), self.agent_id),
-            z=float(np.mean(config['target_z_range_mm'])))
+            z=float(np.mean(target['z_range_mm'])))
         if not self.camera_frame:
             raise ValueError('CameraInfo optical 프레임이 아직 없습니다.')
         stamped = self.tf_buffer.lookup_transform(
@@ -3194,7 +3196,8 @@ class RobotAgentNode(Node):
         roll, pitch, yaw = matrix_to_rpy(rotation)
         speed = stack_place.look_speed(task['assembly']['material'], self.agent_id, action['speed'])
         self.get_logger().info(
-            f"[{task['task_id']}] 제자리 관측 회전: TCP={pose[:3]}, 바구니 관측점(Base)="
+            f"[{task['task_id']}] 제자리 관측 회전: TCP={pose[:3]}, 이전 층={target['material']} "
+            f"(Base Z 범위={target['z_range_mm']}), 바구니 관측점(Base)="
             f"{[round(aim[a], 1) for a in ('x', 'y', 'z')]}, 기울기={tilt:.1f}deg"
             f"{' (상한 적용)' if clamped else ''}, rpy=({math.degrees(roll):.2f}, "
             f"{math.degrees(pitch):.2f}, {math.degrees(yaw):.2f}), speed={speed}")
@@ -3232,7 +3235,7 @@ class RobotAgentNode(Node):
         mean = np.mean(centers, axis=0).tolist()
         delta = {a: corrected[a] - task['reference_place_pose'][a] for a in ('x', 'y', 'z')}
         self.get_logger().info(
-            f"[{task['task_id']}] 최종 평균 빵 중심 XYZ(mm)={mean}, 보정량 XYZ(mm)={delta} "
+            f"[{task['task_id']}] 최종 평균 이전 층 중심 XYZ(mm)={mean}, 보정량 XYZ(mm)={delta} "
             f"(해제 Z: 계산 {task['reference_place_pose']['z']:.1f} → {corrected['z']:.1f})")
         # Commit once; later actions only validate assembly and reuse this pose.
         task['reference_place_pose'] = corrected
@@ -3297,7 +3300,8 @@ class RobotAgentNode(Node):
                             observation, task['basket_center_workspace'], target['material'], config,
                             diagnostics=observation['checks'],
                             base_z=lambda x, y, z: self.convert_place_pose(
-                                dict(x=x, y=y, z=z, yaw=0.0), self.agent_id)['z'])
+                                dict(x=x, y=y, z=z, yaw=0.0), self.agent_id)['z'],
+                            z_range=target['z_range_mm'])
                     except stack_place.NoPreviousLayerCandidate as error:
                         self.get_logger().info(
                             f"[{task['task_id']}] 프레임={observation['frame_number']}: {error}; "
