@@ -84,6 +84,8 @@
     motion_speed_scale: 2.0
     max_tcp_speed_mm_s: 300.0
     max_joint_speed_deg_s: 60.0
+    # 기본(Home) joint 자세 J1~J6 [deg]
+    home_joint_angles_deg: [0.0, -60.0, -30.0, 0.0, 90.0, 0.0]
 
     # A+B 공용 구역 토큰 / 기하 게이트 (zone_token_manager 노드 1개를 함께 실행)
     zone_token_enabled: true

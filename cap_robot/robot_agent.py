@@ -164,6 +164,8 @@ class RobotAgentNode(Node):
         self.declare_parameter('motion_speed_scale', 1.0)
         self.declare_parameter('max_tcp_speed_mm_s', 300.0)
         self.declare_parameter('max_joint_speed_deg_s', 60.0)
+        # 기본(Home) joint 자세 J1~J6 [deg]. Agent별 yaml에서 override
+        self.declare_parameter('home_joint_angles_deg', list(self.HOME_JOINT_ANGLES_DEG))
 
         # A+B 공용 구역 토큰 / 기하 게이트 파라미터
         self.declare_parameter('zone_token_enabled', True)
@@ -270,6 +272,13 @@ class RobotAgentNode(Node):
             raise ValueError('motion_speed_scale은 0.1~3.0이어야 합니다.')
         self.max_tcp_speed_mm_s = float(self.get_parameter('max_tcp_speed_mm_s').value)
         self.max_joint_speed_deg_s = float(self.get_parameter('max_joint_speed_deg_s').value)
+        self.home_joint_angles_deg = [
+            float(v) for v in self.get_parameter('home_joint_angles_deg').value
+        ]
+        if len(self.home_joint_angles_deg) != 6 or not all(
+            math.isfinite(v) for v in self.home_joint_angles_deg
+        ):
+            raise ValueError('home_joint_angles_deg는 유한한 값 6개여야 합니다.')
         self.zone_token_enabled = bool(
             self.get_parameter('zone_token_enabled').value
         )
@@ -1478,7 +1487,7 @@ class RobotAgentNode(Node):
     
     def return_to_home_joint_pose(self):
         """첨부 이미지의 기본 joint 자세로 복귀합니다."""
-        target = list(self.HOME_JOINT_ANGLES_DEG)
+        target = list(self.home_joint_angles_deg)
         joint_speed = self.scaled_speed(self.HOME_JOINT_SPEED_DEG_S, self.max_joint_speed_deg_s)
 
         if self.dry_run:
