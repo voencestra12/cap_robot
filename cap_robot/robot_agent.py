@@ -86,7 +86,7 @@ class RobotAgentNode(Node):
     # Joint = [0, -60, -30, 0, 90, 0] deg
     # Cartesian 좌표보다 joint 자세가 재현성이 높아 기본 자세 복귀는 joint 명령을 사용합니다.
     HOME_JOINT_ANGLES_DEG = [0.0, -60.0, -30.0, 0.0, 90.0, 0.0]
-    HOME_JOINT_SPEED_DEG_S = 20.0
+    HOME_JOINT_SPEED_DEG_S = 30.0
     CLAIM_WAIT_SEC = 2.0
      
     def __init__(self):
@@ -160,6 +160,10 @@ class RobotAgentNode(Node):
         self.declare_parameter('cooperative_review_timeout_sec', 60.0)
         self.declare_parameter('step_sync_timeout_sec', 30.0)
         self.declare_parameter('step_start_delay_sec', 0.25)
+        # 모든 로봇 이동(TCP·joint) 속도 배율. 1.0이면 기존 속도.
+        self.declare_parameter('motion_speed_scale', 1.0)
+        self.declare_parameter('max_tcp_speed_mm_s', 300.0)
+        self.declare_parameter('max_joint_speed_deg_s', 60.0)
 
         # A+B 공용 구역 토큰 / 기하 게이트 파라미터
         self.declare_parameter('zone_token_enabled', True)
@@ -261,6 +265,11 @@ class RobotAgentNode(Node):
         self.step_start_delay_sec = float(
             self.get_parameter('step_start_delay_sec').value
         )
+        self.motion_speed_scale = float(self.get_parameter('motion_speed_scale').value)
+        if not (math.isfinite(self.motion_speed_scale) and 0.1 <= self.motion_speed_scale <= 3.0):
+            raise ValueError('motion_speed_scale은 0.1~3.0이어야 합니다.')
+        self.max_tcp_speed_mm_s = float(self.get_parameter('max_tcp_speed_mm_s').value)
+        self.max_joint_speed_deg_s = float(self.get_parameter('max_joint_speed_deg_s').value)
         self.zone_token_enabled = bool(
             self.get_parameter('zone_token_enabled').value
         )
@@ -1393,6 +1402,11 @@ class RobotAgentNode(Node):
                 f'z=[{self.sdk_z_min:.1f},{self.sdk_z_max:.1f}]'
             )
 
+    def scaled_speed(self, speed, limit):
+        """motion_speed_scale을 적용하고 상한으로 자른 이동 속도."""
+        speed = float(speed) * float(getattr(self, 'motion_speed_scale', 1.0))
+        return min(speed, float(limit))
+
     def move_to_sdk(self, x, y, z, yaw=0.0, speed=100.0, label='',
                     roll_deg=180.0, pitch_deg=0.0):
         """이미 xArm SDK command 좌표인 pose를 set_position으로 보낸다."""
@@ -1402,6 +1416,7 @@ class RobotAgentNode(Node):
         if not all(math.isfinite(value) for value in (roll_deg, pitch_deg, yaw)):
             raise ValueError('TCP 자세에는 유한한 숫자가 필요합니다.')
         self.check_sdk_pose_or_raise(x, y, z, label=label)
+        speed = self.scaled_speed(speed, getattr(self, 'max_tcp_speed_mm_s', 300.0))
 
         if self.dry_run:
             self.get_logger().warn(
@@ -1464,17 +1479,18 @@ class RobotAgentNode(Node):
     def return_to_home_joint_pose(self):
         """첨부 이미지의 기본 joint 자세로 복귀합니다."""
         target = list(self.HOME_JOINT_ANGLES_DEG)
+        joint_speed = self.scaled_speed(self.HOME_JOINT_SPEED_DEG_S, self.max_joint_speed_deg_s)
 
         if self.dry_run:
             self.get_logger().warn(
                 f'🧪 DRY_RUN return_home_joint: angles={target}, '
-                f'speed={self.HOME_JOINT_SPEED_DEG_S:.1f} deg/s'
+                f'speed={joint_speed:.1f} deg/s'
             )
             return True
 
         ret = self.arm.set_servo_angle(
             angle=target,
-            speed=float(self.HOME_JOINT_SPEED_DEG_S),
+            speed=float(joint_speed),
             wait=True,
         )
         if ret in (0, None):

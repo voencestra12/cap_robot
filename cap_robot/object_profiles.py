@@ -19,7 +19,7 @@ OBJECT_PROFILES = {
         "place_tcp_offset_mm": 90.0,
         "place_roll_offset_deg": {"agent1": 30.0, "agent2": -30.0},
         "place_pitch_offset_deg": 0.0,
-        "place_tilt_speed": 75.0,
+        "place_tilt_speed": 150.0,  # action speed 상한(150) = PnP 속도 그대로
     },
     "양상추": {
         "stack_tcp_to_material_center_mm": [0.0, 0.0, 0.0],  # 실측 필요 (중심 파지 가정)
@@ -30,6 +30,7 @@ OBJECT_PROFILES = {
         "place_tcp_offset_mm": 60.0,
         # 빵은 가장자리, 양상추는 중앙을 잡으므로 빵 중심에 맞추도록 보정.
         "place_xy_offset_mm": [0.0, -30.0],
+        "place_tilt_speed": 150.0,  # 적층 관측 회전·Place도 PnP 속도 그대로
     },
     "햄": {
         "stack_tcp_to_material_center_mm": None,  # 실측 필요
@@ -38,7 +39,7 @@ OBJECT_PROFILES = {
         "place_tcp_offset_mm": 100.0,
         "place_roll_offset_deg": {"agent1": 30.0, "agent2": -30.0},
         "place_pitch_offset_deg": 0.0,
-        "place_tilt_speed": 75.0,
+        "place_tilt_speed": 150.0,  # action speed 상한(150) = PnP 속도 그대로
     },
     "바나나": {
         "grip_position": 330.0,

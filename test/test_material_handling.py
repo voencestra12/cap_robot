@@ -235,7 +235,7 @@ def load_agent_methods():
         'validate_actions', 'resolve_task_assembly', 'refresh_execution_assembly',
         'validate_guidebook_policy_candidate', 'build_tasks', 'validate_received_task',
         'execute_task', 'execute_place_action', 'execute_cooperative_task', 'get_basket_center_workspace',
-        'workspace_rpy_to_robot', 'move_to_sdk', 'move_to_robot_tf', 'quaternion_to_rotation_matrix',
+        'workspace_rpy_to_robot', 'move_to_sdk', 'scaled_speed', 'move_to_robot_tf', 'quaternion_to_rotation_matrix',
         'normalize_angle_rad', 'tf_pose_to_sdk_pose',
         'refresh_guidebook_task_states_locked', 'apply_task_status',
         'wait_for_assembly_predecessors',
@@ -333,7 +333,7 @@ class AgentRollProfileTest(unittest.TestCase):
                         np.testing.assert_allclose(
                             [move['roll'] for move in moves], [180, roll, roll, roll, 180])
                         self.assertTrue(all(move['pitch'] == 0 for move in moves))
-                        self.assertTrue(all(move['speed'] == 75 for move in moves))
+                        self.assertTrue(all(move['speed'] == 100 for move in moves))
                         # 기울임/복원은 각각 높은 접근/후퇴 위치에서만 수행한다.
                         self.assertEqual(moves[0]['z'], moves[1]['z'])
                         self.assertEqual(moves[3]['z'], moves[4]['z'])

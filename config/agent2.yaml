@@ -80,6 +80,10 @@
     cooperative_review_timeout_sec: 60.0
     step_sync_timeout_sec: 30.0
     step_start_delay_sec: 0.25
+    # 모든 이동 속도 배율(1.0=기존). TCP/joint 상한으로 잘림.
+    motion_speed_scale: 2.0
+    max_tcp_speed_mm_s: 300.0
+    max_joint_speed_deg_s: 60.0
 
     # A+B 공용 구역 토큰 / 기하 게이트 (zone_token_manager 노드 1개를 함께 실행)
     zone_token_enabled: true
