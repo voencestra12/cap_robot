@@ -605,6 +605,7 @@ def rigid_transform(xyz=(0., 0., 0.), quat=(0., 0., 0., 1.)):
 
 def test_tf_queries_capture_time_and_rejects_invalid_rotation():
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = 0.1
     mount = rigid_transform((.01, .02, .03))
@@ -773,11 +774,11 @@ def set_layer(node, task, layer, calibrated=True):
 
 @pytest.mark.parametrize('layer', [0, 1, 2, 3])
 @pytest.mark.parametrize('agent_id', ['agent1', 'agent2'])
-def test_only_agent1_lettuce_layer_one_can_use_vision(agent, layer, agent_id):
+def test_lettuce_layer_one_or_above_uses_vision_for_both_agents(agent, layer, agent_id):
     node, task = agent
     node.agent_id = task['assignee_id'] = agent_id
-    set_layer(node, task, layer)
-    if layer == 1 and agent_id == 'agent1':
+    material = set_layer(node, task, layer)
+    if layer >= 1 and material == '양상추':
         assert node.needs_stack_place(task)
         return
     node.prepare_stack_place = Mock(side_effect=AssertionError('out-of-scope vision'))
@@ -828,6 +829,7 @@ def test_stale_blue_handles_after_long_wait_fail_without_observation_motion(agen
 
 def test_observation_uses_only_real_tcp_camera_tf():
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = 1.
     transform = rigid_transform((.01, .02, .03))
@@ -914,18 +916,22 @@ def test_failed_motion_never_continues_to_capture_or_release(agent, monkeypatch,
     node.release_zone_token.assert_not_called()
 
 
-def test_first_layer_must_be_bread_for_agent1_lettuce(agent):
-    node, task = agent
-    node.guidebook_tasks['layer_0']['assembly']['material'] = '바나나'
-    assert not node.execute_task(task)
-    assert node.move_to_robot_tf.call_count == 3
-    assert node.control_gripper.call_count == 2
+def test_previous_layer_z_range_rises_by_layers_stacked_after_first():
+    cfg = config(target_z_range_mm=[55., 85.])
+    for order, expected in ((('빵', '햄', '양상추', '빵'), [60., 90.]),
+                            (('빵', '양상추', '햄', '빵'), [55., 85.])):
+        tasks = sandwich()
+        for t, material in zip(tasks, order):
+            t['assembly']['material'] = material
+        lettuce = next(t for t in tasks if t['assembly']['material'] == '양상추')
+        assert vision.previous_layer_z_range(lettuce, tasks, cfg) == expected
 
 
 @pytest.mark.parametrize('link', ['mount', 'tcp'])
 @pytest.mark.parametrize('failure', ['missing', 'wrong_parent', 'wrong_child', 'nan', 'zero_rotation'])
 def test_each_capture_tf_link_fails_closed(link, failure):
     node = load_agent_methods()()
+    node.agent_id = 'agent1'
     node.stack_vision_config = config()
     node.tf_lookup_timeout_sec = .1
     node.tf_buffer = Mock()
@@ -973,10 +979,11 @@ def test_config_cleanup_separates_default_off_from_field_settings_and_has_no_man
     for agent_id in ('agent1', 'agent2'):
         path = Path(__file__).resolve().parents[1] / 'config' / f'{agent_id}.yaml'
         config_values = yaml.safe_load(path.read_text())[f'/{agent_id}/robot_agent_node']['ros__parameters']
-        # Agent1 is the existing field experiment configuration; it is not the
-        # unconfigured runtime default. Keep Agent2 disabled.
-        assert config_values['stack_place_vision.enabled'] is (agent_id == 'agent1')
-        assert config_values['stack_place_vision.observation_validated'] is (agent_id == 'agent1')
+        # Both agents are field experiment configurations; neither is the
+        # unconfigured runtime default.
+        assert config_values['stack_place_vision.enabled'] is True
+        assert config_values['stack_place_vision.observation_validated'] is True
+        assert config_values['stack_place_vision.tcp_frame'] == f'{agent_id}_tcp'
         assert not {f'stack_place_vision.{key}' for key in removed}.intersection(config_values)
 
 

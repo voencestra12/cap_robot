@@ -8,11 +8,11 @@ import uuid
 import numpy as np
 
 try:
-    from .material_handling import material_profile, number
+    from .material_handling import material_profile, number, thickness
     from .object_memory import object_class
     from . import object_profiles as profiles
 except ImportError:
-    from material_handling import material_profile, number
+    from material_handling import material_profile, number, thickness
     from object_memory import object_class
     import object_profiles as profiles
 
@@ -71,11 +71,21 @@ def validate_config(config):
         raise ValueError('samples는 2~8 정수여야 합니다.')
 
 
-def validate_observation_config(config):
+def validate_observation_config(config, agent_id):
     if config.get('observation_validated') is not True:
         raise ValueError('관측 자세/높이/경로 실측 검증 필요: observation_validated=false')
-    if config['tcp_frame'] != 'agent1_tcp':
-        raise ValueError('Agent1 양상추 관측에는 agent1_tcp TF가 필요합니다.')
+    if config['tcp_frame'] != f'{agent_id}_tcp':
+        raise ValueError(f'{agent_id} 양상추 관측에는 {agent_id}_tcp TF가 필요합니다.')
+
+
+def previous_layer_z_range(task, tasks, config):
+    """target_z_range_mm is the first layer's top; raise it by the layers stacked since."""
+    assembly = task['assembly']
+    rise = sum(thickness(t['assembly']['material']) for t in tasks
+               if t.get('assembly', {}).get('id') == assembly['id']
+               and 1 <= t['assembly']['layer_index'] < assembly['layer_index'])
+    low, high = vector(config['target_z_range_mm'], 2, 'target_z_range_mm')
+    return [low + rise, high + rise]
 
 
 def get_previous_layer_target(task, tasks, statuses):

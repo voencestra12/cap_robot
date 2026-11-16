@@ -10,14 +10,16 @@
     pick_verify_timeout_sec: 3.0     # 재확인용 새 프레임 대기 한도(초)
     basket_exclusion_radius_mm: 100.0  # 적층 시 바구니 중심 XY 반경 안 재료는 후보 제외(mm), 실측 필요
 
-    # Agent1 양상추(layer 1)만 지원. 기본 OFF; 안전 범위 미설정이면 실행을 차단합니다.
+    # 양상추가 1층 이상일 때(Agent1·Agent2) Place 전 바로 아래 층을 재인식합니다.
+    # 기본 OFF; 안전 범위 미설정이면 실행을 차단합니다.
     stack_place_vision.enabled: true
     stack_place_vision.materials: ["양상추"]
     # 기존 높은 Place 접근 위치에서 파지 상태 시야/바구니/도구 경로 검증 후에만 true
     stack_place_vision.observation_validated: true
     stack_place_vision.tcp_frame: "agent1_tcp"  # 기존 SDK TCP/Hand-eye TF 사용
     stack_place_vision.basket_half_extent_mm: [165.0, 55.0]  # 바구니 내부 XY 반폭 실측
-    # 이전 층(빵) 윗면의 robot_1_base 기준 Z 범위(mm). ArUco workspace lock과 무관.
+    # 첫 층(빵) 윗면의 robot_1_base 기준 Z 범위(mm). ArUco workspace lock과 무관.
+    # 2층 이상은 1층~직전 층 thickness_mm 합만큼 자동으로 올려 검사합니다(계산값).
     # 2026-11-06 실측 67~70 mm (같은 빵이 workspace Z로는 lock마다 -58/37/15 mm)
     stack_place_vision.target_z_range_mm: [55.0, 85.0]
     stack_place_vision.max_correction_mm: 70.0  # 기존 TCP XY 대비 허용 이동 거리 실측

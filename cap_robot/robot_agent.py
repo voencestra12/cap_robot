@@ -179,7 +179,8 @@ class RobotAgentNode(Node):
         }
         if self.stack_vision_config['enabled']:
             stack_place.validate_config(self.stack_vision_config)
-            stack_place.validate_observation_config(self.stack_vision_config)
+            stack_place.validate_observation_config(
+                self.stack_vision_config, str(self.get_parameter('agent_id').value).strip())
 
         self.agent_id = str(self.get_parameter('agent_id').value).strip()
         self.robot_ip = str(self.get_parameter('robot_ip').value).strip()
@@ -2912,7 +2913,7 @@ class RobotAgentNode(Node):
                 return False
             if self.needs_stack_place(task):
                 stack_place.validate_config(self.stack_vision_config)
-                stack_place.validate_observation_config(self.stack_vision_config)
+                stack_place.validate_observation_config(self.stack_vision_config, self.agent_id)
                 stack_place.material_center_offset(task['assembly']['material'], self.agent_id)
                 if not self.zone_token_enabled or not self.enable_sdk_safety_box:
                     raise ValueError('적층 관측에는 Token과 SDK Safety Box가 활성화되어야 합니다.')
@@ -3102,10 +3103,10 @@ class RobotAgentNode(Node):
     def needs_stack_place(self, task):
         assembly = task.get('assembly', {})
         return (getattr(self, 'stack_vision_config', {}).get('enabled', False)
-                and self.agent_id == 'agent1'
                 and assembly.get('material') == '양상추'
                 and assembly.get('container') == 'basket'
-                and assembly.get('layer_index') == 1
+                and isinstance(assembly.get('layer_index'), int)
+                and assembly.get('layer_index') >= 1
                 and assembly.get('material') in self.stack_vision_config['materials'])
 
     def require_observation_token(self):
@@ -3123,17 +3124,18 @@ class RobotAgentNode(Node):
     def get_previous_layer_target(self, task):
         self.resolve_task_assembly(task, basket_center=task['basket_center_workspace'])
         with self.guidebook_lock:
+            tasks = list(self.guidebook_tasks.values())
             target = stack_place.get_previous_layer_target(
-                task, list(self.guidebook_tasks.values()), self.guidebook_task_status)
-        if self.needs_stack_place(task) and target['material'] != '빵':
-            raise ValueError('Agent1 양상추 관측 대상은 첫 번째 빵이어야 합니다.')
+                task, tasks, self.guidebook_task_status)
+            target['z_range_mm'] = stack_place.previous_layer_z_range(
+                task, tasks, self.stack_vision_config)
         return target
 
     def stack_camera_mount(self, meta):
         """Use the calibrated TCP -> camera TF at the RGB acquisition time."""
         tcp_frame = self.stack_vision_config['tcp_frame']
-        if tcp_frame != 'agent1_tcp' or not meta['camera_frame']:
-            raise ValueError('agent1_tcp 및 CameraInfo optical 프레임이 필요합니다.')
+        if tcp_frame != f'{self.agent_id}_tcp' or not meta['camera_frame']:
+            raise ValueError(f'{self.agent_id}_tcp 및 CameraInfo optical 프레임이 필요합니다.')
         stamped = self.tf_buffer.lookup_transform(
             tcp_frame, meta['camera_frame'], RclpyTime(seconds=meta['color_stamp']),
             timeout=Duration(seconds=self.tf_lookup_timeout_sec))
@@ -3176,7 +3178,7 @@ class RobotAgentNode(Node):
         # Basket center XY at the previous-layer Base Z gate center (target_z_range_mm is Base Z).
         aim = dict(self.convert_place_pose(
             dict(x=basket['x'], y=basket['y'], z=0.0, yaw=0.0), self.agent_id),
-            z=float(np.mean(config['target_z_range_mm'])))
+            z=float(np.mean(self.get_previous_layer_target(task)['z_range_mm'])))
         if not self.camera_frame:
             raise ValueError('CameraInfo optical 프레임이 아직 없습니다.')
         stamped = self.tf_buffer.lookup_transform(
@@ -3294,7 +3296,8 @@ class RobotAgentNode(Node):
                     observation['checks'] = []
                     try:
                         center = stack_place.previous_layer_center(
-                            observation, task['basket_center_workspace'], target['material'], config,
+                            observation, task['basket_center_workspace'], target['material'],
+                            dict(config, target_z_range_mm=target['z_range_mm']),
                             diagnostics=observation['checks'],
                             base_z=lambda x, y, z: self.convert_place_pose(
                                 dict(x=x, y=y, z=z, yaw=0.0), self.agent_id)['z'])
