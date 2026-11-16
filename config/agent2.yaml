@@ -27,7 +27,7 @@
     stack_place_vision.samples: 3
     stack_place_vision.min_confidence: 0.6
     stack_place_vision.timeout_sec: 5.0
-    stack_place_vision.max_age_sec: 1.0
+    stack_place_vision.max_age_sec: 2.0  # 11/16 인식 1초 공백으로 첫 표본 1.27초 초과 실패
     stack_place_vision.sync_tolerance_sec: 0.08
 
     # 현재 두 Agent 구성 예시. 실제 담당 구역에 맞게 수정하세요.
