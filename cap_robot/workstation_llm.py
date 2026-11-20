@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import threading
@@ -14,8 +15,24 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
+
+# VLM 입력은 보조 정보입니다. 이미지 라이브러리가 없어도 노드는 텍스트 전용으로 동작합니다.
+try:
+    import cv2
+    from cv_bridge import CvBridge
+    _VISION_IMPORT_ERROR = None
+except ImportError as _error:  # pragma: no cover - 환경 의존
+    cv2 = None
+    CvBridge = None
+    _VISION_IMPORT_ERROR = str(_error)
 
 from cap_robot.llm_api import get_capability_catalog, validate_cooperative_actions
 from cap_robot.ollama_stream import consume_ollama_stream
@@ -38,6 +55,14 @@ class WorkstationLLM(Node):
         self.declare_parameter('log_dir', '~/capstone_ws/log/cap_robot')
         self.declare_parameter('timeout_sec', 300.0)
         self.declare_parameter('llm_think', True)
+        self.declare_parameter('llm_num_ctx', 16384)
+        # VLM: 고정 RealSense 컬러 이미지를 가이드북 생성 시 참고 자료로 첨부합니다.
+        self.declare_parameter('vision_enable', True)
+        self.declare_parameter('image_topic', '/fixed_camera/camera/color/image_raw')
+        self.declare_parameter('image_max_side_px', 768)
+        self.declare_parameter('image_jpeg_quality', 85)
+        # 이 시간을 넘겨도 오류 없이 첨부하며, 오래되었다는 사실만 LLM에 알립니다.
+        self.declare_parameter('image_stale_warn_sec', 5.0)
 
         self.model = str(self.get_parameter('llm_model').value)
         self.ollama_url = str(self.get_parameter('ollama_url').value).rstrip('/')
@@ -54,6 +79,24 @@ class WorkstationLLM(Node):
             self.get_parameter('plan_review_timeout_sec').value
         )
         self.timeout = float(self.get_parameter('timeout_sec').value)
+        self.num_ctx = int(self.get_parameter('llm_num_ctx').value)
+        self.image_topic = str(self.get_parameter('image_topic').value)
+        self.image_max_side_px = max(
+            64, int(self.get_parameter('image_max_side_px').value)
+        )
+        self.image_jpeg_quality = min(
+            100, max(10, int(self.get_parameter('image_jpeg_quality').value))
+        )
+        self.image_stale_warn_sec = float(
+            self.get_parameter('image_stale_warn_sec').value
+        )
+        self.vision_enabled = bool(self.get_parameter('vision_enable').value)
+        if self.vision_enabled and _VISION_IMPORT_ERROR is not None:
+            self.get_logger().warn(
+                f'VLM 이미지 입력 비활성화(라이브러리 없음): {_VISION_IMPORT_ERROR}'
+            )
+            self.vision_enabled = False
+        self._bridge = CvBridge() if self.vision_enabled else None
 
         self.catalog = get_capability_catalog()
         self.capabilities = set(self.catalog)
@@ -80,11 +123,20 @@ class WorkstationLLM(Node):
             self._extra_perception_callback,
             10,
         )
+        if self.vision_enabled:
+            # 다른 토픽과 시간 동기화하지 않고 최신 프레임 하나만 보관합니다.
+            self.create_subscription(
+                Image,
+                self.image_topic,
+                self._image_callback,
+                qos_profile_sensor_data,
+            )
         self.create_timer(1.0, self._check_review_timeout)
 
         self.log_dir = Path(str(self.get_parameter('log_dir').value)).expanduser()
         self.mission_dir = self.log_dir / 'missions'
         self.mission_dir.mkdir(parents=True, exist_ok=True)
+        self.image_dir = self.log_dir / 'vlm_images'
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.log_file = self.log_dir / f'workstation_{stamp}.jsonl'
 
@@ -92,6 +144,8 @@ class WorkstationLLM(Node):
         self._llm_lock = threading.Lock()
         self._latest_extra_state = None
         self._latest_extra_received_monotonic = 0.0
+        self._latest_image_msg = None
+        self._latest_image_received_monotonic = 0.0
         self._active_review = None
         self._executor = None
         self._spin_thread = None
@@ -105,6 +159,8 @@ class WorkstationLLM(Node):
             topic=self.topic,
             task_status_topic=self.task_status_topic,
             extra_perception_topic=self.extra_perception_topic,
+            vision_enabled=self.vision_enabled,
+            image_topic=self.image_topic if self.vision_enabled else None,
         )
 
     def _load_prompt(self):
@@ -146,6 +202,84 @@ class WorkstationLLM(Node):
         except (ValueError, json.JSONDecodeError) as error:
             self.get_logger().warn(f'추가 인식 상태 해석 실패: {error}')
 
+    def _image_callback(self, msg):
+        # 30Hz 콜백에서는 참조만 교체합니다. 변환/인코딩은 LLM 호출 시점에만 수행합니다.
+        with self._state_lock:
+            self._latest_image_msg = msg
+            self._latest_image_received_monotonic = time.monotonic()
+
+    def _camera_snapshot(self):
+        """최신 컬러 프레임을 ``(base64 JPEG 또는 None, 설명 dict)``로 반환합니다.
+
+        어떤 실패도 예외로 올리지 않습니다. 이미지가 없거나 오래되었어도
+        가이드북 생성은 텍스트 인식 정보만으로 계속 진행됩니다.
+        """
+        if not self.vision_enabled:
+            return None, {'attached': False, 'reason': 'vision_enable=false'}
+        with self._state_lock:
+            msg = self._latest_image_msg
+            received = self._latest_image_received_monotonic
+        if msg is None:
+            return None, {'attached': False, 'reason': '카메라 이미지를 아직 받지 못함'}
+        # 카메라 header.stamp 대신 수신 시각을 써서 시계 불일치 영향을 받지 않습니다.
+        age = round(time.monotonic() - received, 2)
+        try:
+            image = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            height, width = image.shape[:2]
+            scale = self.image_max_side_px / float(max(height, width))
+            if scale < 1.0:
+                image = cv2.resize(
+                    image,
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            ok, encoded = cv2.imencode(
+                '.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), self.image_jpeg_quality]
+            )
+            if not ok:
+                raise RuntimeError('JPEG 인코딩 실패')
+            jpeg = encoded.tobytes()
+        except Exception as error:  # noqa: BLE001 - 이미지 실패는 항상 무시하고 진행
+            self.get_logger().warn(f'VLM 이미지 준비 실패, 텍스트로만 진행: {error}')
+            return None, {'attached': False, 'reason': f'이미지 변환 실패: {error}'}
+
+        info = {
+            'attached': True,
+            'age_sec': age,
+            'stale': age > self.image_stale_warn_sec,
+            'size_px': [int(image.shape[1]), int(image.shape[0])],
+        }
+        try:
+            self.image_dir.mkdir(parents=True, exist_ok=True)
+            path = self.image_dir / (
+                'vlm_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.jpg'
+            )
+            path.write_bytes(jpeg)
+            info['file'] = str(path)
+        except OSError as error:
+            self.get_logger().warn(f'VLM 이미지 저장 실패(진행에는 영향 없음): {error}')
+        return base64.b64encode(jpeg).decode('ascii'), info
+
+    @staticmethod
+    def _image_note(info):
+        if not info.get('attached'):
+            return f"[카메라 이미지 없음: {info.get('reason', 'unknown')}]"
+        note = (
+            f"[첨부 이미지: 고정 RealSense 컬러 카메라, 수신 후 {info['age_sec']}초 경과]"
+        )
+        if info.get('stale'):
+            note += (
+                ' 주의: 이미지가 오래되어 현재 장면과 다를 수 있다. '
+                '이미지와 인식 JSON이 다르면 인식 JSON을 우선한다.'
+            )
+        return note
+
+    @staticmethod
+    def _strip_history_images(messages):
+        # 이전 턴의 이미지는 제거해 컨텍스트가 이미지 토큰으로 불어나지 않게 합니다.
+        for message_item in messages:
+            message_item.pop('images', None)
+
     def _world_snapshot(self):
         with self._state_lock:
             state = copy.deepcopy(self._latest_extra_state)
@@ -175,7 +309,7 @@ class WorkstationLLM(Node):
             'format': 'json',
             'keep_alive': '10m',
             'options': {
-                'num_ctx': 8192,
+                'num_ctx': self.num_ctx,
                 'num_predict': 4096,
                 'temperature': 0.2,
             },
@@ -551,6 +685,7 @@ class WorkstationLLM(Node):
             reason='Agent 거부로 1회 재계획 시작',
         )
         world_state = self._world_snapshot()
+        image_b64, image_info = self._camera_snapshot()
         replan_instruction = {
             'instruction': (
                 '이것은 허용된 단 한 번의 재계획이다. 거부 사유와 최신 인식을 '
@@ -560,13 +695,18 @@ class WorkstationLLM(Node):
             'previous_guidebook': review['guidebook'],
             'rejection_reasons': reasons,
             'current_world_state': world_state,
+            'camera_image': self._image_note(image_info),
         }
+        user_message = {
+            'role': 'user',
+            'content': json.dumps(replan_instruction, ensure_ascii=False),
+        }
+        if image_b64:
+            user_message['images'] = [image_b64]
+        self._log('REPLAN_REQUEST', mission_id=mission_id, image=image_info)
         messages = [
             {'role': 'system', 'content': self.system_prompt},
-            {
-                'role': 'user',
-                'content': json.dumps(replan_instruction, ensure_ascii=False),
-            },
+            user_message,
         ]
         try:
             raw = self._ask_ollama(messages)
@@ -594,12 +734,24 @@ class WorkstationLLM(Node):
 
     def _handle_user(self, text):
         world_state = self._world_snapshot()
+        image_b64, image_info = self._camera_snapshot()
         content = (
             f'{text}\n\n[현재 추가 인식 상태 - 좌표 단위 mm, 기준 {self.workspace_frame}]\n'
             + json.dumps(world_state, ensure_ascii=False)
+            + '\n\n'
+            + self._image_note(image_info)
         )
-        self.messages.append({'role': 'user', 'content': content})
-        self._log('USER', content=text, world_state=world_state)
+        self._strip_history_images(self.messages)
+        user_message = {'role': 'user', 'content': content}
+        if image_b64:
+            user_message['images'] = [image_b64]
+        self.messages.append(user_message)
+        self._log('USER', content=text, world_state=world_state, image=image_info)
+        if image_info.get('attached'):
+            print(f"VLM 이미지 첨부: {image_info['age_sec']}s 경과"
+                  + (' (오래됨)' if image_info.get('stale') else ''))
+        else:
+            print(f"VLM 이미지 없음: {image_info.get('reason')}")
         try:
             raw = self._ask_ollama()
             status, message, guidebook = self._parse(raw)
