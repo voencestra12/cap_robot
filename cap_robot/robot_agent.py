@@ -3187,7 +3187,8 @@ class RobotAgentNode(Node):
         """Turn the camera toward the basket in place after the Pick lift.
 
         The TCP position is kept; only the attitude changes so the hand-eye camera
-        optical axis passes through the basket center at the previous-layer Z gate.
+        optical axis passes through the basket center at the previous-layer Z gate,
+        with link6 +X (camera side) within MAX_LOOK_X_UP_DEG of Base +Z.
         """
         self.require_stack_stopped()
         code, pose = self.arm.get_position(is_radian=False)
@@ -3213,16 +3214,16 @@ class RobotAgentNode(Node):
                 or stamped.child_frame_id != self.camera_frame):
             raise ValueError('TCP/카메라 TF 프레임이 일치하지 않습니다.')
         t, q = stamped.transform.translation, stamped.transform.rotation
-        rotation, tilt, clamped = stack_place.look_at_attitude(
+        rotation, x_up, clamped = stack_place.look_at_attitude(
             rpy_to_matrix(*map(math.radians, pose[3:6])), pose[:3],
             self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w),
             np.array([t.x, t.y, t.z]) * 1000.0, [aim[a] for a in ('x', 'y', 'z')],
-            stack_place.MAX_LOOK_TILT_DEG)
+            stack_place.MAX_LOOK_X_UP_DEG)
         roll, pitch, yaw = matrix_to_rpy(rotation)
         speed = stack_place.look_speed(task['assembly']['material'], self.agent_id, action['speed'])
         self.get_logger().info(
             f"[{task['task_id']}] 제자리 관측 회전: TCP={pose[:3]}, 바구니 관측점(Base)="
-            f"{[round(aim[a], 1) for a in ('x', 'y', 'z')]}, 기울기={tilt:.1f}deg"
+            f"{[round(aim[a], 1) for a in ('x', 'y', 'z')]}, link6 +X↔Base +Z={x_up:.1f}deg"
             f"{' (상한 적용)' if clamped else ''}, rpy=({math.degrees(roll):.2f}, "
             f"{math.degrees(pitch):.2f}, {math.degrees(yaw):.2f}), speed={speed}")
         self.require_observation_token()

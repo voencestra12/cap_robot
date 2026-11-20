@@ -998,33 +998,50 @@ VERTICAL = handling.rpy_to_matrix(math.pi, 0., math.radians(-93.1))  # Pick lift
 MOUNT_R, MOUNT_T = np.eye(3), np.array([100., 0., -87.])            # TCP <- camera, mm
 
 
-@pytest.mark.parametrize('target', [(450., -180., 90.), (300., 150., 60.), (200., 40., 120.)])
-def test_look_at_points_camera_optical_axis_at_target_without_moving_tcp(target):
+def x_up_deg(rotation):
+    return math.degrees(math.acos(rotation[2, 0]))
+
+
+@pytest.mark.parametrize('target', [(450., -180., 90.), (426., -297., 75.), (600., 300., 60.)])
+def test_look_at_points_camera_optical_axis_at_target_with_x_up_without_moving_tcp(target):
     tcp = (260.4, 77.7, 316.7)
-    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, target, 89.)
+    rotation, x_up, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, target, 89.)
     assert not clamped
     miss, ahead = optical_ray_miss_mm(rotation, tcp, MOUNT_R, MOUNT_T, target)
     assert miss < 1e-6 and ahead > 0  # the target lies on the optical axis, in front
     assert np.allclose(rotation.T @ rotation, np.eye(3)) and np.linalg.det(rotation) == pytest.approx(1.)
-    assert tilt == pytest.approx(math.degrees(math.acos(-rotation[2, 2])))
+    assert x_up == pytest.approx(x_up_deg(rotation)) and rotation[2, 0] > 0  # +X up, not -X
+    # Spin about the optical axis puts +X as close to Base +Z as the look allows:
+    # +X, the optical axis and Base +Z share one vertical plane.
+    optical = rotation @ MOUNT_R[:, 2]
+    assert np.dot(rotation[:, 0], np.cross(optical, [0., 0., 1.])) == pytest.approx(0., abs=1e-9)
 
 
-def test_look_at_target_already_on_axis_keeps_pick_attitude():
-    tcp = np.array([260., 80., 316.])
-    below = tcp + VERTICAL @ MOUNT_T + VERTICAL @ np.array([0., 0., 250.])
-    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, below)
-    assert np.allclose(rotation, VERTICAL, atol=1e-9) and tilt == pytest.approx(0., abs=1e-6)
-    assert not clamped
-
-
-def test_look_at_clamps_tilt_but_keeps_direction_toward_target():
+def test_look_at_clamps_x_up_and_raises_optical_axis_with_same_azimuth():
     tcp, far = (260., 80., 316.), (700., -400., 0.)
-    rotation, tilt, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 30.)
-    assert clamped and tilt == pytest.approx(30.)
-    assert math.degrees(math.acos(-rotation[2, 2])) == pytest.approx(30.)
-    lean = rotation[:2, 2] / np.linalg.norm(rotation[:2, 2])
-    wanted = (np.array(far[:2]) - tcp[:2]) / np.linalg.norm(np.array(far[:2]) - tcp[:2])
-    assert float(np.dot(lean, wanted)) > 0.95  # leans toward the basket, only less
+    unclamped, free_x_up, _ = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 89.)
+    assert free_x_up > 30.
+    rotation, x_up, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 30.)
+    assert clamped and x_up == pytest.approx(30.) and x_up_deg(rotation) == pytest.approx(30.)
+    optical = rotation @ MOUNT_R[:, 2]
+    assert math.degrees(math.asin(-optical[2])) == pytest.approx(30.)  # 30 deg below horizontal
+    lean = optical[:2] / np.linalg.norm(optical[:2])
+    free = (unclamped @ MOUNT_R[:, 2])[:2]
+    assert float(np.dot(lean, free / np.linalg.norm(free))) == pytest.approx(1.)  # same azimuth
+
+
+@pytest.mark.parametrize('target', [(300., 150., 60.), (200., 40., 120.)])
+def test_look_at_target_close_below_tcp_has_no_x_up_attitude_and_is_rejected(target):
+    # The camera sits 100 mm on the +X (upper) side; no x-up look reaches these.
+    with pytest.raises(ValueError, match='수렴하지 않았습니다'):
+        vision.look_at_attitude(VERTICAL, (260.4, 77.7, 316.7), MOUNT_R, MOUNT_T, target, 89.)
+
+
+def test_look_straight_down_has_no_azimuth_and_is_rejected():
+    tcp = np.array([260., 80., 316.])
+    below = tcp + VERTICAL @ MOUNT_T + np.array([0., 0., -250.])
+    with pytest.raises(ValueError, match='관측 방위'):
+        vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, below)
 
 
 @pytest.mark.parametrize('action_speed,expected', [(200., 150.), (100., 100.), (10., 10.)])
@@ -1032,10 +1049,10 @@ def test_look_rotation_uses_existing_material_tilt_speed_cap(action_speed, expec
     assert vision.look_speed('양상추', 'agent1', action_speed) == expected
 
 
-@pytest.mark.parametrize('max_tilt', [89., 45.])
-def test_lettuce_looks_in_place_then_runs_unchanged_place_actions(agent, monkeypatch, max_tilt):
+@pytest.mark.parametrize('max_x_up', [89., 20.])
+def test_lettuce_looks_in_place_then_runs_unchanged_place_actions(agent, monkeypatch, max_x_up):
     node, task = agent
-    monkeypatch.setattr(vision, 'MAX_LOOK_TILT_DEG', max_tilt)  # fixture needs ~60 deg
+    monkeypatch.setattr(vision, 'MAX_LOOK_X_UP_DEG', max_x_up)
     feed(monkeypatch, node, [observation(310, 180)] * 3)
     order = []
     observe = node.observe_previous_layer
@@ -1059,11 +1076,10 @@ def test_lettuce_looks_in_place_then_runs_unchanged_place_actions(agent, monkeyp
                                       math.radians(look.kwargs['pitch_deg']), look.kwargs['yaw'])
     target = (300., 200., float(np.mean(node.stack_vision_config['target_z_range_mm'])))
     miss, _ = optical_ray_miss_mm(rotation, lift.args[:3], MOUNT_R, MOUNT_T * 1., target)
-    tilt = math.degrees(math.acos(-rotation[2, 2]))
-    if max_tilt == 89.:
-        assert miss < 1e-6 and tilt < 89.
+    if max_x_up == 89.:
+        assert miss < 1e-6 and 20. < x_up_deg(rotation) < 89.
     else:
-        assert tilt == pytest.approx(45.)  # limited lean toward the basket
+        assert x_up_deg(rotation) == pytest.approx(20.)  # camera raised, still above
     assert order.index('look at previous layer') < order.index('observe')
     # Then the existing Place actions at the corrected XY, back in the Place attitude.
     assert [m.args[:3] for m in moves[4:]] == [(310., 180., 220.), (310., 180., 60.), (310., 180., 220.)]
