@@ -39,6 +39,9 @@ DEFAULTS = {
 # holding material. +X is the hand-eye camera side, so the camera stays above the
 # gripper and the held material does not cover the view.
 MAX_LOOK_X_UP_DEG = 30.0
+# The look rotation pivots about the camera center, so the TCP moves; it may not
+# drop more than this below the Pick lift (2026-11-20 layout: ~47 mm).
+MAX_LOOK_TCP_DROP_MM = 100.0
 
 
 def vector(value, size, label):
@@ -149,50 +152,36 @@ def _x_up_deg(rotation):
 
 def look_at_attitude(tcp_rotation, tcp_position, camera_rotation, camera_translation,
                      target, max_x_up_deg=MAX_LOOK_X_UP_DEG):
-    """Rotate the TCP in place so the camera optical (+Z) axis passes through target
+    """Rotate about the camera center so the optical (+Z) axis passes through target
     with TCP (= link6) +X pointing up, i.e. the camera above the gripper.
 
     Robot Base frame, mm. camera_rotation/translation is TCP <- camera optical frame
-    (hand-eye TF, no manual offset). The spin about the optical axis is chosen so
-    +X is closest to Base +Z; the TCP position never changes. If +X would be more
-    than max_x_up_deg from Base +Z (the camera would look too steeply down), the
-    optical axis is raised toward horizontal with the same azimuth until it is
+    (hand-eye TF, no manual offset). The camera center stays where it is after the
+    Pick lift and the TCP moves around it; pivoting about the TCP instead raised the
+    camera ~135 mm, which needed a ~49 deg look and left the basket at the image edge
+    under the 30 deg limit (2026-11-20). The spin about the optical axis is chosen so
+    +X is closest to Base +Z. If +X would be more than max_x_up_deg from Base +Z,
+    the optical axis is raised toward horizontal with the same azimuth until it is
     exactly at the limit; the target then lies below the image center.
-    Returns (rotation, x_up_deg, clamped).
+    Returns (rotation, tcp_position, x_up_deg, clamped).
     """
     rotation = np.array(tcp_rotation, dtype=float)
-    position = np.array(tcp_position, dtype=float)
-    goal = np.array(target, dtype=float)
     offset = np.array(camera_translation, dtype=float)
     optical = np.array(camera_rotation, dtype=float)[:, 2]
-    # The camera moves with the spin, so look and spin are repeated to a fixed point,
-    # half-way each step: the undamped update oscillates between two azimuths. A
-    # target too close below the TCP has no fixed point, because the camera sits on
-    # the +X (upper) side of the tool.
-    for _ in range(200):
-        wanted = goal - (position + rotation @ offset)
-        if np.linalg.norm(wanted) < 1e-6:
-            raise ValueError('관측 대상이 카메라 위치와 겹칩니다.')
-        step = rotation @ optical + wanted / np.linalg.norm(wanted)
-        if np.linalg.norm(step) < 1e-9:
-            raise ValueError('관측 회전 자세가 수렴하지 않았습니다: 대상이 카메라 뒤쪽입니다.')
-        updated = _x_up_attitude(rotation, optical, step / np.linalg.norm(step))
-        done = np.abs(updated - rotation).max() < 1e-10
-        rotation = updated
-        if done:
-            break
-    else:
-        raise ValueError('관측 회전 자세가 수렴하지 않았습니다: '
-                         '+X 위쪽 카메라로 바라볼 수 없을 만큼 대상이 TCP 아래에 가깝습니다.')
-    x_up = _x_up_deg(rotation)
+    camera = np.array(tcp_position, dtype=float) + rotation @ offset
+    wanted = np.array(target, dtype=float) - camera
+    if np.linalg.norm(wanted) < 1e-6:
+        raise ValueError('관측 대상이 카메라 위치와 겹칩니다.')
+    wanted /= np.linalg.norm(wanted)
+    look = _x_up_attitude(rotation, optical, wanted)
+    x_up = _x_up_deg(look)
     clamped = x_up > max_x_up_deg
     if clamped:
-        direction = rotation @ optical
-        horizontal = np.array([direction[0], direction[1], 0.0])
+        horizontal = np.array([wanted[0], wanted[1], 0.0])
         if np.linalg.norm(horizontal) < 1e-6:
-            raise ValueError('관측 방위를 정할 수 없습니다: 광축이 수직입니다.')
+            raise ValueError('관측 방위를 정할 수 없습니다: 대상이 카메라 바로 아래입니다.')
         horizontal /= np.linalg.norm(horizontal)
-        elevation = math.asin(max(-1.0, min(1.0, float(direction[2]))))
+        elevation = math.asin(max(-1.0, min(1.0, float(wanted[2]))))
 
         def raised(fraction):
             e = elevation * (1.0 - fraction)
@@ -208,9 +197,9 @@ def look_at_attitude(tcp_rotation, tcp_position, camera_rotation, camera_transla
                 low = middle
             else:
                 high = middle
-        rotation = raised(high)
-        x_up = _x_up_deg(rotation)
-    return rotation, x_up, clamped
+        look = raised(high)
+        x_up = _x_up_deg(look)
+    return look, camera - look @ offset, x_up, clamped
 
 
 def look_speed(material, agent_id, action_speed):

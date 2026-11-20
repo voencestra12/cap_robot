@@ -3186,7 +3186,7 @@ class RobotAgentNode(Node):
     def look_at_previous_layer(self, task, action):
         """Turn the camera toward the basket in place after the Pick lift.
 
-        The TCP position is kept; only the attitude changes so the hand-eye camera
+        The hand-eye camera center is kept and the TCP pivots around it, so the camera
         optical axis passes through the basket center at the previous-layer Z gate,
         with link6 +X (camera side) within MAX_LOOK_X_UP_DEG of Base +Z.
         """
@@ -3214,32 +3214,38 @@ class RobotAgentNode(Node):
                 or stamped.child_frame_id != self.camera_frame):
             raise ValueError('TCP/카메라 TF 프레임이 일치하지 않습니다.')
         t, q = stamped.transform.translation, stamped.transform.rotation
-        rotation, x_up, clamped = stack_place.look_at_attitude(
+        rotation, tcp, x_up, clamped = stack_place.look_at_attitude(
             rpy_to_matrix(*map(math.radians, pose[3:6])), pose[:3],
             self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w),
             np.array([t.x, t.y, t.z]) * 1000.0, [aim[a] for a in ('x', 'y', 'z')],
             stack_place.MAX_LOOK_X_UP_DEG)
         roll, pitch, yaw = matrix_to_rpy(rotation)
         speed = stack_place.look_speed(task['assembly']['material'], self.agent_id, action['speed'])
+        camera = tcp + rotation @ (np.array([t.x, t.y, t.z]) * 1000.0)
         self.get_logger().info(
-            f"[{task['task_id']}] 제자리 관측 회전: TCP={pose[:3]}, 바구니 관측점(Base)="
+            f"[{task['task_id']}] 카메라 중심 관측 회전: 카메라(Base)={camera.round(1).tolist()}, "
+            f"TCP={[round(v, 1) for v in pose[:3]]} → {tcp.round(1).tolist()}, 바구니 관측점(Base)="
             f"{[round(aim[a], 1) for a in ('x', 'y', 'z')]}, link6 +X↔Base +Z={x_up:.1f}deg"
             f"{' (상한 적용)' if clamped else ''}, rpy=({math.degrees(roll):.2f}, "
             f"{math.degrees(pitch):.2f}, {math.degrees(yaw):.2f}), speed={speed}")
+        drop = pose[2] - tcp[2]
+        if drop > stack_place.MAX_LOOK_TCP_DROP_MM:
+            raise ValueError(f'관측 회전으로 TCP가 {drop:.0f}mm 내려갑니다 '
+                             f'(상한 {stack_place.MAX_LOOK_TCP_DROP_MM:.0f}mm).')
         self.require_observation_token()
         self.get_previous_layer_target(task)
         if not self.move_to_robot_tf(
-                pose[0], pose[1], pose[2], yaw=yaw, roll_deg=math.degrees(roll),
+                tcp[0], tcp[1], tcp[2], yaw=yaw, roll_deg=math.degrees(roll),
                 pitch_deg=math.degrees(pitch), speed=speed, label='look at previous layer'):
-            raise RuntimeError('제자리 관측 회전 실패')
+            raise RuntimeError('카메라 중심 관측 회전 실패')
         if self.arm.error_code != 0:
-            raise RuntimeError(f'제자리 관측 회전 후 컨트롤러 오류 C{self.arm.error_code}')
+            raise RuntimeError(f'관측 회전 후 컨트롤러 오류 C{self.arm.error_code}')
         self.require_observation_token()
 
     def prepare_stack_place(self, task, action):
         """Called once after predecessor wait, Pick lift and Token acquisition.
 
-        Look at the previous layer in place, observe it, and commit the corrected XY.
+        Look at the previous layer (camera-center pivot), observe it, and commit the corrected XY.
         The unchanged Place actions then move there (returning to the Place attitude),
         descend and release.
         """
