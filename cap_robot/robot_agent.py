@@ -3186,7 +3186,8 @@ class RobotAgentNode(Node):
     def look_at_previous_layer(self, task, action):
         """Turn the camera toward the basket in place after the Pick lift.
 
-        The hand-eye camera center is kept and the TCP pivots around it, so the camera
+        The hand-eye camera center is raised LOOK_CAMERA_RAISE_MM above its Pick-lift
+        position and the TCP pivots around it, so the camera
         optical axis passes through the basket center at the previous-layer Z gate,
         with link6 +X (camera side) within MAX_LOOK_X_UP_DEG of Base +Z.
         """
@@ -3218,7 +3219,7 @@ class RobotAgentNode(Node):
             rpy_to_matrix(*map(math.radians, pose[3:6])), pose[:3],
             self.quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w),
             np.array([t.x, t.y, t.z]) * 1000.0, [aim[a] for a in ('x', 'y', 'z')],
-            stack_place.MAX_LOOK_X_UP_DEG)
+            stack_place.MAX_LOOK_X_UP_DEG, stack_place.LOOK_CAMERA_RAISE_MM)
         roll, pitch, yaw = matrix_to_rpy(rotation)
         speed = stack_place.look_speed(task['assembly']['material'], self.agent_id, action['speed'])
         camera = tcp + rotation @ (np.array([t.x, t.y, t.z]) * 1000.0)

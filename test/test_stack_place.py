@@ -1007,8 +1007,10 @@ def test_look_pivots_about_camera_center_and_points_optical_axis_at_target_with_
     tcp = (260.4, 77.7, 316.7)
     rotation, moved, x_up, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, target, 89.)
     assert not clamped
-    # The camera center stays put; the TCP moves around it.
-    assert moved + rotation @ MOUNT_T == pytest.approx(np.array(tcp) + VERTICAL @ MOUNT_T)
+    # The camera center is raised by LOOK_CAMERA_RAISE_MM; the TCP moves around it.
+    raised = np.array(tcp) + VERTICAL @ MOUNT_T + [0., 0., vision.LOOK_CAMERA_RAISE_MM]
+    assert vision.LOOK_CAMERA_RAISE_MM == 100.
+    assert moved + rotation @ MOUNT_T == pytest.approx(raised)
     miss, ahead = optical_ray_miss_mm(rotation, moved, MOUNT_R, MOUNT_T, target)
     assert miss < 1e-6 and ahead > 0  # the target lies on the optical axis, in front
     assert np.allclose(rotation.T @ rotation, np.eye(3)) and np.linalg.det(rotation) == pytest.approx(1.)
@@ -1021,7 +1023,7 @@ def test_look_pivots_about_camera_center_and_points_optical_axis_at_target_with_
 
 def test_look_at_clamps_x_up_and_raises_optical_axis_with_same_azimuth():
     tcp, far = (260., 80., 316.), (700., -400., 0.)
-    camera = np.array(tcp) + VERTICAL @ MOUNT_T
+    camera = np.array(tcp) + VERTICAL @ MOUNT_T + [0., 0., 100.]
     unclamped, _, free_x_up, _ = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 89.)
     assert free_x_up > 30.
     rotation, moved, x_up, clamped = vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, far, 30.)
@@ -1038,7 +1040,7 @@ def test_look_straight_down_has_no_azimuth_and_is_rejected():
     tcp = np.array([260., 80., 316.])
     below = tcp + VERTICAL @ MOUNT_T + np.array([0., 0., -250.])
     with pytest.raises(ValueError, match='관측 방위'):
-        vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, below)
+        vision.look_at_attitude(VERTICAL, tcp, MOUNT_R, MOUNT_T, below, 45., 0.)
 
 
 @pytest.mark.parametrize('action_speed,expected', [(200., 150.), (100., 100.), (10., 10.)])
@@ -1069,9 +1071,9 @@ def test_lettuce_looks_in_place_then_runs_unchanged_place_actions(agent, monkeyp
     rotation = handling.rpy_to_matrix(math.radians(look.kwargs['roll_deg']),
                                       math.radians(look.kwargs['pitch_deg']), look.kwargs['yaw'])
     lift_rotation = handling.rpy_to_matrix(math.pi, 0., 0.)  # fixture get_position rpy
-    # Camera-center pivot: the camera stays where it was after the lift, the TCP moves.
+    # Camera-center pivot: the camera 100 mm above where it was after the lift, the TCP moves.
     assert np.array(look.args[:3]) + rotation @ MOUNT_T == pytest.approx(
-        np.array(lift.args[:3]) + lift_rotation @ MOUNT_T)
+        np.array(lift.args[:3]) + lift_rotation @ MOUNT_T + [0., 0., 100.])
     assert look.kwargs['speed'] == 20.  # lettuce place_tilt_speed cap
     # Camera optical axis through the basket center at the previous-layer Z gate.
     target = (300., 200., float(np.mean(node.stack_vision_config['target_z_range_mm'])))

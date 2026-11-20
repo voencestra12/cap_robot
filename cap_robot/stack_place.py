@@ -37,10 +37,14 @@ DEFAULTS = {
 # Fixed limits, intentionally not ROS parameters.
 # In-place look rotation: maximum angle between link6 (= TCP) +X and Base +Z while
 # holding material. +X is the hand-eye camera side, so the camera stays above the
-# gripper and the held material does not cover the view.
-MAX_LOOK_X_UP_DEG = 30.0
+# gripper and the held material does not cover the view. 45 deg: the raised camera
+# below needs ~45 deg to center the basket (2026-11-20 layout: 44.7 deg).
+MAX_LOOK_X_UP_DEG = 45.0
+# The look keeps the camera center this far above its Pick-lift position: from the
+# lift height the ham was confused with the bread under it (2026-11-20).
+LOOK_CAMERA_RAISE_MM = 100.0
 # The look rotation pivots about the camera center, so the TCP moves; it may not
-# drop more than this below the Pick lift (2026-11-20 layout: ~47 mm).
+# drop more than this below the Pick lift (2026-11-20 layout: rises ~50 mm).
 MAX_LOOK_TCP_DROP_MM = 100.0
 
 
@@ -151,13 +155,15 @@ def _x_up_deg(rotation):
 
 
 def look_at_attitude(tcp_rotation, tcp_position, camera_rotation, camera_translation,
-                     target, max_x_up_deg=MAX_LOOK_X_UP_DEG):
+                     target, max_x_up_deg=MAX_LOOK_X_UP_DEG,
+                     camera_raise_mm=LOOK_CAMERA_RAISE_MM):
     """Rotate about the camera center so the optical (+Z) axis passes through target
     with TCP (= link6) +X pointing up, i.e. the camera above the gripper.
 
     Robot Base frame, mm. camera_rotation/translation is TCP <- camera optical frame
-    (hand-eye TF, no manual offset). The camera center stays where it is after the
-    Pick lift and the TCP moves around it; pivoting about the TCP instead raised the
+    (hand-eye TF, no manual offset). The camera center is put camera_raise_mm (Base
+    +Z) above where it is after the Pick lift and the TCP moves around it, in one
+    move; pivoting about the TCP instead raised the
     camera ~135 mm, which needed a ~49 deg look and left the basket at the image edge
     under the 30 deg limit (2026-11-20). The spin about the optical axis is chosen so
     +X is closest to Base +Z. If +X would be more than max_x_up_deg from Base +Z,
@@ -169,6 +175,7 @@ def look_at_attitude(tcp_rotation, tcp_position, camera_rotation, camera_transla
     offset = np.array(camera_translation, dtype=float)
     optical = np.array(camera_rotation, dtype=float)[:, 2]
     camera = np.array(tcp_position, dtype=float) + rotation @ offset
+    camera[2] += number(camera_raise_mm, 'camera raise')
     wanted = np.array(target, dtype=float) - camera
     if np.linalg.norm(wanted) < 1e-6:
         raise ValueError('관측 대상이 카메라 위치와 겹칩니다.')
