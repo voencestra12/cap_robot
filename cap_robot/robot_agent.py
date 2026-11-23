@@ -3780,6 +3780,7 @@ class RobotAgentNode(Node):
                         source=inference_image,
                         classes=wanted_class_ids or None,
                         conf=0.3,
+                        imgsz=960 if model_filename == "yolo-bread-lettuce-ham.pt" else 640,
                         verbose=False,
                     )
                     for result in results:
