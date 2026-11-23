@@ -36,7 +36,7 @@ OBJECT_PROFILES = {
         "stack_tcp_to_material_center_mm": None,  # 실측 필요
         "grip_position": 30.0,
         "thickness_mm": 5.0,
-        "place_tcp_offset_mm": 100.0,
+        "place_tcp_offset_mm": 120.0,
         "place_roll_offset_deg": {"agent1": 30.0, "agent2": -30.0},
         "place_pitch_offset_deg": 0.0,
         "place_tilt_speed": 150.0,  # action speed 상한(150) = PnP 속도 그대로
